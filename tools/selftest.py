@@ -1533,6 +1533,69 @@ class TestSkillAnswers(unittest.TestCase):
             "the payload was rebuilt before the day word was checked")
 
 
+class TestRateLimitLogReader(unittest.TestCase):
+    """LOG-01: the reader parses a file another program appends to many times a
+    second, so its ordering has to survive the shapes that file really takes --
+    a second holding several samples, and a window the payload omitted."""
+
+    def log(self, *lines):
+        d = tempfile.mkdtemp(dir=TMP)
+        path = os.path.join(d, "usage-log.jsonl")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("".join(ln + "\n" for ln in lines))
+        return path
+
+    def test_an_absent_window_in_a_shared_second_does_not_raise(self):
+        """Sorting whole rows compares None against a float as soon as two
+        samples share a timestamp and one window is missing -- the wrapper's
+        timestamps are second-resolution and each window is independently
+        absent, so this is a normal file. The TypeError escapes past the
+        per-line guard and the whole run produces no report."""
+        path = self.log(
+            '{"ts":"2026-07-31T15:31:11Z","five_hour":null,"seven_day":30}',
+            '{"ts":"2026-07-31T15:31:11Z","five_hour":23.5,"seven_day":30}')
+        rows = br.read_rl_log(path)
+        self.assertEqual([r[1] for r in rows], [None, 23.5], rows)
+
+    def test_samples_in_one_second_keep_the_order_they_were_written(self):
+        """File order is write order, so the last row of a second is the newest
+        sample. Sorting on the values instead makes the viewer's lastOf() report
+        the LARGEST sample of that second -- visibly wrong right after a 5-hour
+        window resets, which is exactly when several samples land together."""
+        path = self.log(
+            '{"ts":"2026-07-31T15:31:11Z","five_hour":88.0,"seven_day":40}',
+            '{"ts":"2026-07-31T15:31:11Z","five_hour":91.0,"seven_day":40}',
+            '{"ts":"2026-07-31T15:31:11Z","five_hour":3.0,"seven_day":41}')
+        rows = br.read_rl_log(path)
+        self.assertEqual([r[1] for r in rows], [88.0, 91.0, 3.0], rows)
+
+    def test_rows_from_different_seconds_still_sort_ascending(self):
+        path = self.log(
+            '{"ts":"2026-07-31T15:31:20Z","five_hour":2}',
+            '{"ts":"2026-07-31T15:31:11Z","five_hour":1}')
+        self.assertEqual([r[1] for r in br.read_rl_log(path)], [1, 2])
+
+    def test_a_run_over_such_a_log_still_writes_its_report(self):
+        # the user-visible half: the raise is outside read_rl_log's per-line
+        # try, so a single duplicated second cost the entire dashboard and the
+        # only recovery was hand-editing the log
+        d = tempfile.mkdtemp(dir=TMP)
+        root = os.path.join(d, ".claude", "projects")
+        shutil.copytree(P["primary"], root)
+        log = os.path.join(d, ".claude", "usage-logger", "usage-log.jsonl")
+        os.makedirs(os.path.dirname(log))
+        with open(P["rl_log"], encoding="utf-8") as fh:
+            body = fh.read()
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write(body)
+            fh.write('{"ts":"2026-03-01T12:00:00Z","five_hour":null,'
+                     '"seven_day":30}\n')
+        proc, out = run(["--root", root])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(os.path.exists(os.path.join(out, "dashboard.html")))
+        self.assertEqual(len(payload(out)["rl"]), EXP["rl_samples"] + 1)
+
+
 def rl_payload(five=23.5, seven=41.2, sid="sess-1", model="Sonnet 4.6"):
     """A statusline payload shaped the way Claude Code hands one to the
     configured command, on one line, with both cap windows present."""

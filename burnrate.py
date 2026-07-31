@@ -826,7 +826,15 @@ def read_rl_log(rl_log):
                         continue
         except OSError:
             continue
-    rows.sort()
+    # Sort on the timestamp ALONE, never on the whole row. Either window can be
+    # absent (the payload carries them independently), so a default sort
+    # compares None against a float the moment two samples share a second and
+    # raises TypeError out of here, past every per-line guard, and the run
+    # produces no report at all. Sorting on ts is also what keeps ties in file
+    # order -- Python's sort is stable, and file order is write order, so the
+    # viewer's lastOf() reports the LAST sample of a second rather than the
+    # largest one, which is what a 5h window reset looks like.
+    rows.sort(key=lambda r: r[0])
     return rows
 
 
