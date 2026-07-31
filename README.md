@@ -172,9 +172,11 @@ in every project, is planned and not shipped yet.
 The report can show rate-limit cap percentages, but only if a statusline logger
 has been recording them, because Claude Code does not write them to the
 transcripts.
-That logger is opt-in and this repository does not ship it yet, which is why
-`--help` and the report footer mention `usage_logger.sh`. Without it, every
-other panel works and the cap card simply does not render.
+
+That logger is opt-in and ships separately in [`extras/`](extras/README.md),
+which covers installing, upgrading and removing it. Nothing installs it for
+you. Without it, every other panel works and the cap card simply does not
+render.
 
 ## Verifying a copy
 
