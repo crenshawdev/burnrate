@@ -122,6 +122,7 @@ run the tool inside a repository.
 | Flag | Effect |
 |---|---|
 | `--tz-offset HOURS` | Bucket days at a fixed UTC offset. Default is system local time, DST-aware. |
+| `--range {7,14,30,90,all}` | Date window the opened report starts on, in days or `all`. Default `30`; the report's own preset buttons still change it. |
 | `--root DIR` | Transcript tree to read. See resolution order above. |
 | `--out DIR` | Where to write the report. Defaults to the directory holding `burnrate.py`. |
 | `--archive DIR` | Extra transcript source: a `<project>/*.jsonl` tree or a `<project>/<session>/*.zst` archive. |
@@ -144,6 +145,27 @@ directory:
 | Windows | `%LOCALAPPDATA%\burnrate` |
 
 Delete that directory or pass `--rebuild` to force a full reparse.
+
+## The /burnrate skill
+
+This repository ships a Claude Code project skill at `.claude/skills/burnrate/`,
+so `/burnrate` is available when Claude Code is working inside this repository,
+and nowhere else today.
+
+A bare `/burnrate` builds the dashboard and opens it, writing it under the
+platform cache directory above rather than into your working tree. The words
+`7d`, `14d`, `30d`, `90d`, `all`, `rebuild` and `no-archive` map onto the flags
+of the same name, so `/burnrate 7d rebuild` is `--range 7 --rebuild`. Anything
+else is treated as a question: `/burnrate what did yesterday cost` is answered
+in chat from `dashboard_data.json`, without opening the report. The same privacy
+note applies to a report the skill builds; see "What a generated report embeds".
+
+The skill is a wrapper, never a fork: it runs this repository's own
+`burnrate.py`, and `python3 burnrate.py` keeps working with the skill absent or
+`.claude/` deleted.
+
+Installing burnrate as a Claude Code plugin from a git URL, so `/burnrate` works
+in every project, is planned and not shipped yet.
 
 ## The 5h/7d cap card
 
