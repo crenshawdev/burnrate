@@ -1,0 +1,14 @@
+{
+  "name": "burnrate",
+  "owner": {
+    "name": "John Crenshaw"
+  },
+  "description": "burnrate: a local, on-demand dashboard of your own Claude Code token usage.",
+  "plugins": [
+    {
+      "name": "burnrate",
+      "source": "./",
+      "description": "Builds a local, self-contained dashboard of your own Claude Code token usage from your transcripts, and answers quick usage questions in chat."
+    }
+  ]
+}

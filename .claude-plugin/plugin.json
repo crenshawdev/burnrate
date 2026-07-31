@@ -1,0 +1,18 @@
+{
+  "name": "burnrate",
+  "version": "1.0.0",
+  "description": "Builds a local, self-contained dashboard of your own Claude Code token usage from your transcripts, and answers quick usage questions in chat.",
+  "author": {
+    "name": "John Crenshaw"
+  },
+  "homepage": "https://git.jcrenshaw.dev/crenshawdev/burnrate",
+  "repository": "https://git.jcrenshaw.dev/crenshawdev/burnrate.git",
+  "license": "MIT",
+  "keywords": [
+    "usage",
+    "dashboard",
+    "tokens",
+    "rate-limits",
+    "claude-code"
+  ]
+}
