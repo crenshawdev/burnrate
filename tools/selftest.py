@@ -1211,6 +1211,102 @@ console.log(JSON.stringify([MINDAY, MAXDAY, state.d0, state.d1]));
             self.assertIn("||", line, line)
 
 
+SKILL_SCRIPT = os.path.join(REPO, ".claude", "skills", "burnrate", "scripts",
+                            "burnrate_skill.py")
+
+
+@unittest.skipUnless(os.path.exists(SKILL_SCRIPT),
+                     "no .claude/ in this checkout")
+class TestSkillAnswers(unittest.TestCase):
+    """D-14: the /burnrate skill answers from the daily rows, which are twelve
+    unlabeled positions -- a wrong column index prints a plausible wrong number
+    and nothing else notices. These cases are that notice. The script is run
+    the way Claude Code runs it (a subprocess, no in-process import) because it
+    resolves both burnrate.py and its output directory from its own __file__.
+
+    Skipped rather than failed when .claude/ is absent: burnrate.py is a
+    standalone tool and a checkout with the skill removed must still report no
+    failures (AC6)."""
+
+    @classmethod
+    def setUpClass(cls):
+        # one cache home for the whole class, so the first case pays for the
+        # payload and the rest exercise the reuse path
+        cls.cache = tempfile.mkdtemp(dir=TMP)
+
+    def skill(self, *args, expect=0):
+        proc = subprocess.run(
+            [sys.executable, SKILL_SCRIPT, *args],
+            env=base_env(XDG_CACHE_HOME=self.cache,
+                         CLAUDE_PROJECTS=P["primary"]),
+            capture_output=True, text=True)
+        self.assertEqual(proc.returncode, expect, proc.stderr)
+        return proc
+
+    def answer(self, *args):
+        proc = self.skill(*args)
+        return json.loads(proc.stdout)
+
+    def written_payload(self):
+        with open(os.path.join(self.cache, "burnrate", "report",
+                               "dashboard_data.json"), encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def tolerance(self, data):
+        """One token per daily row: the payload rounds each row on its own, so
+        a regrouped sum can drift by that much. Nowhere near enough slack to
+        absorb reading input tokens (index 7) as billed-equiv (index 6)."""
+        return len(data["daily"])
+
+    def test_by_project_matches_the_fixture_per_label(self):
+        got = self.answer("ask", "--by", "project")
+        data = self.written_payload()
+        tol = self.tolerance(data)
+        rows = {r["project"]: r["billed_equiv"] for r in got["rows"]}
+        self.assertEqual(sorted(rows), sorted(EXP["label_be"]))
+        for label, want in EXP["label_be"].items():
+            self.assertLessEqual(abs(rows[label] - want), tol,
+                                 f"{label}: {rows[label]} vs {want}")
+        self.assertLessEqual(
+            abs(got["total"]["billed_equiv"] - EXP["total_be"]), tol,
+            got["total"])
+
+    def test_by_day_sums_to_the_same_total(self):
+        by_day = self.answer("ask", "--by", "day")
+        by_proj = self.answer("ask", "--by", "project")
+        tol = self.tolerance(self.written_payload())
+        self.assertLessEqual(
+            abs(sum(r["billed_equiv"] for r in by_day["rows"])
+                - by_proj["total"]["billed_equiv"]), tol)
+        self.assertEqual(by_day["total"]["billed_equiv"],
+                         by_proj["total"]["billed_equiv"])
+        self.assertTrue(by_day["reused"] or by_proj["reused"],
+                        "a second answer inside the freshness window rebuilt")
+
+    def test_words_reach_this_repos_own_burnrate(self):
+        argv = json.loads(
+            self.skill("run", "--dry-run", "7d", "rebuild",
+                       "no-archive").stdout)
+        self.assertEqual(argv[1], BR)       # upward resolution, not a copy
+        for flag in ("--rebuild", "--no-archive", "--json", "--out"):
+            self.assertIn(flag, argv)
+        self.assertEqual(argv[argv.index("--range") + 1], "7")
+
+    def test_an_unrecognized_word_is_refused(self):
+        proc = self.skill("run", "--dry-run", "bogus", expect=2)
+        self.assertIn("bogus", proc.stderr)
+
+    def test_blocks_join_projects_and_close_five_hours_later(self):
+        got = self.answer("blocks", "--last", "1")
+        data = self.written_payload()
+        self.assertEqual(len(got["blocks"]), 1)
+        b = got["blocks"][0]
+        self.assertEqual(b["billed_equiv"], data["blocks"][-1][3])
+        self.assertEqual(b["window_end_epoch"] - b["start_epoch"], 5 * 3600)
+        ids = {p["id"] for p in data["projects"]}
+        self.assertLessEqual(set(b["top_projects"]), ids)
+
+
 def _private_tokens():
     """Strings identifying the machine running this suite, derived rather than
     hardcoded so the repo ships no one's identity and every user's run checks
