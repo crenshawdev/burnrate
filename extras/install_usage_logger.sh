@@ -171,7 +171,7 @@ cp -p "$SETTINGS" "$BK" || exit 1
 echo "backed up settings.json -> $BK"
 
 python3 - "$SETTINGS" "$INSTALLED" <<'PY' || exit 1
-import json, os, shlex, sys, tempfile
+import json, os, shlex, sys
 p, w = sys.argv[1], sys.argv[2]
 with open(p, encoding="utf-8") as fh:
     d = json.load(fh)
@@ -189,19 +189,22 @@ elif not isinstance(sl, dict):
 sl["command"] = shlex.quote(w)
 sl.setdefault("type", "command")
 d["statusLine"] = sl
-# Write through a temp file in the same directory and rename over the target,
-# so a failure mid-write cannot leave a truncated settings.json behind.
-fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p) or ".", prefix=".settings-")
-try:
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(d, fh, indent=2)
-        fh.write("\n")
-    os.chmod(tmp, os.stat(p).st_mode & 0o7777)
-    os.replace(tmp, p)
-except Exception:
-    if os.path.exists(tmp):
-        os.unlink(tmp)
-    raise
+# Edit the file IN PLACE. Never write a temp file and rename over the target:
+# a rename replaces the name, so it silently changes what settings.json IS.
+# Aimed at a stow/yadm symlink it deletes the link and leaves a regular file
+# the dotfiles repo never sees; it breaks hardlinks; and it resets owner,
+# group and xattrs to whatever the temp file had. Writing through the existing
+# handle keeps the inode and every one of those properties, so this installer
+# changes the file's CONTENT and nothing else about how the system manages it.
+#
+# The cost is a truncate-then-write window: serialize completely first so the
+# window is one write() call, and the timestamped backup taken moments ago is
+# the recovery path if it is ever interrupted.
+blob = json.dumps(d, indent=2) + "\n"
+with open(p, "w", encoding="utf-8") as fh:
+    fh.write(blob)
+    fh.flush()
+    os.fsync(fh.fileno())
 print("statusLine.command updated")
 PY
 

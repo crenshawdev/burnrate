@@ -1825,6 +1825,57 @@ class TestUsageLoggerInstall(unittest.TestCase):
             self.assertEqual(got["statusLine"][key],
                              FULL_SETTINGS["statusLine"][key], key)
 
+    def test_apply_edits_in_place_and_keeps_a_symlinked_settings_a_symlink(self):
+        """A settings.json managed by stow/yadm is a SYMLINK into a dotfiles
+        repo. Replacing the name instead of writing through it deletes the
+        link, so the repo never sees the change and the next `stow -R` puts
+        the old statusLine back while inner-command still exists - after
+        which the clobber guard refuses every reinstall. Falsified by
+        restoring the mkstemp+os.replace write: the link becomes a regular
+        file and the repo copy still says `echo hi`."""
+        cfg = self.config()
+        repo = tempfile.mkdtemp(dir=TMP)
+        target = os.path.join(repo, "settings.json")
+        with open(target, "w", encoding="utf-8") as fh:
+            json.dump(FULL_SETTINGS, fh, indent=2)
+        os.chmod(target, 0o600)
+        link = os.path.join(cfg, "settings.json")
+        os.symlink(target, link)
+        inode = os.stat(target).st_ino
+
+        proc = self.install(cfg, "--apply")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        self.assertTrue(os.path.islink(link), "the symlink was replaced")
+        self.assertEqual(os.stat(target).st_ino, inode, "not written in place")
+        self.assertEqual(os.stat(target).st_mode & 0o7777, 0o600)
+        # the dotfiles repo's own copy is what has to carry the change
+        got = json.loads(self.read(target))
+        self.assertEqual(got["statusLine"]["command"], self.installed(cfg))
+        self.assertEqual(got["cleanupPeriodDays"], 365)
+        self.assertEqual(got["statusLine"]["padding"],
+                         FULL_SETTINGS["statusLine"]["padding"])
+        self.assertEqual([f for f in os.listdir(repo)
+                          if f.startswith(".settings-")], [])
+
+    def test_apply_does_not_break_a_hardlinked_settings(self):
+        """Same rail as the symlink case, one the resolved-path variant would
+        still have broken: a rename detaches every other name for the inode.
+        Falsified by any write that replaces rather than truncates - link
+        count drops to 1 and the second name keeps the stale content."""
+        cfg = self.config()
+        repo = tempfile.mkdtemp(dir=TMP)
+        target = os.path.join(repo, "settings.json")
+        with open(target, "w", encoding="utf-8") as fh:
+            json.dump(FULL_SETTINGS, fh, indent=2)
+        os.link(target, os.path.join(cfg, "settings.json"))
+
+        self.assertEqual(self.install(cfg, "--apply").returncode, 0)
+
+        self.assertEqual(os.stat(target).st_nlink, 2, "hardlink was broken")
+        self.assertEqual(json.loads(self.read(target))["statusLine"]["command"],
+                         self.installed(cfg))
+
     def test_a_second_apply_refuses_to_double_wrap(self):
         cfg = self.config(FULL_SETTINGS)
         self.assertEqual(self.install(cfg, "--apply").returncode, 0)

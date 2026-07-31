@@ -134,6 +134,11 @@ separately if you actually want it gone.
   every step that can fail has succeeded.
 - `settings.json` is copied to a timestamped backup before any edit, and
   rewritten through a JSON parser, so every other key keeps its value.
+- `settings.json` is edited **in place**. The installer changes what is inside
+  the file and nothing about the file itself: a symlink into a dotfiles repo
+  stays a symlink and the repo's own copy receives the change, a hardlink keeps
+  its other names, and the inode, owner, mode and extended attributes are the
+  ones you had. Nothing here writes a temp file and renames it over yours.
 - The wrapper propagates the inner command's exit status. Claude Code uses a
   statusline child's output only when it exited 0, so a swallowed status is a
   blank status bar.
