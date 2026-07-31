@@ -968,6 +968,11 @@ def main():
                     help="bucket days at a fixed UTC offset instead of the "
                          "system's local time (which is the default and "
                          "follows DST)")
+    ap.add_argument("--range", choices=["7", "14", "30", "90", "all"],
+                    default="30", metavar="{7,14,30,90,all}",
+                    help="date window the opened report starts on, in days "
+                         "(or 'all'); the report's own preset buttons still "
+                         "change it client-side")
     ap.add_argument("--root", metavar="DIR",
                     help="transcript tree; default $CLAUDE_PROJECTS, else "
                          "$CLAUDE_CONFIG_DIR/projects, else ~/.claude/projects")
@@ -1012,8 +1017,11 @@ def main():
     # inside a string value -- JSON's structural characters are {}[]",: --
     # so this cannot corrupt the payload.
     blob = json.dumps(data, separators=(",", ":")).replace("<", "\\u003c")
+    # preset FIRST, data SECOND: the blob carries user strings (session
+    # titles), and substituting it first would let a title containing the
+    # literal __PRESET__ be rewritten by the second pass.
     with open(hpath, "w", encoding="utf-8") as fh:
-        fh.write(PAGE.replace("__DATA__", blob))
+        fh.write(PAGE.replace("__PRESET__", a.range).replace("__DATA__", blob))
 
     tot = sum(r[6] for r in data["daily"])
     days = sorted({r[0] for r in data["daily"]})
@@ -1257,7 +1265,7 @@ const MAXDAY = allDays[allDays.length-1] || epochDay(Date.now()/1000);
 const MINDAY = allDays[0] || MAXDAY;
 
 // ---- state ----
-const state = { preset: '30', d0: null, d1: null, projs: null };  // projs null = all
+const state = { preset: '__PRESET__', d0: null, d1: null, projs: null };  // projs null = all
 rangeFromPreset();
 
 function rangeFromPreset(){
