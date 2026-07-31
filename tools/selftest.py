@@ -1891,6 +1891,35 @@ class TestUsageLoggerInstall(unittest.TestCase):
         self.assertEqual(self.read(os.path.join(elsewhere, "inner-command")),
                          "echo hi")
 
+    def test_a_config_dir_holding_a_space_still_runs(self):
+        """Claude Code runs statusLine.command through a shell, so the value
+        this installer writes has to survive one. WSL is a supported target and
+        /mnt/c/Users/First Last is its ordinary shape: unquoted, the shell
+        word-splits it, the statusline exits 127 and goes blank, and the
+        installer exits 0 reporting success. Asserted by RUNNING the string
+        that landed in settings.json, since comparing it to a path is exactly
+        the check that cannot see the difference."""
+        cfg = os.path.join(tempfile.mkdtemp(dir=TMP), "D dir")
+        os.makedirs(cfg)
+        with open(os.path.join(cfg, "settings.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump(FULL_SETTINGS, fh, indent=2)
+        proc = self.install(cfg, "--apply")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        cmd = self.settings(cfg)["statusLine"]["command"]
+        env = base_env(CLAUDE_CONFIG_DIR=cfg, HOME=tempfile.mkdtemp(dir=TMP))
+        ran = subprocess.run(["bash", "-c", cmd], input=rl_payload(), env=env,
+                             capture_output=True, text=True)
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertEqual(ran.stdout, "hi\n", ran.stderr)
+        self.assertTrue(os.path.exists(os.path.join(cfg, "usage-logger",
+                                                    "usage-log.jsonl")))
+        # and the double-wrap guard still recognizes what it wrote
+        again = self.install(cfg, "--apply")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertIn("Already wrapped", again.stdout)
+
     def test_the_inner_command_refusal_says_how_to_recover(self):
         # the refusal is reachable on every retry, so a message that only
         # names the obstacle leaves the user stuck at it

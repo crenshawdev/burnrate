@@ -171,7 +171,7 @@ cp -p "$SETTINGS" "$BK" || exit 1
 echo "backed up settings.json -> $BK"
 
 python3 - "$SETTINGS" "$INSTALLED" <<'PY' || exit 1
-import json, os, sys, tempfile
+import json, os, shlex, sys, tempfile
 p, w = sys.argv[1], sys.argv[2]
 with open(p, encoding="utf-8") as fh:
     d = json.load(fh)
@@ -182,7 +182,11 @@ elif not isinstance(sl, dict):
     # unreachable via this script (the read above refuses it), so reaching it
     # means the file changed underneath us: stop rather than discard it
     sys.exit("statusLine is no longer an object; refusing to replace it")
-sl["command"] = w
+# Claude Code runs statusLine.command through a shell, so a bare path with a
+# space in it word-splits: /mnt/c/Users/First Last/... is a normal WSL home and
+# a normal config dir, and the unquoted form dies with exit 127 while this
+# script reports success. shlex.quote leaves an ordinary path untouched.
+sl["command"] = shlex.quote(w)
 sl.setdefault("type", "command")
 d["statusLine"] = sl
 # Write through a temp file in the same directory and rename over the target,
