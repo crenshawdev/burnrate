@@ -1626,6 +1626,20 @@ class TestPluginPackaging(unittest.TestCase):
         self.assertTrue(os.path.exists(SKILL_MD), SKILL_MD)
         self.assertEqual(frontmatter(SKILL_MD).get("name"), "burnrate")
 
+    def test_skill_md_calls_the_helper_through_the_plugin_root(self):
+        """Under a plugin, $CLAUDE_PROJECT_DIR is the USER's project, which has
+        no helper, and `git rev-parse` resolves the user's repository root --
+        so the old path either fails or runs something unrelated. Only
+        ${CLAUDE_PLUGIN_ROOT}, which the loader substitutes into this text,
+        names the installed copy."""
+        with open(SKILL_MD, encoding="utf-8") as fh:
+            body = fh.read()
+        self.assertIn(
+            "${CLAUDE_PLUGIN_ROOT}/skills/burnrate/scripts/burnrate_skill.py",
+            body)
+        self.assertNotIn("CLAUDE_PROJECT_DIR", body)
+        self.assertNotIn("rev-parse", body)
+
     def test_a_plugin_shaped_copy_runs_its_own_tool(self):
         """An installed plugin is a copy of this repo under a cache directory
         with no git and no checkout around it. The helper resolves burnrate.py

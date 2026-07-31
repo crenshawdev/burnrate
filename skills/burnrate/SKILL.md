@@ -17,13 +17,20 @@ Every action goes through one script. Never write inline Python against
 a standalone tool that runs on its own as `python3 burnrate.py`.
 
 ```
-python3 "${CLAUDE_PROJECT_DIR:-.}/.claude/skills/burnrate/scripts/burnrate_skill.py" ...
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/burnrate/scripts/burnrate_skill.py" ...
 ```
 
-If that path does not exist, resolve the repository root once with
-`git rev-parse --show-toplevel` and use
-`<root>/.claude/skills/burnrate/scripts/burnrate_skill.py` for every call in the
-turn.
+That path is inside this plugin, and the helper runs the `burnrate.py` that
+ships with it -- never a copy in the user's project, and never a guess from the
+working directory.
+
+`${CLAUDE_PLUGIN_ROOT}` is substituted into this text when the skill loads as a
+plugin. If the literal characters `${CLAUDE_PLUGIN_ROOT}` are still sitting in
+the command above, this skill was not loaded as a plugin: use its own base
+directory instead -- the absolute path Claude Code stated when it loaded the
+skill -- and call `<base>/scripts/burnrate_skill.py` for every call in the turn.
+Never hand the unsubstituted literal to bash; the shell expands it to nothing
+and the call dies on `/skills/burnrate/scripts/burnrate_skill.py`.
 
 ## Routing
 
@@ -43,6 +50,9 @@ Look at the words the user passed:
 `run` streams the tool's own output. Report back the `wrote:` path and the
 one-line totals (range, billed-equiv, blocks, projects). Do not paste the whole
 output.
+
+That `wrote:` path is under the user's own platform cache directory, not inside
+this plugin, so report it exactly as the tool printed it.
 
 ## Answering a question
 
