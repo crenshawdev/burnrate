@@ -1731,14 +1731,16 @@ class TestUsageLoggerInstall(unittest.TestCase):
     Claude Code accepts, since a file holding only {command, type} could not
     catch a rewrite that drops the rest."""
 
-    def config(self, settings=None):
+    def config(self, settings=None, raw=None):
         """A throwaway config dir. HOME is thrown away too, so a derivation
-        that falls back to $HOME/.claude cannot reach the real one."""
+        that falls back to $HOME/.claude cannot reach the real one. `raw`
+        writes the file verbatim, for the shapes json.dump cannot produce."""
         d = tempfile.mkdtemp(dir=TMP)
-        if settings is not None:
+        if settings is not None or raw is not None:
             with open(os.path.join(d, "settings.json"), "w",
                       encoding="utf-8") as fh:
-                json.dump(settings, fh, indent=2)
+                fh.write(raw if raw is not None
+                         else json.dumps(settings, indent=2))
         return d
 
     def install(self, cfg, *args, logger_dir=None):
@@ -1825,6 +1827,82 @@ class TestUsageLoggerInstall(unittest.TestCase):
         self.assertEqual(self.settings(cfg)["statusLine"]["command"],
                          "echo hi")
         self.assertEqual(self.read(inner), "my-real-statusline --flag")
+
+    def test_an_unparseable_settings_file_stops_before_anything_is_written(self):
+        """A settings.json the installer cannot read is not a settings.json
+        with no statusline. An unchecked read fails to an empty command, which
+        reads as "(none configured)" for a file that configures one, and the
+        apply that follows saves an EMPTY inner-command over the user's real
+        status bar."""
+        cfg = self.config(raw='{"statusLine": {"command": "echo hi",},}\n')
+        path = os.path.join(cfg, "settings.json")
+        before = self.read(path, "rb")
+        for args in ((), ("--apply",)):
+            proc = self.install(cfg, *args)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout)
+            self.assertNotIn("none configured", proc.stdout)
+            self.assertIn(path, proc.stderr)
+            self.assertEqual(self.read(path, "rb"), before)
+            self.assertFalse(os.path.exists(os.path.join(cfg, "usage-logger")))
+            self.assertEqual(self.backups(cfg), [])
+
+    def test_a_statusline_of_the_wrong_shape_is_refused_not_replaced(self):
+        """Discarding these into a backup and writing the wrapper over them
+        loses a working status bar: a string statusLine goes wholesale, and a
+        list command lands in inner-command as a Python repr that no shell can
+        run, while the installer reports it preserved verbatim."""
+        for raw in ('{"statusLine": "my-real-statusline"}',
+                    '{"statusLine": {"type": "command",'
+                    ' "command": ["bash", "-c", "real"]}}'):
+            cfg = self.config(raw=raw + "\n")
+            path = os.path.join(cfg, "settings.json")
+            before = self.read(path, "rb")
+            proc = self.install(cfg, "--apply")
+            self.assertNotEqual(proc.returncode, 0, proc.stdout)
+            self.assertEqual(self.read(path, "rb"), before, raw)
+            self.assertFalse(os.path.exists(os.path.join(cfg, "usage-logger")),
+                             raw)
+            self.assertEqual(self.backups(cfg), [])
+
+    @unittest.skipIf(os.name != "posix" or os.geteuid() == 0,
+                     "needs POSIX modes and a non-root user")
+    def test_a_failed_apply_leaves_nothing_that_blocks_the_next_run(self):
+        """Whatever a half-finished install leaves behind, an inner-command is
+        the one thing that traps the user: the clobber guard then refuses every
+        later attempt, and the undo instructions naming that file print only on
+        the success path they never reach. The saved original therefore takes
+        that name last, after every step that can fail."""
+        cfg = self.config(FULL_SETTINGS)
+        elsewhere = os.path.join(tempfile.mkdtemp(dir=TMP), "usage-logger")
+        # the backup is written beside settings.json, so an unwritable config
+        # dir fails the run at a point where the state dir is already populated
+        os.chmod(cfg, 0o500)
+        self.addCleanup(os.chmod, cfg, 0o700)
+        proc = self.install(cfg, "--apply", logger_dir=elsewhere)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertFalse(os.path.exists(os.path.join(elsewhere,
+                                                     "inner-command")))
+        self.assertEqual(self.backups(cfg), [])
+        self.assertEqual(self.settings(cfg)["statusLine"]["command"], "echo hi")
+
+        os.chmod(cfg, 0o700)
+        retry = self.install(cfg, "--apply", logger_dir=elsewhere)
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(self.read(os.path.join(elsewhere, "inner-command")),
+                         "echo hi")
+
+    def test_the_inner_command_refusal_says_how_to_recover(self):
+        # the refusal is reachable on every retry, so a message that only
+        # names the obstacle leaves the user stuck at it
+        cfg = self.config(FULL_SETTINGS)
+        os.makedirs(os.path.join(cfg, "usage-logger"))
+        inner = os.path.join(cfg, "usage-logger", "inner-command")
+        with open(inner, "w", encoding="utf-8") as fh:
+            fh.write("my-real-statusline --flag")
+        proc = self.install(cfg, "--apply")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("rm -f", proc.stderr)
+        self.assertIn(inner, proc.stderr.split("rm -f", 1)[1])
 
     def test_settings_without_a_statusline_gain_a_valid_one(self):
         cfg = self.config({"cleanupPeriodDays": 365})

@@ -10,6 +10,11 @@
 #   - settings.json is backed up with a timestamp before any edit
 #   - double-wrapping is detected and refused
 #   - the JSON is rewritten with json.dump, so unrelated keys keep their values
+#   - a settings.json that cannot be parsed, or whose statusLine is not an
+#     object carrying a string command, stops the run before anything is
+#     written rather than being read as "no statusline configured"
+#   - a run that fails partway removes what it created, so a retry is never
+#     blocked by the leftovers of the attempt before it
 #
 # The wrapper is COPIED into the state directory and settings.json points at
 # that copy, not at wherever this repository happens to sit. A path into a
@@ -42,13 +47,56 @@ if [ ! -r "$SETTINGS" ]; then
 fi
 [ -r "$WRAPPER" ] || { echo "wrapper not found at $WRAPPER" >&2; exit 1; }
 
+# Read the current command. An unreadable, unparseable or unexpectedly shaped
+# settings.json has to be a hard stop HERE, before anything is written: an
+# unchecked read fails to an empty CUR, which is indistinguishable from "no
+# statusline configured" and would wrap a working status bar into nothing.
 CUR=$(python3 - "$SETTINGS" <<'PY'
-import json,sys
-d=json.load(open(sys.argv[1]))
-sl=d.get("statusLine") or {}
-print(sl.get("command","") if isinstance(sl,dict) else "")
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as fh:
+        d = json.load(fh)
+except Exception as exc:
+    sys.stderr.write("cannot parse %s as JSON:\n  %s\n" % (path, exc))
+    sys.exit(2)
+if not isinstance(d, dict):
+    sys.stderr.write("%s is a %s at the top level, not a JSON object.\n"
+                     % (path, type(d).__name__))
+    sys.exit(3)
+sl = d.get("statusLine")
+if sl is None:
+    sys.exit(0)
+if not isinstance(sl, dict):
+    sys.stderr.write("statusLine in %s is a %s, not an object.\n"
+                     % (path, type(sl).__name__))
+    sys.exit(4)
+cmd = sl.get("command")
+if cmd is None:
+    sys.exit(0)
+if not isinstance(cmd, str):
+    sys.stderr.write("statusLine.command in %s is a %s, not a string.\n"
+                     % (path, type(cmd).__name__))
+    sys.exit(5)
+sys.stdout.write(cmd)
 PY
 )
+RC=$?
+if [ "$RC" -ne 0 ]; then
+    echo >&2
+    if [ "$RC" -eq 2 ] || [ "$RC" -eq 3 ]; then
+        echo "That file draws your status bar and this installer will not guess at" >&2
+        echo "what is in it. Fix the JSON by hand (a trailing comma or a stray" >&2
+        echo "character is the usual cause), then re-run this script." >&2
+    else
+        echo "This installer only wraps a statusLine object whose command is a" >&2
+        echo "string, because that string is what gets saved and replayed. Put your" >&2
+        echo "statusline in that shape by hand, then re-run this script." >&2
+    fi
+    echo >&2
+    echo "Nothing was written." >&2
+    exit 1
+fi
 
 echo "settings file : $SETTINGS"
 echo "wrapper       : $WRAPPER"
@@ -93,11 +141,26 @@ mkdir -p "$DIR" || exit 1
 # Guard: never clobber an already-saved original.
 if [ -f "$INNER" ]; then
     echo "refusing to overwrite existing $INNER" >&2
+    echo >&2
     echo "its current contents:" >&2
     cat "$INNER" >&2
+    echo >&2
+    echo "That file is a statusline command saved by an earlier install of this" >&2
+    echo "wrapper, and overwriting it would lose it for good. Put it back into" >&2
+    echo "settings.json if you still want that statusline, then remove the file" >&2
+    echo "and re-run this script:" >&2
+    echo >&2
+    echo "    rm -f \"$INNER\"" >&2
     exit 1
 fi
-printf '%s' "$CUR" > "$INNER" || exit 1
+
+# The saved original is staged under a name the guard above ignores and only
+# takes its real name once every other step has succeeded. A run that dies
+# partway therefore leaves no inner-command to trip that guard on the retry,
+# and this script never has to delete anything to clean up after itself. The
+# staging file is rewritten by the next run, and nothing reads it.
+STAGED="$DIR/.inner-command.new"
+printf '%s' "$CUR" > "$STAGED" || exit 1
 
 cp "$WRAPPER" "$INSTALLED" || exit 1
 chmod +x "$INSTALLED" || exit 1
@@ -108,19 +171,45 @@ cp -p "$SETTINGS" "$BK" || exit 1
 echo "backed up settings.json -> $BK"
 
 python3 - "$SETTINGS" "$INSTALLED" <<'PY' || exit 1
-import json,sys
-p,w=sys.argv[1],sys.argv[2]
-d=json.load(open(p))
-sl=d.get("statusLine")
-if not isinstance(sl,dict):
-    sl={"type":"command"}
-sl["command"]=w
-sl.setdefault("type","command")
-d["statusLine"]=sl
-json.dump(d,open(p,"w"),indent=2)
-open(p,"a").write("\n")
+import json, os, sys, tempfile
+p, w = sys.argv[1], sys.argv[2]
+with open(p, encoding="utf-8") as fh:
+    d = json.load(fh)
+sl = d.get("statusLine")
+if sl is None:
+    sl = {"type": "command"}
+elif not isinstance(sl, dict):
+    # unreachable via this script (the read above refuses it), so reaching it
+    # means the file changed underneath us: stop rather than discard it
+    sys.exit("statusLine is no longer an object; refusing to replace it")
+sl["command"] = w
+sl.setdefault("type", "command")
+d["statusLine"] = sl
+# Write through a temp file in the same directory and rename over the target,
+# so a failure mid-write cannot leave a truncated settings.json behind.
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p) or ".", prefix=".settings-")
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(d, fh, indent=2)
+        fh.write("\n")
+    os.chmod(tmp, os.stat(p).st_mode & 0o7777)
+    os.replace(tmp, p)
+except Exception:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+    raise
 print("statusLine.command updated")
 PY
+
+# Commit point: settings.json now names the wrapper, so the saved original
+# takes the name the wrapper reads. A rename within one directory, over a path
+# the guard above proved empty.
+if ! mv "$STAGED" "$INNER"; then
+    echo "could not move $STAGED to $INNER" >&2
+    echo "settings.json already points at the wrapper, so move that file into" >&2
+    echo "place by hand -- it holds your original statusline command." >&2
+    exit 1
+fi
 
 echo
 echo "Done. Restart Claude Code (or start a new session) for the statusline to reload."

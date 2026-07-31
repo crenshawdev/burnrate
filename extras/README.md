@@ -123,9 +123,15 @@ separately if you actually want it gone.
   survive a round trip.
 - An existing `inner-command` is never overwritten. The installer prints its
   contents and stops, because that file may be the last copy of a statusline
-  you have.
+  you have, and names the file to remove once you no longer need it.
 - A `statusLine.command` already pointing at the wrapper is refused rather than
   wrapped again.
+- A `settings.json` the installer cannot parse, or whose `statusLine` is not an
+  object carrying a string command, stops the run before anything is written.
+  An unreadable settings file is never treated as "no statusline configured".
+- A run that fails partway leaves no `inner-command` behind, so the guard above
+  cannot trap you on the retry: the saved original takes that name only once
+  every step that can fail has succeeded.
 - `settings.json` is copied to a timestamped backup before any edit, and
   rewritten through a JSON parser, so every other key keeps its value.
 - The wrapper propagates the inner command's exit status. Claude Code uses a
