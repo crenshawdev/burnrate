@@ -10,6 +10,23 @@ report works offline and can be reopened without re-running anything.
 It reads local files and writes local files. No network calls, no telemetry, no
 account required.
 
+## Contents
+
+- [Install](#install)
+- [Running it](#running-it)
+- [What it reads](#what-it-reads)
+- [What it computes](#what-it-computes)
+- [What the dashboard shows](#what-the-dashboard-shows)
+- [Why your history is shallow](#why-your-history-is-shallow)
+- [What a generated report embeds](#what-a-generated-report-embeds)
+- [Flags](#flags)
+- [Cache](#cache)
+- [The /burnrate skill](#the-burnrate-skill)
+- [The 5h/7d cap card](#the-5h7d-cap-card)
+- [Troubleshooting](#troubleshooting)
+- [Verifying a copy](#verifying-a-copy)
+- [License](#license)
+
 ## Install
 
 Copy `burnrate.py` anywhere and run it:
@@ -23,6 +40,60 @@ That's the whole install. Python 3.8 or newer, standard library only.
 `zstandard` is optional and needed solely to read `.zst` archives. Without it
 the tool still runs against your live transcripts and says so in the report
 subtitle instead of failing.
+
+## Running it
+
+Three ways in, all of them running the same `burnrate.py`.
+
+### The tool directly
+
+```sh
+python3 burnrate.py                        # last 30 days, opens the report
+python3 burnrate.py --range 7              # open on the 7-day preset
+python3 burnrate.py --range all --rebuild  # everything, ignoring the cache
+python3 burnrate.py --no-open --json       # write the report and dashboard_data.json, launch nothing
+python3 burnrate.py --archive ~/backups/transcripts
+python3 burnrate.py --help                 # every flag
+```
+
+Every flag is listed under [Flags](#flags).
+
+### The /burnrate skill
+
+Once the plugin is installed:
+
+```
+/burnrate                              build the dashboard and open it
+/burnrate 7d                           open on the 7-day preset
+/burnrate 30d rebuild                  reparse everything, 30-day preset
+/burnrate all no-archive               live transcripts only, full history
+/burnrate what did yesterday cost      answered in chat, no browser
+/burnrate which project burned most this week
+/burnrate how much is left in this block
+```
+
+The words `7d`, `14d`, `30d`, `90d`, `all`, `rebuild` and `no-archive` map onto
+the flags of the same name. Anything else is treated as a question.
+
+### The skill helper, from a clone
+
+The helper is the skill's only entry point into the tool, and it runs on its own
+with nothing installed:
+
+```sh
+python3 skills/burnrate/scripts/burnrate_skill.py run 7d
+python3 skills/burnrate/scripts/burnrate_skill.py run --dry-run 7d   # print the argv, run nothing
+python3 skills/burnrate/scripts/burnrate_skill.py ask --by day --last 7
+python3 skills/burnrate/scripts/burnrate_skill.py ask --day yesterday
+python3 skills/burnrate/scripts/burnrate_skill.py ask --by project,model --since 2026-07-01
+python3 skills/burnrate/scripts/burnrate_skill.py blocks --last 1
+```
+
+`run` builds and opens the report. `ask` prints the daily rows as JSON, grouped
+by any comma list of `day`, `project`, `command`, `model`, `effort`, `kind`, and
+never opens a browser; it reuses a payload younger than 15 minutes and rebuilds
+otherwise. `blocks` does the same for 5-hour rate-limit windows, which are
+account-wide and take no project filter. Each subcommand has its own `--help`.
 
 ## What it reads
 
@@ -67,6 +138,39 @@ Quoting the report's own footer:
 It exists so a cache-heavy day and a fresh-context day can be compared on one
 axis. It is not a price, it is not tied to any plan or rate card, and burnrate
 never converts it to currency.
+
+## What the dashboard shows
+
+Across the top: a date-range picker and a project filter. Both run client-side,
+so narrowing the range or picking projects re-renders every panel below without
+re-running the tool. Six summary tiles follow the filters:
+
+| Tile | Reads |
+|---|---|
+| Billed-equivalent tokens | Range total, with the percentage change against the prior window of the same length |
+| Daily average | Total over active days, not calendar days |
+| Peak day | Heaviest single day and its date |
+| Output tokens | Output total and the message count behind it |
+| 5h blocks | How many rate-limit blocks the range covers, and their median burn |
+| Peak context | Largest live window reached, and the session count |
+
+Then the panels:
+
+- **Daily burn by project**, stacked per day. The main chart.
+- **Five-hour blocks**, the rate-limit windows. A block opens on the hour of
+  first activity and runs five hours. Account-wide by design, so the project
+  filter does not apply to it.
+- **Rolling 7-day burn**, the trailing weekly total, which is the pacing signal
+  against a weekly window.
+- **Token composition**, the billed-weighted share of input, cache write and
+  cache read per day. This is where a cache-heavy pattern becomes visible.
+- **By command**, **by model**, **by effort**, and **main vs subagents**, four
+  breakdown bars over the filtered range.
+- **Rate-limit windows**, logged used-percentage from the statusline payload.
+  Renders only when the [cap card](#the-5h7d-cap-card) logger has been running.
+- **Top sessions**, the heaviest sessions in range, with peak context,
+  compactions, interrupts and subagent counts.
+- **Daily totals table**, collapsed by default, for reading exact numbers.
 
 ## Why your history is shallow
 
@@ -156,43 +260,46 @@ claude plugin marketplace add https://git.jcrenshaw.dev/crenshawdev/burnrate.git
 claude plugin install burnrate@burnrate
 ```
 
-Both steps are also available inside a session through `/plugin`. The GitHub
-mirror works as an alternative source for the first one:
+The same two steps work inside a running session through `/plugin`:
+
+```
+/plugin marketplace add https://git.jcrenshaw.dev/crenshawdev/burnrate.git
+/plugin install burnrate@burnrate
+```
+
+A bare `/plugin` opens the plugin manager if you would rather browse. The GitHub
+mirror works as an alternative source for the first step either way:
 
 ```sh
 claude plugin marketplace add crenshawdev/burnrate
 ```
 
-You may need to start a new session before `/burnrate` appears.
+Restart Claude Code, or start a new session, before `/burnrate` appears.
 
 The plugin ships this repository's own `burnrate.py` and the skill runs that
 copy, so nothing is copied by hand and no clone is required.
 
 A bare `/burnrate` builds the dashboard and opens it, writing it under the
-platform cache directory above rather than into your working tree. The words
-`7d`, `14d`, `30d`, `90d`, `all`, `rebuild` and `no-archive` map onto the flags
-of the same name, so `/burnrate 7d rebuild` is `--range 7 --rebuild`. Anything
-else is treated as a question: `/burnrate what did yesterday cost` is answered
-in chat from `dashboard_data.json`, without opening the report. The same privacy
-note applies to a report the skill builds; see "What a generated report embeds".
+platform cache directory above rather than into your working tree. The word and
+question forms are listed under [Running it](#running-it). The same privacy note
+applies to a report the skill builds; see
+[What a generated report embeds](#what-a-generated-report-embeds).
 
 ### Updating, disabling and removing
 
 | Command | Effect |
 |---|---|
 | `claude plugin update burnrate` | Pull a newer commit. Restart Claude Code to apply it. |
-| `claude plugin disable burnrate` | Turn it off. `/burnrate` goes away with it. |
-| `claude plugin enable burnrate` | Turn it back on. |
+| `claude plugin disable burnrate` | Turn it off. `/burnrate` goes away with it after a restart. |
+| `claude plugin enable burnrate` | Turn it back on, again after a restart. |
 | `claude plugin uninstall burnrate` | Remove it entirely. |
+
+Each of these has a `/plugin` equivalent inside a session.
 
 The skill is a wrapper, never a fork: it runs this repository's own
 `burnrate.py`, and `python3 burnrate.py` keeps working with the skill absent or
-the `skills/` directory deleted. Inside a clone the helper also runs directly,
-with nothing installed:
-
-```sh
-python3 skills/burnrate/scripts/burnrate_skill.py run 7d
-```
+the `skills/` directory deleted. Inside a clone the helper also runs directly
+with nothing installed; see [Running it](#running-it).
 
 ## The 5h/7d cap card
 
@@ -213,6 +320,43 @@ git clone https://git.jcrenshaw.dev/crenshawdev/burnrate.git
 cd burnrate
 bash extras/install_usage_logger.sh
 ```
+
+## Troubleshooting
+
+**"no data", or a report with nothing in it.** burnrate found no transcripts at
+the path it resolved. Check the resolution order under
+[What it reads](#what-it-reads) and point it explicitly:
+`python3 burnrate.py --root ~/.claude/projects`. An empty run means no files
+matched, which is a different thing from a real zero.
+
+**Only about a month of history.** Expected, and not a bug in burnrate. Claude
+Code prunes its own transcripts. See
+[Why your history is shallow](#why-your-history-is-shallow).
+
+**The printed `range :` line ignores `--range`.** It is reporting the whole
+parsed dataset, not the window you asked for. `--range` sets the preset the
+opened report starts on and nothing else, so the console line and the chart can
+disagree by design.
+
+**Archives are being skipped.** `.zst` archives need the optional `zstandard`
+package. Without it the tool runs on your live transcripts and says so in the
+report subtitle. Plain `<project>/*.jsonl` archive trees need nothing extra.
+
+**Stale numbers after a session you know happened.** The cache keys on files
+that changed. Force a full reparse with `--rebuild`, or delete the cache
+directory listed under [Cache](#cache).
+
+**No browser opened.** Run with `--no-open` and open the printed path yourself.
+The report is a single self-contained file and works offline.
+
+**`/burnrate` does not appear after installing the plugin.** Restart Claude Code
+or start a new session, then confirm it is installed and enabled with
+`claude plugin list`. A plugin skill can register under a qualified id, so check
+that `/burnrate` works rather than looking for a literal `/burnrate` row.
+
+**The 5h/7d cap card does not render.** Its logger is opt-in and installed
+separately. See [The 5h/7d cap card](#the-5h7d-cap-card). Every other panel works
+without it.
 
 ## Verifying a copy
 
