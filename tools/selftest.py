@@ -226,6 +226,20 @@ class TestRootResolution(unittest.TestCase):
         self.assertEqual(payload(out2)["rl"], [])
         self.assertFalse(payload(out2)["rl_installed"])
 
+    def test_rl_rows_carry_the_shape_the_logger_writes(self):
+        """A row count says nothing about the row. The logger writes SCALAR
+        percentages; against nested {"used_percentage": n} objects the payload
+        still carries four rows, and the chart's `v > 0` test then fails on
+        every one of them and renders 'Not enough data in range'."""
+        _, out = run()
+        rl = payload(out)["rl"]
+        self.assertEqual(rl, EXP["rl_rows"])
+        for ts, five, seven in rl:
+            self.assertIsInstance(ts, int)
+            for v in (five, seven):
+                self.assertIsInstance(v, (int, float))
+                self.assertNotIsInstance(v, bool)
+
     def test_missing_root_exits_two_with_its_own_message(self):
         # match the MESSAGE: argparse's own usage error is also exit 2, so an
         # exit-code-only assertion would pass with --root never wired up
