@@ -64,7 +64,7 @@ transcripts and says so in the report subtitle instead of failing.
 /burnrate 7d                           open on the 7-day preset
 /burnrate 30d rebuild                  reparse everything, 30-day preset
 /burnrate all no-archive               live transcripts only, full history
-/burnrate what did yesterday cost      answered in chat, no browser
+/burnrate how much did I burn yesterday   answered in chat, no browser
 /burnrate which project burned most this week
 /burnrate how much is left in this block
 ```
@@ -151,8 +151,10 @@ Then the panels:
   breakdown bars over the filtered range.
 - **Rate-limit windows**, logged used-percentage from the statusline payload.
   Renders only when the [cap card](#the-5h7d-cap-card) logger has been running.
-- **Top sessions**, the heaviest sessions in range, with peak context,
-  compactions, interrupts and subagent counts.
+- **Top sessions**, the heaviest sessions in range. Its `Billed-equiv` column
+  is the same [comparison unit](#billed-equiv-is-a-comparison-unit) as the tile
+  at the top, scoped to one session, not a currency amount. Alongside it: output
+  tokens, message count, peak context, compactions and subagent counts.
 - **Daily totals table**, collapsed by default, for reading exact numbers.
 
 ## Why your history is shallow
