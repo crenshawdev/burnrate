@@ -21,7 +21,7 @@ account required.
 - [What a generated report embeds](#what-a-generated-report-embeds)
 - [Flags](#flags)
 - [Cache](#cache)
-- [The /burnrate skill](#the-burnrate-skill)
+- [Updating, disabling and removing](#updating-disabling-and-removing)
 - [The 5h/7d cap card](#the-5h7d-cap-card)
 - [Troubleshooting](#troubleshooting)
 - [Verifying a copy](#verifying-a-copy)
@@ -29,38 +29,36 @@ account required.
 
 ## Install
 
-Copy `burnrate.py` anywhere and run it:
+burnrate installs as a Claude Code plugin. Two commands:
 
 ```sh
-python3 burnrate.py
+claude plugin marketplace add https://git.jcrenshaw.dev/crenshawdev/burnrate.git
+claude plugin install burnrate@burnrate
 ```
 
-That's the whole install. Python 3.8 or newer, standard library only.
+The same two steps work inside a running session:
 
-`zstandard` is optional and needed solely to read `.zst` archives. Without it
-the tool still runs against your live transcripts and says so in the report
-subtitle instead of failing.
+```
+/plugin marketplace add https://git.jcrenshaw.dev/crenshawdev/burnrate.git
+/plugin install burnrate@burnrate
+```
+
+A bare `/plugin` opens the plugin manager if you would rather browse. The GitHub
+mirror works as an alternative source for the first step either way:
+
+```sh
+claude plugin marketplace add crenshawdev/burnrate
+```
+
+Restart Claude Code, or start a new session, and `/burnrate` works in every
+project. The plugin carries the tool with it: nothing to copy, nothing to clone,
+no path to configure.
+
+Python 3.8 or newer, standard library only. `zstandard` is optional and needed
+solely to read `.zst` archives. Without it burnrate still runs against your live
+transcripts and says so in the report subtitle instead of failing.
 
 ## Running it
-
-Three ways in, all of them running the same `burnrate.py`.
-
-### The tool directly
-
-```sh
-python3 burnrate.py                        # last 30 days, opens the report
-python3 burnrate.py --range 7              # open on the 7-day preset
-python3 burnrate.py --range all --rebuild  # everything, ignoring the cache
-python3 burnrate.py --no-open --json       # write the report and dashboard_data.json, launch nothing
-python3 burnrate.py --archive ~/backups/transcripts
-python3 burnrate.py --help                 # every flag
-```
-
-Every flag is listed under [Flags](#flags).
-
-### The /burnrate skill
-
-Once the plugin is installed:
 
 ```
 /burnrate                              build the dashboard and open it
@@ -72,28 +70,14 @@ Once the plugin is installed:
 /burnrate how much is left in this block
 ```
 
-The words `7d`, `14d`, `30d`, `90d`, `all`, `rebuild` and `no-archive` map onto
-the flags of the same name. Anything else is treated as a question.
+The words `7d`, `14d`, `30d`, `90d`, `all`, `rebuild` and `no-archive` select
+the behavior described under [Flags](#flags). Anything else is treated as a
+question and answered in chat from the last run's data, without opening the
+report. The same privacy note applies to a report the skill builds; see
+[What a generated report embeds](#what-a-generated-report-embeds).
 
-### The skill helper, from a clone
-
-The helper is the skill's only entry point into the tool, and it runs on its own
-with nothing installed:
-
-```sh
-python3 skills/burnrate/scripts/burnrate_skill.py run 7d
-python3 skills/burnrate/scripts/burnrate_skill.py run --dry-run 7d   # print the argv, run nothing
-python3 skills/burnrate/scripts/burnrate_skill.py ask --by day --last 7
-python3 skills/burnrate/scripts/burnrate_skill.py ask --day yesterday
-python3 skills/burnrate/scripts/burnrate_skill.py ask --by project,model --since 2026-07-01
-python3 skills/burnrate/scripts/burnrate_skill.py blocks --last 1
-```
-
-`run` builds and opens the report. `ask` prints the daily rows as JSON, grouped
-by any comma list of `day`, `project`, `command`, `model`, `effort`, `kind`, and
-never opens a browser; it reuses a payload younger than 15 minutes and rebuilds
-otherwise. `blocks` does the same for 5-hour rate-limit windows, which are
-account-wide and take no project filter. Each subcommand has its own `--help`.
+A bare `/burnrate` writes the report under the platform
+[cache directory](#cache) rather than into your working tree.
 
 ## What it reads
 
@@ -218,17 +202,20 @@ session titles alone routinely describe what you were working on and for whom.
 Treat a generated report as private unless you have read it and decided
 otherwise.
 
-The report is written next to `burnrate.py` by default. `.gitignore` it if you
-run the tool inside a repository.
+The report is written under the platform [cache directory](#cache), outside any
+project, so it never lands in a repository by accident.
 
 ## Flags
+
+These are the tool's own flags. `/burnrate`'s window words select among them;
+they are listed so the words have a precise meaning.
 
 | Flag | Effect |
 |---|---|
 | `--tz-offset HOURS` | Bucket days at a fixed UTC offset. Default is system local time, DST-aware. |
 | `--range {7,14,30,90,all}` | Date window the opened report starts on, in days or `all`. Default `30`; the report's own preset buttons still change it. |
 | `--root DIR` | Transcript tree to read. See resolution order above. |
-| `--out DIR` | Where to write the report. Defaults to the directory holding `burnrate.py`. |
+| `--out DIR` | Where to write the report. `/burnrate` always points this at the cache directory. |
 | `--archive DIR` | Extra transcript source: a `<project>/*.jsonl` tree or a `<project>/<session>/*.zst` archive. |
 | `--no-archive` | Ignore every archive source, auto-detected or not. |
 | `--rebuild` | Ignore the cache and reparse everything. |
@@ -250,42 +237,7 @@ directory:
 
 Delete that directory or pass `--rebuild` to force a full reparse.
 
-## The /burnrate skill
-
-burnrate installs as a Claude Code plugin, which puts `/burnrate` in every
-project:
-
-```sh
-claude plugin marketplace add https://git.jcrenshaw.dev/crenshawdev/burnrate.git
-claude plugin install burnrate@burnrate
-```
-
-The same two steps work inside a running session through `/plugin`:
-
-```
-/plugin marketplace add https://git.jcrenshaw.dev/crenshawdev/burnrate.git
-/plugin install burnrate@burnrate
-```
-
-A bare `/plugin` opens the plugin manager if you would rather browse. The GitHub
-mirror works as an alternative source for the first step either way:
-
-```sh
-claude plugin marketplace add crenshawdev/burnrate
-```
-
-Restart Claude Code, or start a new session, before `/burnrate` appears.
-
-The plugin ships this repository's own `burnrate.py` and the skill runs that
-copy, so nothing is copied by hand and no clone is required.
-
-A bare `/burnrate` builds the dashboard and opens it, writing it under the
-platform cache directory above rather than into your working tree. The word and
-question forms are listed under [Running it](#running-it). The same privacy note
-applies to a report the skill builds; see
-[What a generated report embeds](#what-a-generated-report-embeds).
-
-### Updating, disabling and removing
+## Updating, disabling and removing
 
 | Command | Effect |
 |---|---|
@@ -296,10 +248,8 @@ applies to a report the skill builds; see
 
 Each of these has a `/plugin` equivalent inside a session.
 
-The skill is a wrapper, never a fork: it runs this repository's own
-`burnrate.py`, and `python3 burnrate.py` keeps working with the skill absent or
-the `skills/` directory deleted. Inside a clone the helper also runs directly
-with nothing installed; see [Running it](#running-it).
+The skill is a wrapper, never a fork. It runs the `burnrate.py` the plugin
+shipped, so an update moves both at once and there is no second copy to drift.
 
 ## The 5h/7d cap card
 
@@ -325,29 +275,28 @@ bash extras/install_usage_logger.sh
 
 **"no data", or a report with nothing in it.** burnrate found no transcripts at
 the path it resolved. Check the resolution order under
-[What it reads](#what-it-reads) and point it explicitly:
-`python3 burnrate.py --root ~/.claude/projects`. An empty run means no files
-matched, which is a different thing from a real zero.
+[What it reads](#what-it-reads); setting `$CLAUDE_PROJECTS` or
+`$CLAUDE_CONFIG_DIR` in your environment redirects it. An empty run means no
+files matched, which is a different thing from a real zero.
 
 **Only about a month of history.** Expected, and not a bug in burnrate. Claude
 Code prunes its own transcripts. See
 [Why your history is shallow](#why-your-history-is-shallow).
 
-**The printed `range :` line ignores `--range`.** It is reporting the whole
-parsed dataset, not the window you asked for. `--range` sets the preset the
-opened report starts on and nothing else, so the console line and the chart can
-disagree by design.
+**`/burnrate 7d` reports a range wider than seven days.** The run line reports
+the whole parsed dataset. The window word sets the preset the opened report
+starts on and nothing else, so that line and the chart disagree by design.
 
 **Archives are being skipped.** `.zst` archives need the optional `zstandard`
 package. Without it the tool runs on your live transcripts and says so in the
 report subtitle. Plain `<project>/*.jsonl` archive trees need nothing extra.
 
 **Stale numbers after a session you know happened.** The cache keys on files
-that changed. Force a full reparse with `--rebuild`, or delete the cache
+that changed. Force a full reparse with `/burnrate rebuild`, or delete the cache
 directory listed under [Cache](#cache).
 
-**No browser opened.** Run with `--no-open` and open the printed path yourself.
-The report is a single self-contained file and works offline.
+**No browser opened.** The run still reports the path it wrote. Open that file
+yourself; the report is self-contained and works offline.
 
 **`/burnrate` does not appear after installing the plugin.** Restart Claude Code
 or start a new session, then confirm it is installed and enabled with
