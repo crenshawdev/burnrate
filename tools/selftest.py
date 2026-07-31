@@ -1651,6 +1651,20 @@ class TestPluginPackaging(unittest.TestCase):
         self.assertNotEqual(argv[1], BR)
         self.assertEqual(argv[argv.index("--range") + 1], "7")
 
+    def test_a_run_writes_nothing_into_the_plugin_directory(self):
+        """The helper execs burnrate.py through the source loader, which caches
+        bytecode beside the file it loaded -- inside the installed plugin's own
+        directory, which Claude Code owns and re-copies on update. It also
+        falsifies the helper's own docstring, which promises the only writes
+        are burnrate.py's, inside the resolved output directory."""
+        root = self.plugin_copy()
+        self.dry_run(root, "7d")            # asserts rc 0 itself
+        found = [os.path.join(dirpath, name)
+                 for dirpath, dirs, files in os.walk(root)
+                 for name in dirs + files
+                 if name == "__pycache__" or name.endswith(".pyc")]
+        self.assertEqual(found, [], found)
+
 
 class TestRateLimitLogReader(unittest.TestCase):
     """LOG-01: the reader parses a file another program appends to many times a

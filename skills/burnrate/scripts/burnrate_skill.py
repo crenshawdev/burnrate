@@ -91,10 +91,22 @@ def find_tool():
 
 def load_tool(path):
     """burnrate.py as a module, for its own platform rules. Safe to import: it
-    guards main() behind `if __name__ == '__main__'`."""
+    guards main() behind `if __name__ == '__main__'`.
+
+    Bytecode is suppressed across the exec: the source loader caches a .pyc
+    beside the file it loaded, and under a plugin install that file sits in a
+    directory Claude Code owns and re-copies on update -- so every /burnrate
+    would leave a __pycache__ there for an update to clobber. The flag is
+    restored afterwards rather than set once, so this does not change
+    interpreter-wide behavior for anything imported later."""
     spec = importlib.util.spec_from_file_location("burnrate_tool", path)
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    prior = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.dont_write_bytecode = prior
     return mod
 
 
