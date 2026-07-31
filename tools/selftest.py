@@ -1228,6 +1228,118 @@ console.log(JSON.stringify([MINDAY, MAXDAY, state.d0, state.d1]));
             self.assertIn("||", line, line)
 
 
+def viewer_slice(html, start, end):
+    """The verbatim text between two markers in the generated report's script
+    block, so a case runs the shipped code rather than a paraphrase of it."""
+    body = html[html.index("<script>") + len("<script>"):]
+    i = body.index(start)
+    return body[i:body.index(end, i) + len(end)]
+
+
+RL_STUBS = """
+// DOM and chart stubs: enough for the rate-limit block, nothing more.
+const ELS = {};
+const elFor = id => (ELS[id] = ELS[id] || {style: {}, innerHTML: null});
+globalThis.document = { querySelector: s => elFor(s) };
+const CALLS = [];
+function lineChart(elId, days, seriesArr, unit){
+  CALLS.push({elId, days, series: seriesArr, unit});
+}
+"""
+
+
+class TestRateLimitCard(unittest.TestCase):
+    """AC5: the cap card appears only when the selected range holds more than
+    one sample. Proven at the payload level and by running the report's own
+    rate-limit block under a JS engine with DOM stubs -- not in a browser,
+    which nothing here has."""
+
+    def rl_block(self, out):
+        html = report(out)
+        inrange = next(ln for ln in html.splitlines()
+                       if ln.startswith("function inRange(d)"))
+        return (RL_STUBS + day_range_prologue(html) + "\n" + inrange + "\n"
+                + viewer_slice(html, "// rate-limit card",
+                               "} else $('#rlCard').style.display = 'none';")
+                + """
+console.log(JSON.stringify({
+  display: document.querySelector('#rlCard').style.display,
+  calls: CALLS,
+  rl: DATA.rl.length}));
+""")
+
+    def render_rl(self, out):
+        path = os.path.join(tempfile.mkdtemp(dir=TMP), "rl.js")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(self.rl_block(out))
+        r = subprocess.run([NODE, path], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return json.loads(r.stdout)
+
+    def one_sample_root(self):
+        """A copy of the fixture's primary tree whose log holds exactly one
+        in-range sample, taken verbatim from the fixture's own first line."""
+        d = tempfile.mkdtemp(dir=TMP)
+        root = os.path.join(d, ".claude", "projects")
+        shutil.copytree(P["primary"], root)
+        log = os.path.join(d, ".claude", "usage-logger", "usage-log.jsonl")
+        os.makedirs(os.path.dirname(log))
+        with open(P["rl_log"], encoding="utf-8") as fh:
+            first = fh.readline()
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write(first)
+        return root
+
+    def test_the_payload_carries_the_card_both_ways(self):
+        # the same claim without a JS engine, so it stays guarded on a machine
+        # that has none
+        _, out = run()
+        self.assertEqual(payload(out)["rl"], EXP["rl_rows"])
+        self.assertTrue(payload(out)["rl_installed"])
+        _, absent = run(["--root", P["alt"]])
+        self.assertEqual(payload(absent)["rl"], [])
+        self.assertFalse(payload(absent)["rl_installed"])
+
+    @unittest.skipIf(not NODE, "needs a JS engine")
+    def test_samples_in_range_show_the_card(self):
+        _, out = run()
+        got = self.render_rl(out)
+        self.assertEqual(got["display"], "")
+        self.assertEqual(len(got["calls"]), 1, got)
+        call = got["calls"][0]
+        self.assertEqual(call["elId"], "#rlChart")
+        self.assertEqual(len(call["days"]), 2, call["days"])
+        self.assertEqual([s["name"] for s in call["series"]],
+                         ["5-hour window", "7-day window"])
+        for s in call["series"]:
+            self.assertEqual(len(s["values"]), 2, s)
+            for v in s["values"]:
+                self.assertIsInstance(v, (int, float), s)
+
+    @unittest.skipIf(not NODE, "needs a JS engine")
+    def test_no_log_hides_the_card(self):
+        _, out = run(["--root", P["alt"]])
+        got = self.render_rl(out)
+        self.assertEqual(got["rl"], 0)
+        self.assertEqual(got["display"], "none")
+        self.assertEqual(got["calls"], [])
+
+    @unittest.skipIf(not NODE, "needs a JS engine")
+    def test_a_single_sample_still_hides_the_card(self):
+        """The case that actually pins the gate at more-than-one. An absent
+        log is falsy under `> 1` and `> 0` alike and the fixture's four samples
+        are true under both, so without a one-sample input nothing here can
+        tell the gate from `rl.length > 0` -- and the chart itself refuses to
+        draw fewer than two points, so relaxing it would render the card empty
+        rather than hidden."""
+        _, out = run(["--root", self.one_sample_root()])
+        self.assertEqual(len(payload(out)["rl"]), 1)
+        got = self.render_rl(out)
+        self.assertEqual(got["rl"], 1)
+        self.assertEqual(got["display"], "none")
+        self.assertEqual(got["calls"], [])
+
+
 SKILL_SCRIPT = os.path.join(REPO, ".claude", "skills", "burnrate", "scripts",
                             "burnrate_skill.py")
 
