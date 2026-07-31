@@ -1211,7 +1211,11 @@ class TestViewer(unittest.TestCase):
         self.assertFalse(
             br.open_report("x.html", env={"TERM": "xterm"}, platform="linux"))
 
-    def test_no_output_names_a_script_this_repo_does_not_ship(self):
+    def test_no_output_tells_the_user_to_run_the_installer(self):
+        """The repository now ships the installer, but the tool must still
+        never point anyone at it. Wrapping a status bar is opt-in and
+        separately documented; a report that names the installer turns a
+        missing card into an instruction to modify settings.json."""
         _, out = run()
         self.assertNotIn("install_usage_logger.sh", report(out))
         with open(BR, encoding="utf-8") as fh:
@@ -1916,6 +1920,23 @@ class TestPrivacy(unittest.TestCase):
             low = text.lower()
             for tok in (*self.TOKENS, "hindsight"):
                 self.assertNotIn(tok, low, f"{tok!r} found in {name}")
+
+    def test_nothing_under_extras_carries_an_identity(self):
+        """The shipped shell scripts and their doc go out to strangers, and
+        every path in them has to be $HOME- or env-derived. os.walk rather
+        than git, so this holds in an extracted archive too."""
+        self.assertTrue(self.TOKENS, "no usable token: the check would pass "
+                                     "vacuously")
+        seen = 0
+        for dirpath, _dirs, files in os.walk(EXTRAS):
+            for name in sorted(files):
+                path = os.path.join(dirpath, name)
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    low = fh.read().lower()
+                seen += 1
+                for tok in self.TOKENS:
+                    self.assertNotIn(tok, low, f"{tok!r} found in {path}")
+        self.assertTrue(seen, "extras/ is empty: the walk found nothing")
 
     def test_with_the_archive_on_the_only_hindsight_is_the_label(self):
         if not EXP["zstd"]:

@@ -20,7 +20,7 @@ What it reconstructs:
       hour of the first activity after the previous block expires (matches how
       resets_at lands on the hour) and lasts 5h
     - per-session summaries: peak context, compactions, interrupts, agents
-    - the rate-limit logger's samples (usage_logger.sh), when installed
+    - the rate-limit logger's samples (extras/usage_logger.sh), when installed
 
 Attribution: any <command-name> in a user line (or "skill":"..." tool call)
 opens a segment that stays open until the next one; a subagent attaches to the
@@ -1758,7 +1758,7 @@ $('#gen').textContent = `Generated ${DATA.generated} · ` +
 $('#foot').textContent = 'Billed-equivalent weights every token to a common unit; it is not a bill. ' +
   (DATA.rl_installed ? '' :
    'Rate-limit logger not installed: cap percentages (5h/7d windows) are not ' +
-   'being recorded; they need the opt-in usage logger.');
+   'being recorded; they need the opt-in extras/usage_logger.sh.');
 buildFilters();
 render();
 </script>
