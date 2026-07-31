@@ -30,6 +30,9 @@ import warnings
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 BR = os.path.join(REPO, "burnrate.py")
+EXTRAS = os.path.join(REPO, "extras")
+WRAPPER = os.path.join(EXTRAS, "usage_logger.sh")
+INSTALLER = os.path.join(EXTRAS, "install_usage_logger.sh")
 
 TMP = tempfile.mkdtemp(prefix="burnrate-selftest-")
 atexit.register(shutil.rmtree, TMP, ignore_errors=True)
@@ -1369,6 +1372,126 @@ class TestSkillAnswers(unittest.TestCase):
             os.path.exists(os.path.join(cold, "burnrate", "report",
                                         "dashboard_data.json")),
             "the payload was rebuilt before the day word was checked")
+
+
+def rl_payload(five=23.5, seven=41.2, sid="sess-1", model="Sonnet 4.6"):
+    """A statusline payload shaped the way Claude Code hands one to the
+    configured command, on one line, with both cap windows present."""
+    return json.dumps({
+        "session_id": sid,
+        "model": {"id": "claude-sonnet-4-6", "display_name": model},
+        "workspace": {"current_dir": "/home/alice/work/api"},
+        "rate_limits": {
+            "five_hour": {"used_percentage": five, "resets_at": 1772380800},
+            "seven_day": {"used_percentage": seven, "resets_at": 1772985600},
+        }})
+
+
+@unittest.skipIf(sys.platform == "win32", "the logger is bash-only")
+class TestUsageLoggerWrapper(unittest.TestCase):
+    """LOG-01: the wrapper is a tee, so the statusline it wraps has to behave
+    exactly as it did unwrapped -- same stdout, same exit status -- however
+    badly the logging half fails. Driven by subprocess rather than a shell test
+    runner: this repository ships no shell harness and the suite already
+    executes POSIX shell stand-ins."""
+
+    def logger_dir(self, inner=None):
+        d = os.path.join(tempfile.mkdtemp(dir=TMP), "usage-logger")
+        os.makedirs(d)
+        if inner is not None:
+            with open(os.path.join(d, "inner-command"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(inner)
+        return d
+
+    def feed(self, d, payload="{}"):
+        """Run the wrapper BY ITS OWN PATH, so a lost executable bit fails
+        here rather than in the user's status bar."""
+        env = base_env(CLAUDE_USAGE_LOGGER_DIR=d,
+                       HOME=tempfile.mkdtemp(dir=TMP),
+                       CLAUDE_CONFIG_DIR=tempfile.mkdtemp(dir=TMP))
+        return subprocess.run([WRAPPER], input=payload, env=env,
+                              capture_output=True, text=True)
+
+    def log_lines(self, d):
+        path = os.path.join(d, "usage-log.jsonl")
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding="utf-8") as fh:
+            return [ln for ln in fh.read().splitlines() if ln.strip()]
+
+    def test_the_inner_commands_output_and_status_both_survive(self):
+        # Claude Code uses a statusline child's stdout only when it exited 0,
+        # and classifies anything else as a failure: a swallowed exit status
+        # silently blanks the status bar
+        d = self.logger_dir("printf STATUS; exit 3")
+        proc = self.feed(d, rl_payload())
+        self.assertEqual(proc.stdout, "STATUS")
+        self.assertEqual(proc.returncode, 3)
+
+    @unittest.skipIf(os.name != "posix" or os.geteuid() == 0,
+                     "needs POSIX modes and a non-root user")
+    def test_an_unwritable_log_dir_still_renders_the_statusline(self):
+        d = self.logger_dir("printf STATUS; exit 3")
+        os.chmod(d, 0o500)
+        # restored so the atexit rmtree can remove it: rmtree(ignore_errors)
+        # cannot delete inside a 0o500 directory and would leak TMP silently
+        self.addCleanup(os.chmod, d, 0o700)
+        proc = self.feed(d, rl_payload())
+        self.assertEqual(proc.stdout, "STATUS")
+        self.assertEqual(proc.returncode, 3)
+        self.assertEqual(self.log_lines(d), [])
+
+    def test_no_inner_command_emits_nothing_and_succeeds(self):
+        # printing anything here would clobber a status bar the user never
+        # asked this script to draw
+        d = self.logger_dir()
+        proc = self.feed(d, rl_payload())
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(proc.returncode, 0)
+
+    def test_one_line_per_change_with_scalar_percentages(self):
+        d = self.logger_dir()
+        self.feed(d, rl_payload(23.5, 41.2))
+        lines = self.log_lines(d)
+        self.assertEqual(len(lines), 1, lines)
+        rec = json.loads(lines[0])
+        self.assertRegex(rec["ts"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+        for key in ("five_hour", "seven_day"):
+            self.assertIsInstance(rec[key], (int, float), rec)
+            self.assertNotIsInstance(rec[key], bool)
+        # the statusline fires many times a second, so an unchanged pair must
+        # not become a row
+        self.feed(d, rl_payload(23.5, 41.2))
+        self.assertEqual(len(self.log_lines(d)), 1)
+        self.feed(d, rl_payload(24.5, 41.2))
+        self.assertEqual(len(self.log_lines(d)), 2)
+
+    def test_a_payload_without_rate_limits_writes_nothing(self):
+        # every invocation before a session's first API response looks like
+        # this, and they must not cost a file
+        d = self.logger_dir()
+        proc = self.feed(d, json.dumps({"session_id": "s", "model": {}}))
+        self.assertEqual(proc.returncode, 0)
+        self.assertFalse(os.path.exists(os.path.join(d, "usage-log.jsonl")))
+
+    def test_what_the_wrapper_writes_is_what_the_reader_reads(self):
+        """The one case that ties the shipped script to burnrate's own reader:
+        the log is a wire contract between two files that never import each
+        other, and this phase adds no ingestion code, so the script is what has
+        to conform."""
+        d = self.logger_dir()
+        self.feed(d, rl_payload(23.5, 41.2))
+        self.feed(d, rl_payload(24.5, 42.5))
+        rows = br.read_rl_log(os.path.join(d, "usage-log.jsonl"))
+        self.assertEqual(len(rows), 2, rows)
+        for ts, five, seven in rows:
+            self.assertIsInstance(ts, int)
+            self.assertIsInstance(five, float)
+            self.assertIsInstance(seven, float)
+        self.assertLessEqual(rows[0][0], rows[1][0])
+        self.assertEqual([r[1] for r in rows], [23.5, 24.5])
+        self.assertEqual([r[2] for r in rows], [41.2, 42.5])
 
 
 def _private_tokens():
