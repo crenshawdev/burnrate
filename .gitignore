@@ -1,0 +1,5 @@
+__pycache__/
+dashboard.html
+dashboard_data.json
+.dash_cache.json.gz
+.planning/
