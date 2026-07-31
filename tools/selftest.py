@@ -1275,6 +1275,22 @@ console.log(JSON.stringify([MINDAY, MAXDAY, state.d0, state.d1]));
             self.assertIn("||", line, line)
 
 
+class TestBilledUnitIsLabeled(unittest.TestCase):
+    """Billed-equivalent is a weighted token count, never a currency amount.
+    Every place the page prints one of those numbers has to say so on its own,
+    because a reader who lands on a table does not scroll to the footer."""
+
+    def test_the_sessions_column_names_the_unit(self):
+        # a bare "Billed" over comma-separated numbers reads as money
+        self.assertIn('<th class="num">Billed-equiv</th>', br.PAGE)
+        self.assertNotIn('<th class="num">Billed</th>', br.PAGE)
+
+    def test_the_hero_tile_disclaims_outside_the_delta_branch(self):
+        # the first window has no prior window, so delta is null there; the
+        # disclaimer has to survive that branch rather than ride along with it
+        self.assertIn("}weighted tokens, not a bill", br.PAGE)
+
+
 def viewer_slice(html, start, end):
     """The verbatim text between two markers in the generated report's script
     block, so a case runs the shipped code rather than a paraphrase of it."""

@@ -1631,7 +1631,8 @@ function render(){
     <div class="tile hero"><div class="l">Billed-equivalent tokens</div>
       <div class="v">${fmt(total)}</div>
       <div class="d">${delta == null ? '' :
-        `<span class="${delta >= 0 ? 'up' : 'down'}">${delta >= 0 ? '+' : ''}${delta.toFixed(0)}%</span> vs prior ${nDays}d`}</div></div>
+        `<span class="${delta >= 0 ? 'up' : 'down'}">${delta >= 0 ? '+' : ''}${delta.toFixed(0)}%</span> vs prior ${nDays}d · `
+      }weighted tokens, not a bill</div></div>
     <div class="tile"><div class="l">Daily average</div><div class="v">${fmt(active ? total/active : 0)}</div>
       <div class="d">${active} active day${active===1?'':'s'}</div></div>
     <div class="tile"><div class="l">Peak day</div><div class="v">${fmt(perDayTotal[pk]||0)}</div>
@@ -1717,7 +1718,7 @@ function render(){
   const top = sess.slice(0, 15);
   const st = document.createElement('table');
   st.innerHTML = `<thead><tr><th>Session</th><th>Project</th><th>Day</th>
-    <th class="num">Billed</th><th class="num">Output</th><th class="num">Msgs</th>
+    <th class="num">Billed-equiv</th><th class="num">Output</th><th class="num">Msgs</th>
     <th class="num">Peak ctx</th><th class="num">Compact</th><th class="num">Agents</th></tr></thead>`;
   const tb = document.createElement('tbody');
   for (const s of top){
@@ -1738,7 +1739,7 @@ function render(){
   else $('#sessTable').innerHTML = '<div class="empty">No sessions in range</div>';
 
   // daily totals table (the always-reachable table view)
-  const dt = ['<table><thead><tr><th>Day</th><th class="num">Billed</th><th class="num">Fresh in</th>' +
+  const dt = ['<table><thead><tr><th>Day</th><th class="num">Billed-equiv</th><th class="num">Fresh in</th>' +
     '<th class="num">Cache write</th><th class="num">Cache read</th><th class="num">Output</th>' +
     '<th class="num">Msgs</th></tr></thead><tbody>'];
   const dm = new Map();
