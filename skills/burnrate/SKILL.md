@@ -24,12 +24,13 @@ That path is inside this plugin, and the helper runs the `burnrate.py` that
 ships with it -- never a copy in the user's project, and never a guess from the
 working directory.
 
-`${CLAUDE_PLUGIN_ROOT}` is substituted into this text when the skill loads as a
-plugin. If the literal characters `${CLAUDE_PLUGIN_ROOT}` are still sitting in
-the command above, this skill was not loaded as a plugin: use its own base
-directory instead -- the absolute path Claude Code stated when it loaded the
-skill -- and call `<base>/scripts/burnrate_skill.py` for every call in the turn.
-Never hand the unsubstituted literal to bash; the shell expands it to nothing
+The plugin loader substitutes that leading token with an absolute directory when
+it loads this skill. Judge the command above by what it now reads: if it starts
+with an absolute path, use it as written. If it still shows a placeholder in
+curly braces, this skill was not loaded as a plugin -- use its own base
+directory instead, the absolute path Claude Code stated when it loaded the
+skill, and call `<base>/scripts/burnrate_skill.py` for every call in the turn.
+Never hand an unsubstituted placeholder to bash; the shell expands it to nothing
 and the call dies on `/skills/burnrate/scripts/burnrate_skill.py`.
 
 ## Routing

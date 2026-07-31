@@ -1639,6 +1639,14 @@ class TestPluginPackaging(unittest.TestCase):
             body)
         self.assertNotIn("CLAUDE_PROJECT_DIR", body)
         self.assertNotIn("rev-parse", body)
+        # The loader substitutes the token with a GLOBAL regex over the whole
+        # body, so a second occurrence -- prose explaining the unsubstituted
+        # case -- is rewritten too, and a guard phrased against it reads as its
+        # own opposite under a correct plugin load. The command may name it; no
+        # other line may.
+        self.assertEqual(
+            body.count("${CLAUDE_PLUGIN_ROOT}"), 1,
+            "${CLAUDE_PLUGIN_ROOT} must appear exactly once, in the command")
 
     def test_a_plugin_shaped_copy_runs_its_own_tool(self):
         """An installed plugin is a copy of this repo under a cache directory
