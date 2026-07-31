@@ -24,7 +24,6 @@ account required.
 - [Updating, disabling and removing](#updating-disabling-and-removing)
 - [The 5h/7d cap card](#the-5h7d-cap-card)
 - [Troubleshooting](#troubleshooting)
-- [Verifying a copy](#verifying-a-copy)
 - [License](#license)
 
 ## Install
@@ -306,12 +305,6 @@ that `/burnrate` works rather than looking for a literal `/burnrate` row.
 **The 5h/7d cap card does not render.** Its logger is opt-in and installed
 separately. See [The 5h/7d cap card](#the-5h7d-cap-card). Every other panel works
 without it.
-
-## Verifying a copy
-
-```sh
-python3 tools/selftest.py
-```
 
 ## License
 
