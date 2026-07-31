@@ -148,9 +148,25 @@ Delete that directory or pass `--rebuild` to force a full reparse.
 
 ## The /burnrate skill
 
-This repository ships a Claude Code project skill at `.claude/skills/burnrate/`,
-so `/burnrate` is available when Claude Code is working inside this repository,
-and nowhere else today.
+burnrate installs as a Claude Code plugin, which puts `/burnrate` in every
+project:
+
+```sh
+claude plugin marketplace add https://git.jcrenshaw.dev/crenshawdev/burnrate.git
+claude plugin install burnrate@burnrate
+```
+
+Both steps are also available inside a session through `/plugin`. The GitHub
+mirror works as an alternative source for the first one:
+
+```sh
+claude plugin marketplace add crenshawdev/burnrate
+```
+
+You may need to start a new session before `/burnrate` appears.
+
+The plugin ships this repository's own `burnrate.py` and the skill runs that
+copy, so nothing is copied by hand and no clone is required.
 
 A bare `/burnrate` builds the dashboard and opens it, writing it under the
 platform cache directory above rather than into your working tree. The words
@@ -160,12 +176,23 @@ else is treated as a question: `/burnrate what did yesterday cost` is answered
 in chat from `dashboard_data.json`, without opening the report. The same privacy
 note applies to a report the skill builds; see "What a generated report embeds".
 
+### Updating, disabling and removing
+
+| Command | Effect |
+|---|---|
+| `claude plugin update burnrate` | Pull a newer commit. Restart Claude Code to apply it. |
+| `claude plugin disable burnrate` | Turn it off. `/burnrate` goes away with it. |
+| `claude plugin enable burnrate` | Turn it back on. |
+| `claude plugin uninstall burnrate` | Remove it entirely. |
+
 The skill is a wrapper, never a fork: it runs this repository's own
 `burnrate.py`, and `python3 burnrate.py` keeps working with the skill absent or
-`.claude/` deleted.
+the `skills/` directory deleted. Inside a clone the helper also runs directly,
+with nothing installed:
 
-Installing burnrate as a Claude Code plugin from a git URL, so `/burnrate` works
-in every project, is planned and not shipped yet.
+```sh
+python3 skills/burnrate/scripts/burnrate_skill.py run 7d
+```
 
 ## The 5h/7d cap card
 
@@ -177,6 +204,15 @@ That logger is opt-in and ships separately in [`extras/`](extras/README.md),
 which covers installing, upgrading and removing it. Nothing installs it for
 you. Without it, every other panel works and the cap card simply does not
 render.
+
+The logger is the one part that does need a clone, because you run its installer
+yourself:
+
+```sh
+git clone https://git.jcrenshaw.dev/crenshawdev/burnrate.git
+cd burnrate
+bash extras/install_usage_logger.sh
+```
 
 ## Verifying a copy
 
