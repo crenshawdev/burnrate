@@ -62,6 +62,10 @@ Pick the `--by` / `--day` / `--since` / `--until` / `--project` combination the
 question implies; `python3 <helper> ask --help` lists them all. `ask` reuses a
 payload under 15 minutes old, rebuilds it otherwise, and never opens a browser.
 
+For a question about 5h rate-limit windows ("how much is left in this block",
+"when does it reset"), use `blocks` instead: `python3 <helper> blocks --last 1`.
+Blocks are account-wide, so no project filter applies to them.
+
 Then answer in one or two sentences: the figure with thousands separators, the
 unit ("billed-equivalent tokens"), and which day or range it covers. Say
 `reused: false` runs took a rebuild only if the user is waiting on why it was
