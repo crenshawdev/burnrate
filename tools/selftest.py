@@ -1387,12 +1387,15 @@ console.log(JSON.stringify({
         self.assertEqual(got["calls"], [])
 
 
-SKILL_SCRIPT = os.path.join(REPO, ".claude", "skills", "burnrate", "scripts",
-                            "burnrate_skill.py")
+SKILL_DIR = os.path.join(REPO, "skills", "burnrate")
+SKILL_MD = os.path.join(SKILL_DIR, "SKILL.md")
+SKILL_SCRIPT = os.path.join(SKILL_DIR, "scripts", "burnrate_skill.py")
+PLUGIN_MANIFEST = os.path.join(REPO, ".claude-plugin", "plugin.json")
+MARKET_MANIFEST = os.path.join(REPO, ".claude-plugin", "marketplace.json")
 
 
 @unittest.skipUnless(os.path.exists(SKILL_SCRIPT),
-                     "no .claude/ in this checkout")
+                     "no skills/ in this checkout")
 class TestSkillAnswers(unittest.TestCase):
     """D-14: the /burnrate skill answers from the daily rows, which are twelve
     unlabeled positions -- a wrong column index prints a plausible wrong number
@@ -1400,7 +1403,7 @@ class TestSkillAnswers(unittest.TestCase):
     the way Claude Code runs it (a subprocess, no in-process import) because it
     resolves both burnrate.py and its output directory from its own __file__.
 
-    Skipped rather than failed when .claude/ is absent: burnrate.py is a
+    Skipped rather than failed when skills/ is absent: burnrate.py is a
     standalone tool and a checkout with the skill removed must still report no
     failures (AC6)."""
 
@@ -1531,6 +1534,108 @@ class TestSkillAnswers(unittest.TestCase):
             os.path.exists(os.path.join(cold, "burnrate", "report",
                                         "dashboard_data.json")),
             "the payload was rebuilt before the day word was checked")
+
+
+def frontmatter(path):
+    """The leading `---` block as a flat dict. A line scan, not a YAML parser:
+    the suite is stdlib only, and the only thing read from it here is a name."""
+    with open(path, encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+    out = {}
+    if not lines or lines[0].strip() != "---":
+        return out
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        if ":" in line:
+            key, value = line.split(":", 1)
+            out[key.strip()] = value.strip()
+    return out
+
+
+@unittest.skipUnless(os.path.exists(PLUGIN_MANIFEST)
+                     and os.path.exists(MARKET_MANIFEST),
+                     "no .claude-plugin/ in this checkout")
+class TestPluginPackaging(unittest.TestCase):
+    """PLUG-01: the repository is its own single-plugin marketplace, so
+    `claude plugin install burnrate@burnrate` puts /burnrate in projects that
+    are not this one. The manifests are what Claude Code reads, and the skill's
+    own trigger is its frontmatter name -- neither is exercised by any other
+    case here, and a typo in either is invisible until an install fails.
+
+    Skipped rather than failed when .claude-plugin/ is absent, the same rule
+    the skill cases follow: a checkout stripped of an optional piece skips."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(PLUGIN_MANIFEST, encoding="utf-8") as fh:
+            cls.plugin = json.load(fh)
+        with open(MARKET_MANIFEST, encoding="utf-8") as fh:
+            cls.market = json.load(fh)
+
+    def plugin_copy(self):
+        """A plugin-shaped copy: burnrate.py and skills/, nothing else. No
+        .git, no tools/, no extras/ -- which is what an installed plugin's
+        cache directory has of ours that the skill actually runs. __pycache__
+        is excluded on the way in so a case about bytecode measures the run,
+        not the copy."""
+        d = tempfile.mkdtemp(dir=TMP)
+        shutil.copy2(BR, os.path.join(d, "burnrate.py"))
+        shutil.copytree(os.path.join(REPO, "skills"),
+                        os.path.join(d, "skills"),
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        return d
+
+    def dry_run(self, root, *words):
+        """`run --dry-run` from a plugin-shaped copy, returning the argv it
+        would have executed."""
+        script = os.path.join(root, "skills", "burnrate", "scripts",
+                              "burnrate_skill.py")
+        proc = subprocess.run(
+            [sys.executable, script, "run", "--dry-run", *words],
+            env=base_env(XDG_CACHE_HOME=os.path.join(
+                tempfile.mkdtemp(dir=TMP), "cache"),
+                CLAUDE_PROJECTS=P["primary"]),
+            capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)
+
+    def test_the_plugin_manifest_names_burnrate(self):
+        self.assertEqual(self.plugin.get("name"), "burnrate")
+        for key in ("version", "description", "license"):
+            self.assertTrue(self.plugin.get(key), f"plugin.json lacks {key}")
+
+    def test_the_marketplace_lists_this_plugin_once(self):
+        # a marketplace with no description fails `plugin validate --strict`
+        self.assertTrue(self.market.get("description"),
+                        "marketplace.json lacks a description")
+        entries = self.market.get("plugins")
+        self.assertEqual(len(entries), 1, entries)
+        entry = entries[0]
+        self.assertEqual(entry.get("name"), self.plugin["name"])
+        self.assertEqual(entry.get("source"), "./")
+        # `claude plugin tag` validates that a marketplace entry's version and
+        # plugin.json's agree, so plugin.json stays the only place one is
+        # written and the entry carries none to drift from it
+        self.assertNotIn("version", entry)
+
+    def test_the_skill_sits_at_the_default_discovery_path(self):
+        """skills/<name>/SKILL.md is where the loader looks with no `skills`
+        key in plugin.json, and the frontmatter name is what makes the trigger
+        /burnrate -- rename either and the plugin installs but does nothing."""
+        self.assertTrue(os.path.exists(SKILL_MD), SKILL_MD)
+        self.assertEqual(frontmatter(SKILL_MD).get("name"), "burnrate")
+
+    def test_a_plugin_shaped_copy_runs_its_own_tool(self):
+        """An installed plugin is a copy of this repo under a cache directory
+        with no git and no checkout around it. The helper resolves burnrate.py
+        by walking up from its own file, so it must land on THAT copy's tool
+        and never on this working tree's."""
+        root = self.plugin_copy()
+        argv = self.dry_run(root, "7d")
+        self.assertEqual(argv[1], os.path.join(root, "burnrate.py"))
+        self.assertNotEqual(argv[1], BR)
+        self.assertEqual(argv[argv.index("--range") + 1], "7")
 
 
 class TestRateLimitLogReader(unittest.TestCase):
@@ -2078,7 +2183,7 @@ class TestLoggerIsNeverASideEffect(unittest.TestCase):
         self.assertFalse(data["rl_installed"])
 
     @unittest.skipUnless(os.path.exists(SKILL_SCRIPT),
-                         "no .claude/ in this checkout")
+                         "no skills/ in this checkout")
     def test_a_skill_run_installs_nothing(self):
         # a REAL run, never --dry-run: cmd_run prints its argv and returns
         # before subprocess.run, so a dry run executes nothing at all and its
