@@ -1306,6 +1306,56 @@ class TestSkillAnswers(unittest.TestCase):
         ids = {p["id"] for p in data["projects"]}
         self.assertLessEqual(set(b["top_projects"]), ids)
 
+    def test_an_exact_project_label_beats_the_one_it_prefixes(self):
+        """The fixture's 'home/alice/work/api' is a prefix of
+        'home/alice/work/api#2'. Matching exact OR substring in one pass sums
+        both and reports a confidently wrong figure."""
+        want = EXP["label_be"]["home/alice/work/api"]
+        got = self.answer("ask", "--by", "project",
+                          "--project", "home/alice/work/api")
+        tol = self.tolerance(self.written_payload())
+        self.assertEqual([r["project"] for r in got["rows"]],
+                         ["home/alice/work/api"])
+        self.assertLessEqual(abs(got["total"]["billed_equiv"] - want), tol,
+                             got["total"])
+        # a substring matching no label exactly still spans every label it hits
+        both = self.answer("ask", "--by", "project", "--project", "alice/work")
+        self.assertEqual(sorted(r["project"] for r in both["rows"]),
+                         ["home/alice/work/api", "home/alice/work/api#2"])
+
+    def test_a_malformed_date_window_is_refused(self):
+        """Day strings are compared as strings: '2026-3-1' sorts below every
+        payload day and silently empties the selection, and 'banana' sorts
+        above so --until applies no filter at all. Both must fail instead."""
+        for flag, value in (("--since", "2026-3-1"), ("--until", "banana"),
+                            ("--since", "03/01/2026")):
+            proc = self.skill("ask", "--by", "day", flag, value, expect=2)
+            self.assertIn(flag, proc.stderr)
+
+    def test_a_last_below_one_is_refused(self):
+        """rows[-0:] is the WHOLE list and rows[1:] drops the current window --
+        the one a 'how much is left' question is about."""
+        for n in ("0", "-1"):
+            for cmd in ("blocks", "ask"):
+                proc = self.skill(cmd, "--last", n, expect=2)
+                self.assertIn("N >= 1", proc.stderr)
+
+    def test_a_bad_day_word_fails_before_the_payload_is_built(self):
+        """Validation after ensure_payload pays for a full transcript reparse
+        before printing a usage error. A cold cache proves the ordering: the
+        run must fail without ever writing a payload."""
+        cold = tempfile.mkdtemp(dir=TMP)
+        proc = subprocess.run(
+            [sys.executable, SKILL_SCRIPT, "ask", "--day", "bogus"],
+            env=base_env(XDG_CACHE_HOME=cold, CLAUDE_PROJECTS=P["primary"]),
+            capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("--day", proc.stderr)
+        self.assertFalse(
+            os.path.exists(os.path.join(cold, "burnrate", "report",
+                                        "dashboard_data.json")),
+            "the payload was rebuilt before the day word was checked")
+
 
 def _private_tokens():
     """Strings identifying the machine running this suite, derived rather than

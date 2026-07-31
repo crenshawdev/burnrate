@@ -38,6 +38,10 @@ BLOCK_SECONDS = 5 * 3600        # a rate-limit window, same constant as the tool
 COLS = {"day": 0, "project": 1, "command": 2, "model": 3, "effort": 4,
         "kind": 5, "billed_equiv": 6, "input": 7, "cache_write": 8,
         "cache_write_1h": 9, "cache_read": 10, "output": 11, "messages": 12}
+# Day strings are compared as strings, so an unvalidated one filters silently
+# instead of failing: '2026-3-1' sorts below every payload day and empties the
+# selection. Every date-shaped flag goes through this.
+DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 GROUP_KEYS = ("day", "project", "command", "model", "effort", "kind")
 METRICS = ("billed_equiv", "input", "cache_write", "cache_write_1h",
            "cache_read", "output")
@@ -169,13 +173,27 @@ def ensure_payload(max_age_min):
         die(f"no usable {PAYLOAD} in {out}: {exc}")
 
 
+def check_day_word(word):
+    """Shape-check a --day word BEFORE the payload is touched. Resolving one to
+    a date needs the payload's tz_offset, so a malformed word validated after
+    ensure_payload pays for a full transcript reparse before its usage error."""
+    w = word.strip().lower()
+    if not DAY_RE.match(w) and w not in ("today", "yesterday"):
+        die(f"--day wants YYYY-MM-DD, today or yesterday: {word!r}")
+
+
+def check_date_flag(name, value):
+    if value is not None and not DAY_RE.match(value.strip()):
+        die(f"{name} wants YYYY-MM-DD: {value!r}")
+
+
 def resolve_day(word, tz_offset):
     """A day string in the same bucketing the payload used. 'today' and
     'yesterday' follow the system's local date when the payload was built at
     the same UTC offset, and otherwise UTC shifted by that offset -- which is
     the offset the payload's day strings were bucketed under."""
     w = word.strip().lower()
-    if re.match(r"^\d{4}-\d{2}-\d{2}$", w):
+    if DAY_RE.match(w):
         return w
     if w not in ("today", "yesterday"):
         die(f"--day wants YYYY-MM-DD, today or yesterday: {word!r}")
@@ -201,6 +219,19 @@ def label_of(labels, idx):
     return labels[idx] if 0 <= idx < len(labels) else str(idx)
 
 
+def positive_int(v):
+    """A --last of 0 or below is a usage error, not an empty slice: rows[-0:]
+    is the WHOLE list and rows[1:] silently drops the current window, which is
+    the one a 'how much is left' question is about."""
+    try:
+        n = int(v)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"wants an integer: {v!r}")
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"wants N >= 1: {v!r}")
+    return n
+
+
 def emit(obj):
     json.dump(obj, sys.stdout, indent=1)
     sys.stdout.write("\n")
@@ -217,10 +248,19 @@ def cmd_ask(a):
     if not by:
         die("--by needs at least one field")
 
+    if a.day:
+        check_day_word(a.day)
+    check_date_flag("--since", a.since)
+    check_date_flag("--until", a.until)
+
     data, reused = ensure_payload(a.max_age)
     labels = project_labels(data)
     day = resolve_day(a.day, data["tz_offset"]) if a.day else None
     want = a.project.lower() if a.project else None
+    # An exact label wins outright: matching exact OR substring in one pass
+    # sums every label the wanted one is a prefix of, which is the collision
+    # burnrate.py's distinct project labels exist to prevent.
+    exact = want is not None and want in {lab.lower() for lab in labels}
 
     sel = []
     for r in data.get("daily", []):
@@ -233,10 +273,11 @@ def cmd_ask(a):
             continue
         if want is not None:
             lab = label_of(labels, r[COLS["project"]]).lower()
-            if want != lab and want not in lab:
+            hit = lab == want if exact else want in lab
+            if not hit:
                 continue
         sel.append(r)
-    if a.last:
+    if a.last is not None:
         keep = set(sorted({r[COLS["day"]] for r in sel})[-a.last:])
         sel = [r for r in sel if r[COLS["day"]] in keep]
 
@@ -282,7 +323,7 @@ def cmd_blocks(a):
 
     now = datetime.now(timezone.utc).timestamp()
     rows = data.get("blocks", [])
-    if a.last:
+    if a.last is not None:
         rows = rows[-a.last:]
     out = []
     for t0, first, last, be, output, msgs, pp in rows:
@@ -349,7 +390,7 @@ def build_parser():
     k.add_argument("--until", metavar="YYYY-MM-DD")
     k.add_argument("--project", metavar="LABEL",
                    help="exact project label, else a substring of one")
-    k.add_argument("--last", type=int, metavar="N",
+    k.add_argument("--last", type=positive_int, metavar="N",
                    help="keep only the N most recent days that survive the "
                         "other filters")
     k.add_argument("--max-age", type=float, default=15.0, metavar="MIN",
@@ -364,7 +405,7 @@ def build_parser():
                     "cover every project at once, so no project filter applies "
                     "to them and this command takes none. Same freshness rule "
                     "as ask; never opens a browser.")
-    b.add_argument("--last", type=int, default=3, metavar="N",
+    b.add_argument("--last", type=positive_int, default=3, metavar="N",
                    help="how many of the most recent windows (default: 3)")
     b.add_argument("--max-age", type=float, default=15.0, metavar="MIN",
                    help="reuse an existing payload younger than this many "
