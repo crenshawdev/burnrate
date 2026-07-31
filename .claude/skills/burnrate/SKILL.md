@@ -46,4 +46,24 @@ output.
 
 ## Answering a question
 
-<!-- filled in with the ask flow -->
+Call `ask`, then answer from the JSON it prints. Never hand-index
+`dashboard_data.json`, and never write inline Python to compute a total: the
+daily rows are twelve unlabeled positions, and a wrong index returns a
+plausible wrong number with no failure signal.
+
+```
+python3 <helper> ask --by day
+python3 <helper> ask --day yesterday
+python3 <helper> ask --by project --last 7
+python3 <helper> ask --by command,model --project web
+```
+
+Pick the `--by` / `--day` / `--since` / `--until` / `--project` combination the
+question implies; `python3 <helper> ask --help` lists them all. `ask` reuses a
+payload under 15 minutes old, rebuilds it otherwise, and never opens a browser.
+
+Then answer in one or two sentences: the figure with thousands separators, the
+unit ("billed-equivalent tokens"), and which day or range it covers. Say
+`reused: false` runs took a rebuild only if the user is waiting on why it was
+slow. If `rows` is empty, say there was no activity in that window rather than
+reporting zero as a measurement.

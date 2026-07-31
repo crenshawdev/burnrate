@@ -22,10 +22,24 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 
 TOOL_NAME = "burnrate.py"
+PAYLOAD = "dashboard_data.json"
+
+# The daily row's twelve unlabeled positions, mirroring burnrate.py's own
+# legend (`const D = {...}` beside the viewer's payload). Every read of a daily
+# row goes through this map: a wrong literal index returns a plausible wrong
+# number with no failure signal, and this is the one place to get it right.
+COLS = {"day": 0, "project": 1, "command": 2, "model": 3, "effort": 4,
+        "kind": 5, "billed_equiv": 6, "input": 7, "cache_write": 8,
+        "cache_write_1h": 9, "cache_read": 10, "output": 11, "messages": 12}
+GROUP_KEYS = ("day", "project", "command", "model", "effort", "kind")
+METRICS = ("billed_equiv", "input", "cache_write", "cache_write_1h",
+           "cache_read", "output")
 
 # The words the skill accepts, mapped onto burnrate.py's own flags. Matching is
 # case-insensitive and ignores surrounding punctuation, so "7d," from a typed
@@ -108,6 +122,154 @@ def flags_for(words):
     return out
 
 
+# ---------------------------------------------------------------- payload
+
+def payload_age_min(data):
+    """Minutes since the payload was generated. `generated` is the only
+    freshness signal burnrate writes, and it is always an aware timestamp."""
+    ts = datetime.fromisoformat(data["generated"])
+    if ts.tzinfo is None:                       # defensive: never seen in v1
+        ts = ts.astimezone()
+    return (datetime.now(timezone.utc) - ts).total_seconds() / 60.0
+
+
+def ensure_payload(max_age_min):
+    """(data, reused). Reuse dashboard_data.json while it is younger than
+    max_age_min; otherwise rebuild it with --no-open, which is what "answer
+    without opening the report" means -- dashboard.html is rewritten either
+    way, only the browser launch is suppressed."""
+    tool = find_tool()
+    out = out_dir(tool)
+    path = os.path.join(out, PAYLOAD)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        age = payload_age_min(data)
+        # a stamp far in the future is a broken clock, not a fresh payload
+        if -max_age_min <= age < max_age_min:
+            return data, True
+    except (OSError, ValueError, KeyError):
+        pass
+
+    argv = [sys.executable, tool, "--json", "--no-open", "--quiet",
+            "--out", out]
+    # the tool's summary goes to stderr here: stdout belongs to this command's
+    # single JSON object, and a caller parsing it must not have to strip
+    # four lines of report chatter off the front.
+    proc = subprocess.run(argv, stdout=subprocess.PIPE, text=True)
+    if proc.stdout:
+        sys.stderr.write(proc.stdout)
+    if proc.returncode != 0:
+        die(f"{TOOL_NAME} exited {proc.returncode}", proc.returncode)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh), False
+    except (OSError, ValueError) as exc:
+        die(f"no usable {PAYLOAD} in {out}: {exc}")
+
+
+def resolve_day(word, tz_offset):
+    """A day string in the same bucketing the payload used. 'today' and
+    'yesterday' follow the system's local date when the payload was built at
+    the same UTC offset, and otherwise UTC shifted by that offset -- which is
+    the offset the payload's day strings were bucketed under."""
+    w = word.strip().lower()
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", w):
+        return w
+    if w not in ("today", "yesterday"):
+        die(f"--day wants YYYY-MM-DD, today or yesterday: {word!r}")
+    local = datetime.now().astimezone()
+    local_off = (local.utcoffset() or timedelta()).total_seconds() / 3600.0
+    if abs(local_off - float(tz_offset)) < 1e-6:
+        base = local.date()
+    else:
+        base = (datetime.now(timezone.utc)
+                + timedelta(hours=float(tz_offset))).date()
+    if w == "yesterday":
+        base -= timedelta(days=1)
+    return base.isoformat()
+
+
+def project_labels(data):
+    return [p["id"] for p in data.get("projects", [])]
+
+
+def label_of(labels, idx):
+    """A daily row carries a project INDEX, never a label; the label lives in
+    the payload's `projects` array at that position."""
+    return labels[idx] if 0 <= idx < len(labels) else str(idx)
+
+
+def emit(obj):
+    json.dump(obj, sys.stdout, indent=1)
+    sys.stdout.write("\n")
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_ask(a):
+    by = [w.strip().lower() for w in a.by.split(",") if w.strip()]
+    for b in by:
+        if b not in GROUP_KEYS:
+            die(f"unknown --by field: {b!r}; accepted: "
+                + ", ".join(GROUP_KEYS))
+    if not by:
+        die("--by needs at least one field")
+
+    data, reused = ensure_payload(a.max_age)
+    labels = project_labels(data)
+    day = resolve_day(a.day, data["tz_offset"]) if a.day else None
+    want = a.project.lower() if a.project else None
+
+    sel = []
+    for r in data.get("daily", []):
+        d = r[COLS["day"]]
+        if day is not None and d != day:
+            continue
+        if a.since and d < a.since:
+            continue
+        if a.until and d > a.until:
+            continue
+        if want is not None:
+            lab = label_of(labels, r[COLS["project"]]).lower()
+            if want != lab and want not in lab:
+                continue
+        sel.append(r)
+    if a.last:
+        keep = set(sorted({r[COLS["day"]] for r in sel})[-a.last:])
+        sel = [r for r in sel if r[COLS["day"]] in keep]
+
+    groups = {}
+    total = dict.fromkeys(METRICS, 0)
+    total["messages"] = 0
+    for r in sel:
+        key = tuple(label_of(labels, r[COLS[b]]) if b == "project"
+                    else r[COLS[b]] for b in by)
+        g = groups.get(key)
+        if g is None:
+            g = groups[key] = dict(zip(by, key))
+            for m in METRICS:
+                g[m] = 0
+            g["messages"] = 0
+        for m in METRICS + ("messages",):
+            g[m] += r[COLS[m]]
+            total[m] += r[COLS[m]]
+
+    rows = list(groups.values())
+    if by[0] == "day":
+        rows.sort(key=lambda g: tuple(str(g[b]) for b in by))
+    else:
+        rows.sort(key=lambda g: -g["billed_equiv"])
+
+    emit({"generated": data.get("generated"), "reused": reused,
+          "tz_offset": data.get("tz_offset"),
+          "filters": {"by": by, "day": day, "since": a.since,
+                      "until": a.until, "project": a.project,
+                      "last": a.last},
+          "rows": rows, "total": total})
+    return 0
+
+
 def cmd_run(a):
     tool = find_tool()
     argv = [sys.executable, tool, "--json", "--out",
@@ -136,6 +298,30 @@ def build_parser():
     r.add_argument("--dry-run", action="store_true",
                    help="print the argv that would run, as JSON, and exit")
     r.set_defaults(func=cmd_run)
+
+    k = sub.add_parser(
+        "ask", help="summarize the daily rows as one JSON object on stdout",
+        description="Group and filter the last run's daily rows. Rebuilds the "
+                    "payload with --no-open when it is missing or stale, and "
+                    "never opens a browser. `kind` is 'm' (main thread) or "
+                    "'a' (subagent); an empty `command` means no command "
+                    "segment was open.")
+    k.add_argument("--by", default="day",
+                   help="comma list of " + ", ".join(GROUP_KEYS)
+                        + " (default: day)")
+    k.add_argument("--day", metavar="D",
+                   help="one day: YYYY-MM-DD, today or yesterday")
+    k.add_argument("--since", metavar="YYYY-MM-DD")
+    k.add_argument("--until", metavar="YYYY-MM-DD")
+    k.add_argument("--project", metavar="LABEL",
+                   help="exact project label, else a substring of one")
+    k.add_argument("--last", type=int, metavar="N",
+                   help="keep only the N most recent days that survive the "
+                        "other filters")
+    k.add_argument("--max-age", type=float, default=15.0, metavar="MIN",
+                   help="reuse an existing payload younger than this many "
+                        "minutes (default: 15)")
+    k.set_defaults(func=cmd_ask)
     return ap
 
 
