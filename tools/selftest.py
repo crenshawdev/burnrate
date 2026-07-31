@@ -905,6 +905,49 @@ def encodingless_opens(path):
     return bad
 
 
+LAUNCHERS = ("run", "Popen", "call", "check_call", "check_output", "system",
+             "popen", "startfile", "execv", "execvp", "execl", "execlp",
+             "execve", "spawnv", "spawnl", "spawnvp", "spawnlp")
+
+
+def launch_call_strings(path):
+    """(lineno, text) for every string constant inside a call that starts a
+    process: what a file could EXECUTE, as opposed to what it merely names in
+    a docstring or a message."""
+    with open(path, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        if isinstance(f, ast.Attribute):
+            base = f.value.id if isinstance(f.value, ast.Name) else ""
+            hit = f.attr in LAUNCHERS or base in ("subprocess", "webbrowser")
+        else:
+            hit = isinstance(f, ast.Name) and f.id in LAUNCHERS
+        if not hit:
+            continue
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                out.append((sub.lineno, sub.value))
+    return out
+
+
+def tree_listing(root):
+    """Every path under root with its size: a new file, a deleted one and a
+    rewritten one all change it."""
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in dirnames:
+            out.append(os.path.relpath(os.path.join(dirpath, name), root) + "/")
+        for name in filenames:
+            p = os.path.join(dirpath, name)
+            out.append("%s:%d" % (os.path.relpath(p, root),
+                                  os.path.getsize(p)))
+    return sorted(out)
+
+
 def module_imports(path):
     """(all top-level module names imported, names imported inside a try)."""
     with open(path, encoding="utf-8") as fh:
@@ -1753,6 +1796,71 @@ class TestUsageLoggerInstall(unittest.TestCase):
                                                     "inner-command")))
         self.assertFalse(os.path.exists(os.path.join(cfg, "usage-logger")))
         self.assertEqual(self.settings(cfg)["statusLine"]["command"], copy)
+
+
+class TestLoggerIsNeverASideEffect(unittest.TestCase):
+    """LOG-02: installing the logger wraps the user's status bar, so it must
+    only ever happen because the user ran the installer themselves. Nothing in
+    the tool or the skill may bootstrap it, and neither may so much as name a
+    path it would execute."""
+
+    def clean_home(self):
+        """A config home holding transcripts and nothing else: no
+        usage-logger, no settings.json."""
+        d = tempfile.mkdtemp(dir=TMP)
+        shutil.copytree(P["primary"], os.path.join(d, "projects"))
+        return d
+
+    def assertInstalledNothing(self, home, before, what):
+        self.assertEqual(tree_listing(home), before, what)
+        self.assertFalse(os.path.exists(os.path.join(home, "usage-logger")),
+                         what)
+        self.assertFalse(os.path.exists(os.path.join(home, "settings.json")),
+                         what)
+
+    def test_a_dashboard_run_installs_nothing(self):
+        home = self.clean_home()
+        before = tree_listing(home)
+        proc, out = run(env=base_env(CLAUDE_CONFIG_DIR=home))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertInstalledNothing(home, before, "burnrate.py")
+        data = payload(out)
+        self.assertEqual(data["rl"], [])
+        self.assertFalse(data["rl_installed"])
+
+    @unittest.skipUnless(os.path.exists(SKILL_SCRIPT),
+                         "no .claude/ in this checkout")
+    def test_a_skill_run_installs_nothing(self):
+        # a REAL run, never --dry-run: cmd_run prints its argv and returns
+        # before subprocess.run, so a dry run executes nothing at all and its
+        # before/after snapshot would be identical whatever the real path did
+        home = self.clean_home()
+        before = tree_listing(home)
+        env = base_env(CLAUDE_CONFIG_DIR=home, XDG_CACHE_HOME=os.path.join(
+            tempfile.mkdtemp(dir=TMP), "cache"),
+            CLAUDE_PROJECTS=os.path.join(home, "projects"))
+        for args in (["run", "--no-open"], ["ask", "--by", "day"]):
+            proc = subprocess.run([sys.executable, SKILL_SCRIPT, *args],
+                                  env=env, capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertInstalledNothing(home, before, " ".join(args))
+
+    def test_neither_the_tool_nor_the_skill_can_reach_the_installer(self):
+        # scoped to INVOCATION, not to the bare substring "extras/": the tool
+        # deliberately names extras/usage_logger.sh in its --help and in the
+        # report footer, as the thing a user may choose to install
+        paths = [BR] + ([SKILL_SCRIPT] if os.path.exists(SKILL_SCRIPT) else [])
+        launched = 0
+        for path in paths:
+            with open(path, encoding="utf-8") as fh:
+                src = fh.read()
+            self.assertNotIn("settings.json", src, path)
+            self.assertNotIn("install_usage_logger.sh", src, path)
+            strings = launch_call_strings(path)
+            launched += len(strings)
+            for lineno, text in strings:
+                self.assertNotIn("extras", text, f"{path}:{lineno}")
+        self.assertTrue(launched, "no launcher call found: the walk is vacuous")
 
 
 def _private_tokens():
