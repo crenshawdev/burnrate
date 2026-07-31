@@ -1689,6 +1689,30 @@ class TestUsageLoggerWrapper(unittest.TestCase):
         self.feed(d, rl_payload(24.5, 41.2))
         self.assertEqual(len(self.log_lines(d)), 2)
 
+    def test_a_payload_past_the_pipe_buffer_keeps_the_inner_status(self):
+        """Nothing obliges a statusline command to read its stdin, and the
+        moment the payload outgrows the 64 KiB pipe buffer the printf feeding
+        it takes SIGPIPE. Under pipefail that 141 becomes the pipeline's
+        status, and Claude Code discards the output of a statusline that did
+        not exit 0 -- so a command that worked unwrapped renders blank. Between
+        65000 and 66000 bytes is where it starts."""
+        d = self.logger_dir("printf STATUS; exit 0")
+        big = json.dumps(dict(json.loads(rl_payload()), pad="x" * 200000))
+        proc = self.feed(d, big)
+        self.assertEqual(proc.stdout, "STATUS")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_a_partial_reader_of_a_big_payload_still_reports_success(self):
+        """The same break for a command that reads only its first bytes, which
+        is what any statusline that stops at one JSON field does. It has to
+        exit 0 to show the defect: pipefail reports the RIGHTMOST nonzero
+        status, so an inner command that fails on its own already outranks the
+        SIGPIPE, and only a successful one gets its status overwritten."""
+        d = self.logger_dir("head -c 5 >/dev/null; printf STATUS; exit 0")
+        proc = self.feed(d, json.dumps({"pad": "x" * 200000}))
+        self.assertEqual(proc.stdout, "STATUS")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
     def test_a_payload_without_rate_limits_writes_nothing(self):
         # every invocation before a session's first API response looks like
         # this, and they must not cost a file

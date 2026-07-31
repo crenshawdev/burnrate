@@ -106,7 +106,14 @@ if [ -r "$INNER" ]; then
     cmd=$(cat "$INNER")
     if [ -n "$cmd" ]; then
         printf '%s' "$input" | bash -c "$cmd"
-        exit $?
+        # The INNER command's status, never the pipeline's. A statusline that
+        # does not drain stdin leaves printf writing into a pipe nobody reads,
+        # and once the payload passes the 64 KiB pipe buffer printf takes
+        # SIGPIPE; pipefail then promotes that 141 over the inner command's own
+        # 0, Claude Code discards a nonzero statusline's output, and a status
+        # bar that worked unwrapped goes blank. Must stay on the line directly
+        # after the pipeline: any command in between rewrites PIPESTATUS.
+        exit "${PIPESTATUS[1]}"
     fi
 fi
 
