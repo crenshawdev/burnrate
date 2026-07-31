@@ -1494,6 +1494,155 @@ class TestUsageLoggerWrapper(unittest.TestCase):
         self.assertEqual([r[2] for r in rows], [41.2, 42.5])
 
 
+FULL_SETTINGS = {
+    "statusLine": {"type": "command", "command": "echo hi", "padding": 0,
+                   "refreshInterval": 1000, "hideVimModeIndicator": True},
+    "cleanupPeriodDays": 365,
+}
+
+
+@unittest.skipIf(sys.platform == "win32", "the installer is bash-only")
+class TestUsageLoggerInstall(unittest.TestCase):
+    """LOG-01: the installer edits the file that draws the user's status bar,
+    so every case asserts on settings.json itself rather than on what the
+    script said it would do. The fixture settings carry the optional keys
+    Claude Code accepts, since a file holding only {command, type} could not
+    catch a rewrite that drops the rest."""
+
+    def config(self, settings=None):
+        """A throwaway config dir. HOME is thrown away too, so a derivation
+        that falls back to $HOME/.claude cannot reach the real one."""
+        d = tempfile.mkdtemp(dir=TMP)
+        if settings is not None:
+            with open(os.path.join(d, "settings.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump(settings, fh, indent=2)
+        return d
+
+    def install(self, cfg, *args, logger_dir=None):
+        env = base_env(CLAUDE_CONFIG_DIR=cfg, HOME=tempfile.mkdtemp(dir=TMP),
+                       CLAUDE_USAGE_LOGGER_DIR=logger_dir)
+        return subprocess.run([INSTALLER, *args], env=env,
+                              capture_output=True, text=True)
+
+    def read(self, path, mode="r"):
+        with open(path, mode, **({} if "b" in mode else
+                                 {"encoding": "utf-8"})) as fh:
+            return fh.read()
+
+    def settings(self, cfg):
+        return json.loads(self.read(os.path.join(cfg, "settings.json")))
+
+    def backups(self, cfg):
+        return [f for f in os.listdir(cfg) if ".bak." in f]
+
+    def installed(self, cfg, logger_dir=None):
+        return os.path.join(logger_dir or os.path.join(cfg, "usage-logger"),
+                            "usage_logger.sh")
+
+    def test_a_dry_run_changes_nothing_on_disk(self):
+        cfg = self.config(FULL_SETTINGS)
+        path = os.path.join(cfg, "settings.json")
+        before = self.read(path, "rb")
+        proc = self.install(cfg)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.read(path, "rb"), before)
+        self.assertFalse(os.path.exists(os.path.join(cfg, "usage-logger")))
+        self.assertEqual(self.backups(cfg), [])
+        self.assertIn(self.installed(cfg), proc.stdout)
+
+    def test_apply_installs_a_copy_and_keeps_every_other_key(self):
+        cfg = self.config(FULL_SETTINGS)
+        path = os.path.join(cfg, "settings.json")
+        before = self.read(path, "rb")
+        proc = self.install(cfg, "--apply")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        copy = self.installed(cfg)
+        self.assertTrue(os.access(copy, os.X_OK), copy)
+        self.assertEqual(self.read(copy, "rb"), self.read(WRAPPER, "rb"))
+        self.assertEqual(
+            self.read(os.path.join(cfg, "usage-logger", "inner-command")),
+            "echo hi")
+
+        baks = self.backups(cfg)
+        self.assertEqual(len(baks), 1, baks)
+        self.assertEqual(self.read(os.path.join(cfg, baks[0]), "rb"), before)
+
+        got = self.settings(cfg)
+        self.assertEqual(got["statusLine"]["command"], copy)
+        self.assertEqual(got["cleanupPeriodDays"], 365)
+        for key in ("type", "padding", "refreshInterval",
+                    "hideVimModeIndicator"):
+            self.assertEqual(got["statusLine"][key],
+                             FULL_SETTINGS["statusLine"][key], key)
+
+    def test_a_second_apply_refuses_to_double_wrap(self):
+        cfg = self.config(FULL_SETTINGS)
+        self.assertEqual(self.install(cfg, "--apply").returncode, 0)
+        inner = os.path.join(cfg, "usage-logger", "inner-command")
+        proc = self.install(cfg, "--apply")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("Already wrapped", proc.stdout)
+        self.assertEqual(self.settings(cfg)["statusLine"]["command"],
+                         self.installed(cfg))
+        self.assertEqual(self.read(inner), "echo hi")
+
+    def test_an_existing_inner_command_is_never_overwritten(self):
+        # the state this guard exists for: the wrapper was uninstalled from
+        # settings.json but the saved original was left behind. Overwriting it
+        # would lose the user's real statusline for good.
+        cfg = self.config(FULL_SETTINGS)
+        os.makedirs(os.path.join(cfg, "usage-logger"))
+        inner = os.path.join(cfg, "usage-logger", "inner-command")
+        with open(inner, "w", encoding="utf-8") as fh:
+            fh.write("my-real-statusline --flag")
+        proc = self.install(cfg, "--apply")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("my-real-statusline --flag", proc.stderr)
+        self.assertEqual(self.settings(cfg)["statusLine"]["command"],
+                         "echo hi")
+        self.assertEqual(self.read(inner), "my-real-statusline --flag")
+
+    def test_settings_without_a_statusline_gain_a_valid_one(self):
+        cfg = self.config({"cleanupPeriodDays": 365})
+        proc = self.install(cfg, "--apply")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        sl = self.settings(cfg)["statusLine"]
+        self.assertEqual(sl, {"type": "command",
+                              "command": self.installed(cfg)})
+
+    def test_a_statusline_missing_its_type_gets_one(self):
+        """The only shape in which setdefault does any work: with `type`
+        already present it is a no-op, and with no statusLine at all the
+        installer takes its isinstance branch instead. Claude Code rejects a
+        statusLine without a type, so dropping the setdefault would leave a
+        dark status bar after a run that reported success."""
+        cfg = self.config({"statusLine": {"command": "echo hi"}})
+        proc = self.install(cfg, "--apply")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        sl = self.settings(cfg)["statusLine"]
+        self.assertEqual(sl["type"], "command")
+        self.assertEqual(sl["command"], self.installed(cfg))
+
+    def test_the_logger_dir_override_moves_the_whole_install(self):
+        """$CLAUDE_USAGE_LOGGER_DIR is the escape hatch for the divergence
+        between where the logger writes and where burnrate reads: burnrate
+        looks for the log beside the transcript root it resolved, so a
+        $CLAUDE_PROJECTS tree whose parent is not the config dir needs the log
+        pointed at that parent instead."""
+        cfg = self.config(FULL_SETTINGS)
+        elsewhere = os.path.join(tempfile.mkdtemp(dir=TMP), "usage-logger")
+        proc = self.install(cfg, "--apply", logger_dir=elsewhere)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        copy = os.path.join(elsewhere, "usage_logger.sh")
+        self.assertTrue(os.access(copy, os.X_OK), copy)
+        self.assertTrue(os.path.exists(os.path.join(elsewhere,
+                                                    "inner-command")))
+        self.assertFalse(os.path.exists(os.path.join(cfg, "usage-logger")))
+        self.assertEqual(self.settings(cfg)["statusLine"]["command"], copy)
+
+
 def _private_tokens():
     """Strings identifying the machine running this suite, derived rather than
     hardcoded so the repo ships no one's identity and every user's run checks
