@@ -11,7 +11,8 @@ demand" stays fast.
 
 What it measures (per assistant message, deduped globally by .message.id):
     input / cache-write (5m and 1h split) / cache-read / output tokens
-    billed-equivalent = input + 1.25*cache_write + 0.10*cache_read
+    billed-equivalent = input + 1.25*cache_write_5m + 2*cache_write_1h
+                              + 0.10*cache_read
     context footprint = input + cache_write + cache_read  (the live window size)
 
 What it reconstructs:
@@ -48,7 +49,7 @@ import webbrowser
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
-CW, CR = 1.25, 0.10
+CW5, CW1H, CR = 1.25, 2.00, 0.10
 BLOCK_H = 5 * 3600
 CACHE_VER = 2
 
@@ -794,8 +795,12 @@ def collect(cache_path, sources, rebuild, quiet):
 # ---------------------------------------------------------------- aggregate
 
 def be_of(r):
-    _, _, _, _, _, inp, cc, _, cr, _ = r
-    return inp + CW * cc + CR * cr
+    """A 1h cache write bills at 2x base, a 5m one at 1.25x, so the two halves
+    of cache_creation cannot share a weight. Transcripts that predate the
+    cache_creation breakdown report cc1h = 0, which weights their writes as 5m
+    -- an undercount, but the only reading their data supports."""
+    _, _, _, _, _, inp, cc, cc1h, cr, _ = r
+    return inp + CW5 * (cc - cc1h) + CW1H * cc1h + CR * cr
 
 
 def seg_at(segs, ts):
@@ -1190,7 +1195,7 @@ footer{color:var(--muted);font-size:11.5px;margin:18px 0 8px}
 
   <div class="card">
     <h2>Daily burn by project</h2>
-    <div class="note">Billed-equivalent tokens per day (input + 1.25&times;cache write + 0.10&times;cache read)</div>
+    <div class="note">Billed-equivalent tokens per day (input + 1.25&times;cache write 5m + 2&times;cache write 1h + 0.10&times;cache read)</div>
     <div class="legend" id="dailyLegend"></div>
     <div id="dailyChart"></div>
   </div>
@@ -1664,13 +1669,13 @@ function render(){
   const comp = [
     {name:'fresh input', color:'--s1', values:new Array(nDays).fill(0)},
     {name:'cache write 5m ×1.25', color:'--s2', values:new Array(nDays).fill(0)},
-    {name:'cache write 1h ×1.25', color:'--s3', values:new Array(nDays).fill(0)},
+    {name:'cache write 1h ×2', color:'--s3', values:new Array(nDays).fill(0)},
     {name:'cache read ×0.10', color:'--s4', values:new Array(nDays).fill(0)}];
   for (const r of rows){
     const i = dIdx.get(r[D.day]); if (i == null) continue;
     comp[0].values[i] += r[D.inp];
     comp[1].values[i] += 1.25*(r[D.cc]-r[D.cc1h]);
-    comp[2].values[i] += 1.25*r[D.cc1h];
+    comp[2].values[i] += 2*r[D.cc1h];
     comp[3].values[i] += 0.10*r[D.cr];
   }
   stackedChart('#compChart', days, [...comp].reverse(), {W: 520});

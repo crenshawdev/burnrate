@@ -31,12 +31,12 @@ try:
 except ImportError:
     zstd = None
 
-CW, CR = 1.25, 0.10
+CW5, CW1H, CR = 1.25, 2.00, 0.10
 
 # Every assistant message uses the same cache split so billed-equiv stays an
-# exact integer: be = input + 1.25*400 + 0.10*2000 = input + 700.
+# exact integer: be = input + 1.25*300 + 2*100 + 0.10*2000 = input + 775.
 CC, CC1H, CRD, OUT = 400, 100, 2000, 300
-BE_EXTRA = CW * CC + CR * CRD          # 700.0
+BE_EXTRA = CW5 * (CC - CC1H) + CW1H * CC1H + CR * CRD     # 775.0
 
 # Three probe instants, each chosen for a specific timezone disagreement.
 PROBES = {
