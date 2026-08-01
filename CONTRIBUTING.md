@@ -98,6 +98,39 @@ If you want the long version of how I think about this, I have written it out.
 - [The Gap Between Looking Finished and Being Finished](https://jcrenshaw.dev/posts/the-gap-between-looking-finished-and-being-finished)
 - [The Gap Runs Both Ways](https://jcrenshaw.dev/posts/the-gap-runs-both-ways)
 
+## Cutting a release
+
+Read this before tagging anything. It is the one step in this project with a
+silent failure mode.
+
+An installed plugin lives in `<config>/plugins/cache/burnrate/burnrate/<version>/`,
+and that `<version>` comes from `.claude-plugin/plugin.json`. `claude plugin
+update` compares that string. If it has not changed, the manager refetches
+nothing, correctly, and the release reaches no installed copy. That is not a
+bug in Claude Code. It is what a version number is for. `v0.1.1` and `v0.1.2`
+both shipped without a bump and reached nobody.
+
+So the manifest is the version. Tags follow it, never the other way around:
+
+1. Bump `version` in `.claude-plugin/plugin.json`.
+2. Merge to `main`.
+3. Tag `v<that exact version>` and push the tag.
+
+Two things enforce it, so neither has to be remembered:
+
+- `.githooks/pre-push` refuses to push a `v*` tag whose name disagrees with the
+  manifest at that commit. Point a fresh clone at it once:
+
+  ```sh
+  git config core.hooksPath .githooks
+  ```
+
+- `tools/selftest.py` fails if `HEAD` carries a `v*` tag that does not match,
+  and fails if the hook goes missing or loses its execute bit.
+
+`claude plugin validate .` and `claude plugin tag --dry-run` are worth running
+too; the latter checks the manifest against the marketplace entry.
+
 ## Last thing
 
 None of this is meant to scare you off. If you are still reading, you are probably the kind of person I want sending me code. Come say hello, bring me something you understand and can stand behind, and let us build something small and solid. And if we do not end up agreeing, fork it and go build yours. Either way, welcome.

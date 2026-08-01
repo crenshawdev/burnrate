@@ -1621,6 +1621,55 @@ class TestPluginPackaging(unittest.TestCase):
         for key in ("version", "description", "license"):
             self.assertTrue(self.plugin.get(key), f"plugin.json lacks {key}")
 
+    def test_a_release_tag_on_head_matches_the_manifest_version(self):
+        """The installed plugin lives in <config>/plugins/cache/<name>/<name>/
+        <version>/, keyed on plugin.json's version, and `claude plugin update`
+        compares that string. Ship code under a version already installed and
+        the manager correctly refetches nothing: v0.1.1 and v0.1.2 both did
+        that and reached no installed copy. A tag is the release, so a v* tag
+        on HEAD must name the manifest's version.
+
+        Asserting `version` is merely truthy is what let this through for two
+        releases, so this case asserts it MOVED, not that it exists."""
+        try:
+            out = subprocess.run(["git", "tag", "--points-at", "HEAD"],
+                                 cwd=REPO, capture_output=True, text=True,
+                                 timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            self.skipTest("git unavailable")
+        if out.returncode != 0:
+            self.skipTest("not a git checkout")
+        tags = [t for t in out.stdout.split() if t.startswith("v")]
+        if not tags:
+            self.skipTest("HEAD carries no release tag")
+        # The manifest AS COMMITTED at HEAD, not the working tree's: a tag
+        # ships the commit. Reading the working copy instead fails the moment
+        # you bump the version while still standing on the previous release,
+        # which is exactly when the next release starts.
+        show = subprocess.run(
+            ["git", "show", "HEAD:.claude-plugin/plugin.json"],
+            cwd=REPO, capture_output=True, text=True, timeout=15)
+        if show.returncode != 0:
+            self.skipTest("plugin.json not committed at HEAD")
+        want = "v" + json.loads(show.stdout)["version"]
+        self.assertIn(want, tags,
+                      f"HEAD is tagged {tags} but its plugin.json says "
+                      f"{want[1:]}, so the tag ships to nobody. "
+                      f"Bump the manifest or retag {want}.")
+
+    def test_the_version_gate_hook_is_present_and_executable(self):
+        """The suite only catches this when someone runs it. .githooks/pre-push
+        catches it at the push itself, which is the step that cannot be
+        skipped, and CONTRIBUTING tells a fresh clone to point core.hooksPath
+        at it. Losing the file silently downgrades the guard back to memory."""
+        hook = os.path.join(REPO, ".githooks", "pre-push")
+        self.assertTrue(os.path.exists(hook), f"missing {hook}")
+        self.assertTrue(os.access(hook, os.X_OK), f"{hook} is not executable")
+        with open(hook, encoding="utf-8") as fh:
+            body = fh.read()
+        self.assertIn("plugin.json", body)
+        self.assertIn("refs/tags/v", body)
+
     def test_the_marketplace_lists_this_plugin_once(self):
         # a marketplace with no description fails `plugin validate --strict`
         self.assertTrue(self.market.get("description"),

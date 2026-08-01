@@ -1,6 +1,6 @@
 {
   "name": "burnrate",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Builds a local, self-contained dashboard of your own Claude Code token usage from your transcripts, and answers quick usage questions in chat.",
   "author": {
     "name": "John Crenshaw"
