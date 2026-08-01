@@ -1116,6 +1116,27 @@ class TestViewer(unittest.TestCase):
         self.assertIn("e.target.checked", handler)
         self.assertIn("new Set()", handler)
 
+    def test_the_composition_card_uses_the_billed_equiv_weights(self):
+        # The card recomputes billed-equiv in JavaScript, so the weights live
+        # in two places: be_of() and this block. That is the seam the 1h write
+        # weight was already wrong on, and nothing else in the suite reads the
+        # viewer's copy -- it could quietly go back to pricing a 1h write at
+        # 1.25x while every Python-side assertion still passed.
+        block = br.PAGE.split("// composition", 1)[1].split("stackedChart", 1)[0]
+
+        def weight(term):
+            m = re.search(r"\+=\s*([0-9.]+)\s*\*\s*" + re.escape(term), block)
+            self.assertIsNotNone(m, f"no weighted term for {term}")
+            return float(m.group(1))
+
+        self.assertEqual(weight("(r[D.cc]-r[D.cc1h])"), br.CW5)
+        self.assertEqual(weight("r[D.cc1h]"), br.CW1H)
+        self.assertEqual(weight("r[D.cr]"), br.CR)
+        # fresh input carries no weight at all, and the 5m band is the
+        # remainder after the 1h half is taken out, never the raw total
+        self.assertIn("comp[0].values[i] += r[D.inp];", block)
+        self.assertNotIn("* r[D.cc]", block.replace("r[D.cc]-", ""))
+
     def marker(self):
         m = os.path.join(tempfile.mkdtemp(dir=TMP), "launched")
         return m

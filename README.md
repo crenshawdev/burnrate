@@ -153,8 +153,11 @@ Then the panels:
   filter does not apply to it.
 - **Rolling 7-day burn**, the trailing weekly total, which is the pacing signal
   against a weekly window.
-- **Token composition**, the billed-weighted share of input, cache write and
-  cache read per day. This is where a cache-heavy pattern becomes visible.
+- **Token composition**, the same billed-equivalent total as the daily chart,
+  split per day into fresh input, cache writes at each of the two weights, and
+  cache read. This is where a cache-heavy pattern becomes visible. The ×1.25
+  band is every write not reported as 1h, so it also carries the writes in
+  transcripts too old to declare a TTL.
 - **By command**, **by model**, **by effort**, and **main vs subagents**, four
   breakdown bars over the filtered range.
 - **Rate-limit windows**, logged used-percentage from the statusline payload.
