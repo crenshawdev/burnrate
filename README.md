@@ -98,7 +98,7 @@ transcripts, and optionally any archive you point `--archive` at.
 Per assistant message, deduped globally by `message.id`:
 
 - input, cache-write (5m and 1h), cache-read and output tokens
-- **billed-equiv** = `input + 1.25*cache_creation + 0.10*cache_read`
+- **billed-equiv** = `input + 1.25*cache_write_5m + 2*cache_write_1h + 0.10*cache_read`
 - context footprint = `input + cache_creation + cache_read`, the live window size
 
 From those it reconstructs daily burn at day x project x command x model x
@@ -110,7 +110,15 @@ per-session summaries (peak context, compactions, interrupts, subagents).
 `cache_creation` is the field name in the transcript JSONL
 (`cache_creation_input_tokens`). `burnrate.py --help` calls the same quantity
 `cache_write`, and the chart note in the report calls it "cache write". They are
-the same number with the same 1.25 weight, not three different things.
+the same number, not three different things.
+
+That number carries two weights, because the API prices the two cache TTLs
+differently: a 5-minute cache write bills at 1.25x base input, a 1-hour one at
+2x. burnrate reads the split from `cache_creation.ephemeral_1h_input_tokens`
+and weights each half accordingly. Claude Code writes a mix of both, so a
+single blended weight would be wrong in either direction. Transcripts old
+enough to predate that breakdown report no 1h tokens, and their writes are all
+weighted as 5m.
 
 ### billed-equiv is a comparison unit
 
