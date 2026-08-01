@@ -1214,7 +1214,7 @@ footer{color:var(--muted);font-size:11.5px;margin:18px 0 8px}
     </div>
     <div class="card" style="margin:0">
       <h2>Token composition</h2>
-      <div class="note">Billed-weighted share per day</div>
+      <div class="note">Billed-equivalent tokens per day, by what was billed</div>
       <div class="legend" id="compLegend"></div>
       <div id="compChart"></div>
     </div>
@@ -1668,7 +1668,7 @@ function render(){
   // composition
   const comp = [
     {name:'fresh input', color:'--s1', values:new Array(nDays).fill(0)},
-    {name:'cache write 5m ×1.25', color:'--s2', values:new Array(nDays).fill(0)},
+    {name:'cache write ×1.25 (5m/unattributed)', color:'--s2', values:new Array(nDays).fill(0)},
     {name:'cache write 1h ×2', color:'--s3', values:new Array(nDays).fill(0)},
     {name:'cache read ×0.10', color:'--s4', values:new Array(nDays).fill(0)}];
   for (const r of rows){
