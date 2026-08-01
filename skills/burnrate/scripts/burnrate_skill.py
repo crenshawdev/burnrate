@@ -35,6 +35,8 @@ BLOCK_SECONDS = 5 * 3600        # a rate-limit window, same constant as the tool
 # legend (`const D = {...}` beside the viewer's payload). Every read of a daily
 # row goes through this map: a wrong literal index returns a plausible wrong
 # number with no failure signal, and this is the one place to get it right.
+# cache_write is the TOTAL cache_creation; cache_write_1h is the 1h-TTL half
+# already counted inside it. They nest, and summing the two double-counts.
 COLS = {"day": 0, "project": 1, "command": 2, "model": 3, "effort": 4,
         "kind": 5, "billed_equiv": 6, "input": 7, "cache_write": 8,
         "cache_write_1h": 9, "cache_read": 10, "output": 11, "messages": 12}
@@ -392,7 +394,11 @@ def build_parser():
                     "payload with --no-open when it is missing or stale, and "
                     "never opens a browser. `kind` is 'm' (main thread) or "
                     "'a' (subagent); an empty `command` means no command "
-                    "segment was open.")
+                    "segment was open. `cache_write` is the whole "
+                    "cache-creation total and ALREADY INCLUDES "
+                    "`cache_write_1h`, which is the 1-hour-TTL half of it -- "
+                    "the two are nested, not disjoint, so adding them "
+                    "double-counts.")
     k.add_argument("--by", default="day",
                    help="comma list of " + ", ".join(GROUP_KEYS)
                         + " (default: day)")
