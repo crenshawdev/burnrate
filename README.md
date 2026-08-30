@@ -1,5 +1,8 @@
 # burnrate
 
+[![CI](https://github.com/crenshawdev/burnrate/actions/workflows/ci.yml/badge.svg)](https://github.com/crenshawdev/burnrate/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A single-file, on-demand dashboard of your own Claude Code token usage.
 
 Run it and one self-contained `dashboard.html` opens in your browser: daily burn

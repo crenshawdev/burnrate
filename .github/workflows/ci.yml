@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.8"
+          - "3.14"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Check Python syntax
+        run: |
+          python -m py_compile burnrate.py tools/mkfixture.py tools/selftest.py
+          python -m json.tool .claude-plugin/marketplace.json >/dev/null
+          python -m json.tool .claude-plugin/plugin.json >/dev/null
+
+      - name: Check shell syntax
+        run: bash -n .githooks/pre-push extras/install_usage_logger.sh extras/usage_logger.sh
+
+      - name: Run self-test
+        run: python tools/selftest.py
