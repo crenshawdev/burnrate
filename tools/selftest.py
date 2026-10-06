@@ -458,6 +458,138 @@ class TestDiscovery(unittest.TestCase):
         self.assertIn("agent-1", s["subs"])
 
 
+def typed_command(uuid, name, human=True):
+    """A slash command line, exactly as Claude Code writes one. Skill commands
+    carry origin human; built-ins carry no origin at all."""
+    d = {"type": "user", "uuid": uuid,
+         "message": {"role": "user",
+                     "content": f"<command-name>/{name}</command-name>\n"
+                                f"<command-message>{name}</command-message>\n"
+                                "<command-args></command-args>"}}
+    if human:
+        d["origin"] = {"kind": "human"}
+    return d
+
+
+def typed_prompt(uuid, text, source="typed"):
+    return {"type": "user", "uuid": uuid, "promptSource": source,
+            "origin": {"kind": "human"},
+            "message": {"role": "user", "content": text}}
+
+
+def local_stdout(parent, as_system=False):
+    """The reply a built-in command gets. Both shapes occur in real trees."""
+    body = "<local-command-stdout>Set model to Opus</local-command-stdout>"
+    if as_system:
+        return {"type": "system", "subtype": "local_command",
+                "uuid": parent + "-out", "parentUuid": parent, "content": body}
+    return {"type": "user", "uuid": parent + "-out", "parentUuid": parent,
+            "message": {"role": "user", "content": body}}
+
+
+def billed_reply(mid, inp):
+    """An assistant message whose billed-equiv is exactly `inp`."""
+    return {"type": "assistant", "uuid": "u-" + mid,
+            "message": {"id": mid, "role": "assistant",
+                        "model": "claude-opus-4-6",
+                        "usage": {"input_tokens": inp, "output_tokens": 1}}}
+
+
+class TestCommandAttribution(unittest.TestCase):
+    """Only work opens a command segment: a command the user typed, or a skill
+    the model invoked. Built-ins like /clear and /model change a setting and
+    reply with <local-command-stdout>, and a tool result quoting transcript
+    text is not a command at all. Both used to open segments, and on a real
+    tree they held over 40% of all burn."""
+
+    T0 = 1772366400  # 2026-03-01T12:00:00Z
+
+    def by_command(self, *sessions):
+        """{command: billed-equiv} from a real run over these sessions."""
+        root = os.path.join(tempfile.mkdtemp(dir=TMP), "projects")
+        pdir = os.path.join(root, "-home-alice-work-api")
+        os.makedirs(pdir)
+        for n, lines in enumerate(sessions):
+            with open(os.path.join(pdir, f"sess-{n}.jsonl"), "w",
+                      encoding="utf-8") as fh:
+                for i, d in enumerate(lines):
+                    d["timestamp"] = time.strftime(
+                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.T0 + 60 * i))
+                    fh.write(json.dumps(d) + "\n")
+        proc, out = run(["--root", root])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        got = {}
+        for r in payload(out)["daily"]:
+            got[r[2]] = got.get(r[2], 0) + r[6]
+        return got
+
+    def test_a_builtin_command_opens_no_segment(self):
+        got = self.by_command(
+            [typed_command("c1", "plan"), billed_reply("m1", 100),
+             typed_command("c2", "model", human=False), local_stdout("c2"),
+             billed_reply("m2", 20)],
+            [typed_command("c3", "clear", human=False),
+             local_stdout("c3", as_system=True), billed_reply("m3", 3)])
+        self.assertEqual(got, {"plan": 120, "": 3})
+
+    def test_a_builtin_still_opens_none_once_it_carries_an_origin(self):
+        # the stdout reply decides, so a later Claude Code stamping built-ins
+        # human cannot bring them back
+        got = self.by_command(
+            [typed_command("c1", "plan"), billed_reply("m1", 100),
+             typed_command("c2", "effort"), local_stdout("c2"),
+             billed_reply("m2", 20)])
+        self.assertEqual(got, {"plan": 120})
+
+    def test_the_next_typed_prompt_ends_the_command(self):
+        # the 09-24 shape: a command, then free-form work that is not its own
+        got = self.by_command(
+            [typed_command("c1", "plan"), billed_reply("m1", 100),
+             typed_prompt("p1", "now on to the audit"), billed_reply("m2", 20),
+             typed_prompt("p2", "and this", source="queued"),
+             billed_reply("m3", 3)])
+        self.assertEqual(got, {"plan": 100, "": 23})
+
+    def test_lines_the_user_did_not_type_leave_the_command_open(self):
+        notice = {"type": "user", "uuid": "n1", "promptSource": "system",
+                  "origin": {"kind": "task-notification"},
+                  "message": {"role": "user",
+                              "content": "<task-notification> done"}}
+        sdk = {"type": "user", "uuid": "k1", "promptSource": "sdk",
+               "message": {"role": "user", "content": "EVIDENCE: ok"}}
+        meta = dict(typed_prompt("x1", "Base directory for this skill"),
+                    isMeta=True)
+        answer = {"type": "user", "uuid": "a1", "parentUuid": "u-m1",
+                  "message": {"role": "user", "content": [
+                      {"type": "tool_result", "tool_use_id": "toolu_3",
+                       "content": "User answered: A"}]}}
+        got = self.by_command(
+            [typed_command("c1", "plan"), meta, billed_reply("m1", 100),
+             answer, notice, sdk, billed_reply("m2", 20)])
+        self.assertEqual(got, {"plan": 120})
+
+    def test_a_tool_result_quoting_a_command_opens_no_segment(self):
+        quoted = {"type": "user", "uuid": "r1", "parentUuid": "u-m1",
+                  "message": {"role": "user", "content": [
+                      {"type": "tool_result", "tool_use_id": "toolu_1",
+                       "content": "<command-name>/clear</command-name>"}]}}
+        got = self.by_command(
+            [billed_reply("m1", 100), quoted, billed_reply("m2", 20)])
+        self.assertEqual(got, {"": 120})
+
+    def test_a_skill_the_model_invokes_still_opens_one(self):
+        invoke = {"type": "assistant", "uuid": "s1",
+                  "message": {"id": "m-s", "role": "assistant",
+                              "model": "claude-opus-4-6", "content": [
+                                  {"type": "tool_use", "id": "toolu_2",
+                                   "name": "Skill",
+                                   "input": {"skill": "cadence:cad-plan",
+                                             "args": "3"}}]}}
+        got = self.by_command(
+            [billed_reply("m1", 100), invoke, billed_reply("m2", 20)])
+        self.assertEqual(got, {"": 100, "cadence:cad-plan": 20})
+
+
 class TestZstandardAbsent(unittest.TestCase):
     """The optional dependency is missing on most machines, so every branch
     that drops an arch source has to hold there -- which is precisely where the
@@ -1312,6 +1444,47 @@ class TestBilledUnitIsLabeled(unittest.TestCase):
         self.assertIn("}weighted tokens, not a bill", br.PAGE)
 
 
+class TestCacheHitRate(unittest.TestCase):
+    """Cache read over every prompt token: fresh input + cache write + cache
+    read. cache write already holds the 1h half, so adding cache_write_1h
+    again undercounts the rate. Floored, so one miss never reads 100%."""
+
+    def test_the_run_summary_prints_it(self):
+        proc, _ = run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        line = next(ln for ln in proc.stdout.splitlines()
+                    if ln.startswith("cache   :"))
+        want = EXP["cache_read"] * 1000 // EXP["prompt_tokens"] / 10
+        self.assertIn(f"{want:.1f}% hit rate", line)
+
+    def test_an_empty_tree_says_so_instead_of_dividing(self):
+        proc, _ = run(["--root", EMPTY_ROOT])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("cache   : no data", proc.stdout)
+
+    @unittest.skipIf(not NODE, "needs a JS engine")
+    def test_the_viewer_floors_and_handles_no_prompt_tokens(self):
+        _, out = run()
+        js = (viewer_slice(report(out), "const hitPct", ": null;")
+              + "\nconsole.log(JSON.stringify("
+                "[hitPct(1, 1, 9998), hitPct(100, 400, 1500), hitPct(0, 0, 0)]));")
+        path = os.path.join(tempfile.mkdtemp(dir=TMP), "hit.js")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(js)
+        r = subprocess.run([NODE, path], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout), [99.9, 75, None])
+
+    def test_every_viewer_call_passes_the_whole_cache_write(self):
+        # the rate's inputs are read in three places; none may reach for the
+        # 1h half, which would count those tokens twice
+        calls = re.findall(r"hitPct\(([^)]*)\)", br.PAGE)
+        self.assertGreaterEqual(len(calls), 4, calls)
+        self.assertFalse([c for c in calls if "cc1h" in c], calls)
+        block = br.PAGE.split("const perDayCache", 1)[1].split("const sum3", 1)[0]
+        self.assertIn("c[1] += r[D.cc];", block)
+
+
 def viewer_slice(html, start, end):
     """The verbatim text between two markers in the generated report's script
     block, so a case runs the shipped code rather than a paraphrase of it."""
@@ -1498,6 +1671,13 @@ class TestSkillAnswers(unittest.TestCase):
                          by_proj["total"]["billed_equiv"])
         self.assertTrue(by_day["reused"] or by_proj["reused"],
                         "a second answer inside the freshness window rebuilt")
+
+    def test_the_cache_hit_rate_counts_every_prompt_token_once(self):
+        got = self.answer("ask", "--by", "project")
+        want = round(EXP["cache_read"] / EXP["prompt_tokens"], 4)
+        self.assertEqual(got["total"]["cache_hit_rate"], want, got["total"])
+        for r in got["rows"]:
+            self.assertGreater(r["cache_hit_rate"], 0, r)
 
     def test_words_reach_this_repos_own_burnrate(self):
         argv = json.loads(

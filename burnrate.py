@@ -14,6 +14,7 @@ What it measures (per assistant message, deduped globally by .message.id):
     billed-equivalent = input + 1.25*cache_write_5m + 2*cache_write_1h
                               + 0.10*cache_read
     context footprint = input + cache_write + cache_read  (the live window size)
+    cache hit rate = cache_read / (input + cache_write + cache_read)
 
 What it reconstructs:
     - daily burn at (day x project x command x model x effort x main|agent) grain
@@ -23,9 +24,11 @@ What it reconstructs:
     - per-session summaries: peak context, compactions, interrupts, agents
     - the rate-limit logger's samples (extras/usage_logger.sh), when installed
 
-Attribution: any <command-name> in a user line (or "skill":"..." tool call)
-opens a segment that stays open until the next one; a subagent attaches to the
-segment open at its first timestamp.
+Attribution: a slash command the user typed, or a skill the model invoked,
+opens a segment that stays open until the user's next typed prompt or the next
+command; a subagent attaches to the segment open at its first timestamp.
+Built-ins like /clear and /model change a setting rather than do work, so they
+open none.
 
 Stdlib + zstandard (archive only). The parse cache is one gzipped file per
 source set under the platform's cache directory: $XDG_CACHE_HOME/burnrate
@@ -51,10 +54,10 @@ from datetime import datetime, timedelta, timezone
 
 CW5, CW1H, CR = 1.25, 2.00, 0.10
 BLOCK_H = 5 * 3600
-CACHE_VER = 2
+CACHE_VER = 3
 
 CMD_RE = re.compile(r"<command-name>/?([A-Za-z0-9:_.-]+)</command-name>")
-SKILL_RE = re.compile(r'"skill"\s*:\s*"([A-Za-z0-9:_.-]+)"')
+NAME_RE = re.compile(r"[A-Za-z0-9:_.-]+")
 BASE_DIR_RE = re.compile(r"""\s*base_dir\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s#]+))""")
 
 try:
@@ -590,6 +593,35 @@ def session_sig(s):
 
 # ---------------------------------------------------------------- parsing
 
+def seg_name(d):
+    """The command or skill a transcript line opens, or None. Read from the
+    parsed message, not the raw line: a tool result quoting transcript text
+    carries <command-name> markup too, and is not a command."""
+    content = (d.get("message") or {}).get("content")
+    if d.get("type") == "user":
+        if isinstance(content, str):
+            m = CMD_RE.search(content)
+            return m.group(1) if m else None
+    elif d.get("type") == "assistant" and isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "tool_use":
+                inp = b.get("input")
+                s = inp.get("skill") if isinstance(inp, dict) else None
+                if isinstance(s, str) and NAME_RE.fullmatch(s):
+                    return s
+    return None
+
+
+def typed_by_user(d):
+    """A prompt the user typed, pasted or accepted. Claude Code marks those
+    origin.kind == "human"; task notifications, hook feedback, SDK prompts and
+    ! shell input carry no such origin. Transcripts that predate the field
+    never end a segment early."""
+    o = d.get("origin")
+    return (d.get("type") == "user" and not d.get("isMeta")
+            and isinstance(o, dict) and o.get("kind") == "human")
+
+
 def scan_unit(iters, unit, rec, want_meta):
     """Stream one logical file (live + archive generations). Appends usage rows
     and, for the main transcript, segments and session metadata. Dedupe within
@@ -602,12 +634,14 @@ def scan_unit(iters, unit, rec, want_meta):
                 continue
             has_usage = '"usage"' in line
             is_seg = want_meta and ("<command-name>" in line or '"skill"' in line)
+            is_local = want_meta and "<local-command-stdout>" in line
+            is_prompt = want_meta and '"human"' in line
             is_mark = want_meta and (
                 '"compact_boundary"' in line or '"isCompactSummary":true' in line
                 or '"interruptedMessageId"' in line
                 or '"isApiErrorMessage":true' in line
                 or '"aiTitle"' in line)
-            if not (has_usage or is_seg or is_mark):
+            if not (has_usage or is_seg or is_mark or is_local or is_prompt):
                 continue
             try:
                 d = json.loads(line)
@@ -638,16 +672,19 @@ def scan_unit(iters, unit, rec, want_meta):
                 if key and key not in marks:
                     marks.add(key)
                     rec[key[0]] += 1
-            if is_seg:
+            if is_local and d.get("parentUuid"):
+                # a built-in's reply, parented on the command line it answers
+                rec["_local"].add(d["parentUuid"])
+            if is_seg or is_prompt:
                 uid = d.get("uuid")
                 if uid is None or ("seg", uid) not in marks:
-                    m = CMD_RE.search(line) if d.get("type") == "user" else None
-                    if m is None:
-                        m = SKILL_RE.search(line)
-                    if m:
+                    name = seg_name(d)
+                    if name is None and is_prompt and typed_by_user(d):
+                        name = ""   # the user moved on: back to conversation
+                    if name is not None:
                         if uid is not None:
                             marks.add(("seg", uid))
-                        rec["segs"].append([ts, m.group(1)])
+                        rec["segs"].append([ts, name, uid])
             if not has_usage or d.get("type") != "assistant":
                 continue
             msg = d.get("message") or {}
@@ -671,16 +708,19 @@ def parse_session(s):
     rec = {"rows": [], "segs": [], "slug": None, "title": None,
            "comp": 0, "intr": 0, "err": 0, "agents": {},
            "_mids": set(), "_marks": set(), "_branch": Counter(),
-           "_cwd": Counter()}
+           "_cwd": Counter(), "_local": set()}
     scan_unit(iters_for(s["main"]), "", rec, want_meta=True)
     for key, specs in sorted(s["subs"].items()):
         rec["agents"][key] = s["meta"].get(key) or "unresolved"
         scan_unit(iters_for(specs), key, rec, want_meta=False)
-    rec["segs"].sort(key=lambda x: x[0])
+    # a command that got a <local-command-stdout> reply was a built-in
+    rec["segs"] = sorted(([ts, name] for ts, name, uid in rec["segs"]
+                          if uid is None or uid not in rec["_local"]),
+                         key=lambda x: x[0])
     rec["branch"] = (rec["_branch"].most_common(1) or [(None, 0)])[0][0]
     rec["cwd"] = (min(rec["_cwd"].items(), key=lambda kv: (-kv[1], kv[0]))[0]
                   if rec["_cwd"] else None)
-    for k in ("_mids", "_marks", "_branch", "_cwd"):
+    for k in ("_mids", "_marks", "_branch", "_cwd", "_local"):
         del rec[k]
     return rec
 
@@ -1043,6 +1083,11 @@ def main():
     print(f"billed  : {tot:,.0f} billed-equiv tokens, "
           f"{len(data['blocks'])} five-hour blocks, "
           f"{len(data['projects'])} projects")
+    # floored like the report's tile, so one miss never prints as 100%
+    prompt = sum(r[7] + r[8] + r[10] for r in data["daily"])
+    read = sum(r[10] for r in data["daily"])
+    print(f"cache   : {read * 1000 // prompt / 10:.1f}% hit rate "
+          "(cache read / all prompt tokens)" if prompt else "cache   : no data")
     print(f"rl log  : {'%d samples' % len(data['rl']) if data['rl'] else 'not installed'}")
     print(f"wrote   : {hpath}")
 
@@ -1129,9 +1174,7 @@ h1{font-size:19px;font-weight:650;margin-bottom:2px}
 .tile .v{font-size:22px;font-weight:650}
 .tile.hero .v{font-size:46px;font-weight:700;line-height:1.05}
 .tile .d{font-size:12px;color:var(--muted);margin-top:3px}
-.tile .d .up{color:#e34948}.tile .d .down{color:#006300}
-:root[data-theme="dark"] .tile .d .down,
-:root:not([data-theme="light"]) .tile .d .down{}
+.tile .d .bad{color:#e34948}.tile .d .good{color:#006300}
 .card{background:var(--surface-1);border:1px solid var(--border);border-radius:12px;
   padding:14px 16px;margin-bottom:14px;position:relative}
 .card h2{font-size:14px;font-weight:650;margin-bottom:2px}
@@ -1218,6 +1261,11 @@ footer{color:var(--muted);font-size:11.5px;margin:18px 0 8px}
       <div class="legend" id="compLegend"></div>
       <div id="compChart"></div>
     </div>
+    <div class="card" style="margin:0">
+      <h2>Cache hit rate</h2>
+      <div class="note">Share of prompt tokens read from cache, per day (cache read &divide; fresh input + cache write + cache read)</div>
+      <div id="hitChart"></div>
+    </div>
   </div>
 
   <div class="grid3" style="margin-bottom:14px">
@@ -1265,6 +1313,10 @@ const fmtTime  = e => new Date((e + TZ*3600)*1000).toISOString().slice(11,16);
 const fmt = n => n >= 1e9 ? (n/1e9).toFixed(2)+'B' : n >= 1e6 ? (n/1e6).toFixed(1)+'M'
   : n >= 1e3 ? (n/1e3).toFixed(n<1e4?1:0)+'k' : Math.round(n).toString();
 const fmtFull = n => Math.round(n).toLocaleString('en-US');
+// cache read over every prompt token, floored so one miss never shows as 100%.
+// cc is the whole cache write and already holds the 1h half.
+const hitPct = (inp, cc, cr) => inp + cc + cr > 0
+  ? Math.floor(cr / (inp + cc + cr) * 1000) / 10 : null;
 
 // column indexes: daily row = [day,p,cmd,model,effort,kind,be,in,cc,cc1h,cr,out,n]
 const D = {day:0,p:1,cmd:2,model:3,effort:4,kind:5,be:6,inp:7,cc:8,cc1h:9,cr:10,out:11,n:12};
@@ -1369,13 +1421,14 @@ function barPath(x, y, w, h, r){
   return `M${x},${y+h} L${x},${y+r} Q${x},${y} ${x+r},${y} L${x+w-r},${y}` +
          `Q${x+w},${y} ${x+w},${y+r} L${x+w},${y+h} Z`;
 }
-function axisTicks(max, plotH, padT, padL, W){
+function axisTicks(max, plotH, padT, padL, W, lo){
+  lo = lo || 0;
   let out = '';
   for (let i = 0; i <= 4; i++){
-    const v = max*i/4, y = padT + plotH - plotH*i/4;
+    const v = lo + (max-lo)*i/4, y = padT + plotH - plotH*i/4;
     out += `<line x1="${padL}" x2="${W}" y1="${y}" y2="${y}" stroke="var(--grid)" stroke-width="1"
       vector-effect="non-scaling-stroke"></line>
-      <text x="${padL-6}" y="${Math.max(y+3, 10)}" text-anchor="end">${fmt(v)}</text>`;
+      <text x="${padL-6}" y="${Math.max(y+3, 10)}" text-anchor="end">${lo ? +v.toFixed(1) : fmt(v)}</text>`;
   }
   return out;
 }
@@ -1457,8 +1510,10 @@ function stackedChart(elId, days, series, opts){
 }
 const cssVar = v => getComputedStyle(document.body).getPropertyValue(v).trim();
 
-// ---- line chart (rolling 7d, rate-limit) ----
-function lineChart(elId, days, seriesArr, unit){
+// ---- line chart (rolling 7d, rate-limit, cache hit) ----
+// lo raises the axis floor, for a percentage that lives near the top
+function lineChart(elId, days, seriesArr, unit, lo){
+  lo = lo || 0;
   const W = 520, H = 200, padT = 12, padB = 20, padL = 46;
   const plotH = H - padT - padB, n = days.length;
   const el = $(elId);
@@ -1468,7 +1523,7 @@ function lineChart(elId, days, seriesArr, unit){
   const max = unit === '%' ? 100 :
     niceMax(Math.max(...seriesArr.flatMap(s => s.values.filter(v => v != null))));
   const xOf = i => n === 1 ? (W+padL)/2 : padL + i*(W-padL-8)/(n-1);
-  const yOf = v => padT + plotH - plotH*v/max;
+  const yOf = v => padT + plotH - plotH*(v-lo)/(max-lo);
   let body = '';
   for (const s of seriesArr){
     let dstr = '', started = false;
@@ -1483,12 +1538,12 @@ function lineChart(elId, days, seriesArr, unit){
       body += `<circle cx="${xOf(i)}" cy="${yOf(s.values[i])}" r="4" fill="var(${s.color})"
         stroke="var(--surface-1)" stroke-width="2"></circle>
         <text class="val" x="${Math.min(xOf(i), W-34)}" y="${Math.max(10, yOf(s.values[i])-8)}"
-        text-anchor="middle">${unit==='%' ? s.values[i].toFixed(0)+'%' : fmt(s.values[i])}</text>`;
+        text-anchor="middle">${unit==='%' ? s.values[i].toFixed(lo ? 1 : 0)+'%' : fmt(s.values[i])}</text>`;
       break;
     }
   }
   el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" style="aspect-ratio:${W}/${H}">
-    ${axisTicks(max, plotH, padT, padL, W)}
+    ${axisTicks(max, plotH, padT, padL, W, lo)}
     <line x1="${padL}" x2="${W}" y1="${padT+plotH}" y2="${padT+plotH}" stroke="var(--axis)"></line>
     ${body}
     <line id="xh" x1="0" x2="0" y1="${padT}" y2="${padT+plotH}" stroke="var(--axis)" opacity="0"></line>
@@ -1584,6 +1639,7 @@ function render(){
   // per-project stacked series (top 7 all-time in-filter projects get slots)
   const perProj = new Map();
   const perDayTotal = new Array(nDays).fill(0);
+  const perDayCache = days.map(() => [0, 0, 0]);   // fresh in, cache write, cache read
   let total = 0, totalOut = 0, totalMsgs = 0;
   for (const r of rows){
     const i = dIdx.get(r[D.day]);
@@ -1592,7 +1648,10 @@ function render(){
     perProj.get(r[D.p])[i] += r[D.be];
     perDayTotal[i] += r[D.be];
     total += r[D.be]; totalOut += r[D.out]; totalMsgs += r[D.n];
+    const c = perDayCache[i];
+    c[0] += r[D.inp]; c[1] += r[D.cc]; c[2] += r[D.cr];
   }
+  const sum3 = list => list.reduce((s, c) => [s[0]+c[0], s[1]+c[1], s[2]+c[2]], [0, 0, 0]);
   // slots by ALL-TIME project rank so filtering never repaints survivors
   topSlots = new Map();
   DATA.projects.forEach((p,i) => { if (i < SLOTS.length) topSlots.set(i, SLOTS[i]); });
@@ -1617,8 +1676,14 @@ function render(){
   // KPIs (+ comparison vs the prior period of equal length)
   const prev0 = addDays(state.d0, -nDays), prev1 = addDays(state.d0, -1);
   let prevTotal = 0;
+  const prevCache = [0, 0, 0];
   for (const r of DATA.daily)
-    if (r[D.day] >= prev0 && r[D.day] <= prev1 && projOk(r[D.p])) prevTotal += r[D.be];
+    if (r[D.day] >= prev0 && r[D.day] <= prev1 && projOk(r[D.p])){
+      prevTotal += r[D.be];
+      prevCache[0] += r[D.inp]; prevCache[1] += r[D.cc]; prevCache[2] += r[D.cr];
+    }
+  const hit = hitPct(...sum3(perDayCache)), prevHit = hitPct(...prevCache);
+  const dHit = hit != null && prevHit != null ? hit - prevHit : null;
   const active = perDayTotal.filter(v => v > 0).length;
   const pk = perDayTotal.indexOf(Math.max(...perDayTotal));
   const blocks = DATA.blocks.filter(b => {
@@ -1636,7 +1701,7 @@ function render(){
     <div class="tile hero"><div class="l">Billed-equivalent tokens</div>
       <div class="v">${fmt(total)}</div>
       <div class="d">${delta == null ? '' :
-        `<span class="${delta >= 0 ? 'up' : 'down'}">${delta >= 0 ? '+' : ''}${delta.toFixed(0)}%</span> vs prior ${nDays}d · `
+        `<span class="${delta >= 0 ? 'bad' : 'good'}">${delta >= 0 ? '+' : ''}${delta.toFixed(0)}%</span> vs prior ${nDays}d · `
       }weighted tokens, not a bill</div></div>
     <div class="tile"><div class="l">Daily average</div><div class="v">${fmt(active ? total/active : 0)}</div>
       <div class="d">${active} active day${active===1?'':'s'}</div></div>
@@ -1644,6 +1709,11 @@ function render(){
       <div class="d">${perDayTotal[pk] ? fmtDay(days[pk]) : '—'}</div></div>
     <div class="tile"><div class="l">Output tokens</div><div class="v">${fmt(totalOut)}</div>
       <div class="d">${fmtFull(totalMsgs)} messages</div></div>
+    <div class="tile"><div class="l">Cache hit rate</div>
+      <div class="v">${hit == null ? '—' : hit.toFixed(1) + '%'}</div>
+      <div class="d">${hit == null ? 'no prompt tokens' : (100 - hit).toFixed(1) + '% missed'}${dHit == null ? '' :
+        ` · <span class="${dHit >= 0 ? 'good' : 'bad'}">${dHit >= 0 ? '+' : ''}${dHit.toFixed(1)} pts</span> vs prior`
+      }</div></div>
     <div class="tile"><div class="l">5h blocks</div><div class="v">${blocks.length}</div>
       <div class="d">median ${fmt(med)}</div></div>
     <div class="tile"><div class="l">Peak context</div><div class="v">${fmt(peakCtx)}</div>
@@ -1682,25 +1752,43 @@ function render(){
   $('#compLegend').innerHTML = comp.map(s =>
     `<span class="it"><span class="sw" style="background:var(${s.color})"></span>${s.name}</span>`).join('');
 
-  // breakdowns
+  // cache hit rate per day. The axis floor sits below the lowest day, so a
+  // rate living at 97-99% still shows its dips.
+  const hitDays = perDayCache.map(c => hitPct(...c));
+  const known = hitDays.filter(v => v != null);
+  const need = (100 - (known.length ? Math.min(...known) : 0)) * 1.15;
+  const span = [2, 4, 8, 20, 40, 100].find(s => s >= need) || 100;
+  lineChart('#hitChart', days, [{name:'cache hit', color:'--s3', values: hitDays}],
+    '%', 100 - span);
+
+  // breakdowns: a = [billed-equiv, fresh in, cache write, cache read]
   const agg = (key, labelFn) => {
     const m = new Map();
-    for (const r of rows) m.set(r[key], (m.get(r[key])||0) + r[D.be]);
-    return [...m.entries()].map(([k,v]) => ({label: labelFn(k), v}))
+    for (const r of rows){
+      const a = m.get(r[key]) || [0, 0, 0, 0];
+      a[0] += r[D.be]; a[1] += r[D.inp]; a[2] += r[D.cc]; a[3] += r[D.cr];
+      m.set(r[key], a);
+    }
+    return [...m.entries()].map(([k,a]) => ({label: labelFn(k), v: a[0], a}))
       .sort((a,b) => b.v - a.v);
   };
+  // every bar's tooltip carries its own cache hit rate
+  const withHit = items => items.map(it => {
+    const h = hitPct(it.a[1], it.a[2], it.a[3]);
+    return {...it, tip: h == null ? it.label : `${it.label} · ${h.toFixed(1)}% cache hit`};
+  });
   let cmds = agg(D.cmd, c => c || '(conversation)');
   if (cmds.length > 10){
-    const rest = cmds.slice(10).reduce((a,c) => a + c.v, 0);
-    cmds = cmds.slice(0,10); cmds.push({label:'(other commands)', v: rest});
+    const rest = cmds.slice(10).reduce((s,c) => s.map((x,j) => x + c.a[j]), [0, 0, 0, 0]);
+    cmds = cmds.slice(0,10); cmds.push({label:'(other commands)', v: rest[0], a: rest});
     cmds.sort((a,b) => b.v - a.v);
   }
-  hbars('#byCmd', cmds);
-  hbars('#byModel', agg(D.model, m => m.replace(/^claude-/,'')));
+  hbars('#byCmd', withHit(cmds));
+  hbars('#byModel', withHit(agg(D.model, m => m.replace(/^claude-/,''))));
   const EORD = ['max','xhigh','high','medium','low','(unspecified)'];
-  hbars('#byEffort', agg(D.effort, e => e === '-' ? '(unspecified)' : e).sort((a,b) =>
-    EORD.indexOf(a.label) - EORD.indexOf(b.label)));
-  hbars('#byKind', agg(D.kind, k => k === 'm' ? 'main session' : 'subagents'));
+  hbars('#byEffort', withHit(agg(D.effort, e => e === '-' ? '(unspecified)' : e).sort((a,b) =>
+    EORD.indexOf(a.label) - EORD.indexOf(b.label))));
+  hbars('#byKind', withHit(agg(D.kind, k => k === 'm' ? 'main session' : 'subagents')));
 
   // rate-limit card
   const rl = DATA.rl.filter(s => { const d = epochDay(s[0]); return inRange(d); });
