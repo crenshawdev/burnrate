@@ -34,23 +34,18 @@ account required.
 burnrate installs as a Claude Code plugin. Two commands:
 
 ```sh
-claude plugin marketplace add https://git.jcrenshaw.dev/crenshawdev/burnrate.git
+claude plugin marketplace add crenshawdev/burnrate
 claude plugin install burnrate@burnrate
 ```
 
 The same two steps work inside a running session:
 
 ```
-/plugin marketplace add https://git.jcrenshaw.dev/crenshawdev/burnrate.git
+/plugin marketplace add crenshawdev/burnrate
 /plugin install burnrate@burnrate
 ```
 
-A bare `/plugin` opens the plugin manager if you would rather browse. The GitHub
-mirror works as an alternative source for the first step either way:
-
-```sh
-claude plugin marketplace add crenshawdev/burnrate
-```
+A bare `/plugin` opens the plugin manager if you would rather browse.
 
 Restart Claude Code, or start a new session, and `/burnrate` works in every
 project. The plugin carries the tool with it: nothing to copy, nothing to clone,
@@ -308,7 +303,7 @@ The logger is the one part that does need a clone, because you run its installer
 yourself:
 
 ```sh
-git clone https://git.jcrenshaw.dev/crenshawdev/burnrate.git
+git clone https://github.com/crenshawdev/burnrate.git
 cd burnrate
 bash extras/install_usage_logger.sh
 ```

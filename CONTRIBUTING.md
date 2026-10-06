@@ -30,15 +30,13 @@ Forking needs no permission at all, ever. The license hands you that outright. Y
 
 ## Where the code lives
 
-I host this myself at [git.jcrenshaw.dev](https://git.jcrenshaw.dev/crenshawdev/burnrate), and that is the copy that matters. The GitHub mirror exists so people who live on GitHub can find the project and clone it, and I push to it, but the forge is where the issues and the pull requests belong. Open yours there.
+The project lives on GitHub at [crenshawdev/burnrate](https://github.com/crenshawdev/burnrate), and that is the copy that matters. The issues and the pull requests belong there. Open yours there.
 
-## Access and signing
+## Signing
 
-Reads are open to the world, so anyone can browse and clone without an account. To push, you need one, and I do not run open registration, because an account a spam bot can mint on its own is an account I have to babysit. Getting one is easy. Say hello, tell me you want to contribute, and I will approve you by hand, usually fast.
+One rule, no exceptions. Every single commit is GPG signed. Not most of them, not just the important ones, every one, and unsigned work does not get in. This is not me being difficult for sport. It is the exact standard I hold my own commits to, and I am not going to ask less of the code carrying this project's name than I ask of myself.
 
-Two rules, no exceptions. Access is over SSH. And every single commit is GPG signed. Not most of them, not just the important ones, every one, and unsigned work does not get in. This is not me being difficult for sport. It is the exact standard I hold my own commits to, and I am not going to ask less of the code carrying this project's name than I ask of myself.
-
-`main` is protected and takes no direct pushes, mine included. Everything lands through a pull request, so branch your work, sign it, and open it against `main`.
+`main` is protected and takes no direct pushes, mine included. It refuses an unsigned commit, and it refuses a pull request until CI passes. Everything lands through a pull request, so fork it, branch your work, sign it, and open it against `main`.
 
 ## What this thing is, and what it has to stay
 
