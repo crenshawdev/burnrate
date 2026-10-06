@@ -458,6 +458,92 @@ class TestDiscovery(unittest.TestCase):
         self.assertIn("agent-1", s["subs"])
 
 
+def typed_command(uuid, name):
+    """A slash command line, exactly as Claude Code writes one."""
+    return {"type": "user", "uuid": uuid,
+            "message": {"role": "user",
+                        "content": f"<command-name>/{name}</command-name>\n"
+                                   f"<command-message>{name}</command-message>\n"
+                                   "<command-args></command-args>"}}
+
+
+def local_stdout(parent, as_system=False):
+    """The reply a built-in command gets. Both shapes occur in real trees."""
+    body = "<local-command-stdout>Set model to Opus</local-command-stdout>"
+    if as_system:
+        return {"type": "system", "subtype": "local_command",
+                "uuid": parent + "-out", "parentUuid": parent, "content": body}
+    return {"type": "user", "uuid": parent + "-out", "parentUuid": parent,
+            "message": {"role": "user", "content": body}}
+
+
+def billed_reply(mid, inp):
+    """An assistant message whose billed-equiv is exactly `inp`."""
+    return {"type": "assistant", "uuid": "u-" + mid,
+            "message": {"id": mid, "role": "assistant",
+                        "model": "claude-opus-4-6",
+                        "usage": {"input_tokens": inp, "output_tokens": 1}}}
+
+
+class TestCommandAttribution(unittest.TestCase):
+    """Only work opens a command segment: a command the user typed, or a skill
+    the model invoked. Built-ins like /clear and /model change a setting and
+    reply with <local-command-stdout>, and a tool result quoting transcript
+    text is not a command at all. Both used to open segments, and on a real
+    tree they held over 40% of all burn."""
+
+    T0 = 1772366400  # 2026-03-01T12:00:00Z
+
+    def by_command(self, *sessions):
+        """{command: billed-equiv} from a real run over these sessions."""
+        root = os.path.join(tempfile.mkdtemp(dir=TMP), "projects")
+        pdir = os.path.join(root, "-home-alice-work-api")
+        os.makedirs(pdir)
+        for n, lines in enumerate(sessions):
+            with open(os.path.join(pdir, f"sess-{n}.jsonl"), "w",
+                      encoding="utf-8") as fh:
+                for i, d in enumerate(lines):
+                    d["timestamp"] = time.strftime(
+                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.T0 + 60 * i))
+                    fh.write(json.dumps(d) + "\n")
+        proc, out = run(["--root", root])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        got = {}
+        for r in payload(out)["daily"]:
+            got[r[2]] = got.get(r[2], 0) + r[6]
+        return got
+
+    def test_a_builtin_command_opens_no_segment(self):
+        got = self.by_command(
+            [typed_command("c1", "plan"), billed_reply("m1", 100),
+             typed_command("c2", "model"), local_stdout("c2"),
+             billed_reply("m2", 20)],
+            [typed_command("c3", "clear"), local_stdout("c3", as_system=True),
+             billed_reply("m3", 3)])
+        self.assertEqual(got, {"plan": 120, "": 3})
+
+    def test_a_tool_result_quoting_a_command_opens_no_segment(self):
+        quoted = {"type": "user", "uuid": "r1", "parentUuid": "u-m1",
+                  "message": {"role": "user", "content": [
+                      {"type": "tool_result", "tool_use_id": "toolu_1",
+                       "content": "<command-name>/clear</command-name>"}]}}
+        got = self.by_command(
+            [billed_reply("m1", 100), quoted, billed_reply("m2", 20)])
+        self.assertEqual(got, {"": 120})
+
+    def test_a_skill_the_model_invokes_still_opens_one(self):
+        invoke = {"type": "assistant", "uuid": "s1",
+                  "message": {"id": "m-s", "role": "assistant",
+                              "model": "claude-opus-4-6", "content": [
+                                  {"type": "tool_use", "id": "toolu_2",
+                                   "name": "Skill",
+                                   "input": {"skill": "cadence:cad-plan",
+                                             "args": "3"}}]}}
+        got = self.by_command(
+            [billed_reply("m1", 100), invoke, billed_reply("m2", 20)])
+        self.assertEqual(got, {"": 100, "cadence:cad-plan": 20})
+
+
 class TestZstandardAbsent(unittest.TestCase):
     """The optional dependency is missing on most machines, so every branch
     that drops an arch source has to hold there -- which is precisely where the

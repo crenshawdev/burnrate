@@ -108,6 +108,18 @@ From those it reconstructs daily burn at day x project x command x model x
 effort x main/agent grain, account-wide 5-hour rate-limit blocks, and
 per-session summaries (peak context, compactions, interrupts, subagents).
 
+### Which command burned it
+
+A slash command you type, or a skill Claude invokes, owns the work from that
+point until the next command. A subagent belongs to the command that was open
+when it started.
+
+Built-in commands such as `/clear`, `/model`, `/effort` and `/mcp` change a
+setting and do no work, so they never own anything. burnrate tells them apart
+by the `<local-command-stdout>` reply Claude Code writes after each one, not by
+a list of names. Command text quoted inside a tool result, such as grep output
+over your transcripts, is not a command either.
+
 ### One term, three spellings
 
 `cache_creation` is the field name in the transcript JSONL
@@ -162,7 +174,8 @@ Then the panels:
   band is every write not reported as 1h, so it also carries the writes in
   transcripts too old to declare a TTL.
 - **By command**, **by model**, **by effort**, and **main vs subagents**, four
-  breakdown bars over the filtered range.
+  breakdown bars over the filtered range. See
+  [Which command burned it](#which-command-burned-it) for what a command owns.
 - **Rate-limit windows**, logged used-percentage from the statusline payload.
   Renders only when the [cap card](#the-5h7d-cap-card) logger has been running.
 - **Top sessions**, the heaviest sessions in range. Its `Billed-equiv` column

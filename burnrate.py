@@ -23,9 +23,10 @@ What it reconstructs:
     - per-session summaries: peak context, compactions, interrupts, agents
     - the rate-limit logger's samples (extras/usage_logger.sh), when installed
 
-Attribution: any <command-name> in a user line (or "skill":"..." tool call)
+Attribution: a slash command the user typed, or a skill the model invoked,
 opens a segment that stays open until the next one; a subagent attaches to the
-segment open at its first timestamp.
+segment open at its first timestamp. Built-ins like /clear and /model change a
+setting rather than do work, so they open none.
 
 Stdlib + zstandard (archive only). The parse cache is one gzipped file per
 source set under the platform's cache directory: $XDG_CACHE_HOME/burnrate
@@ -51,10 +52,10 @@ from datetime import datetime, timedelta, timezone
 
 CW5, CW1H, CR = 1.25, 2.00, 0.10
 BLOCK_H = 5 * 3600
-CACHE_VER = 2
+CACHE_VER = 3
 
 CMD_RE = re.compile(r"<command-name>/?([A-Za-z0-9:_.-]+)</command-name>")
-SKILL_RE = re.compile(r'"skill"\s*:\s*"([A-Za-z0-9:_.-]+)"')
+NAME_RE = re.compile(r"[A-Za-z0-9:_.-]+")
 BASE_DIR_RE = re.compile(r"""\s*base_dir\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s#]+))""")
 
 try:
@@ -590,6 +591,26 @@ def session_sig(s):
 
 # ---------------------------------------------------------------- parsing
 
+def seg_name(d):
+    """The command or skill a transcript line opens, or None. Read from the
+    parsed message, not the raw line: a tool result quoting transcript text
+    carries <command-name> markup too, and is not a command."""
+    content = (d.get("message") or {}).get("content")
+    if d.get("type") == "user":
+        if isinstance(content, str):
+            m = CMD_RE.search(content)
+            return m.group(1) if m else None
+    elif d.get("type") == "assistant" and isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "tool_use":
+                inp = b.get("input")
+                s = inp.get("skill") if isinstance(inp, dict) else None
+                if isinstance(s, str) and NAME_RE.fullmatch(s):
+                    return s
+    return None
+
+
+
 def scan_unit(iters, unit, rec, want_meta):
     """Stream one logical file (live + archive generations). Appends usage rows
     and, for the main transcript, segments and session metadata. Dedupe within
@@ -602,12 +623,13 @@ def scan_unit(iters, unit, rec, want_meta):
                 continue
             has_usage = '"usage"' in line
             is_seg = want_meta and ("<command-name>" in line or '"skill"' in line)
+            is_local = want_meta and "<local-command-stdout>" in line
             is_mark = want_meta and (
                 '"compact_boundary"' in line or '"isCompactSummary":true' in line
                 or '"interruptedMessageId"' in line
                 or '"isApiErrorMessage":true' in line
                 or '"aiTitle"' in line)
-            if not (has_usage or is_seg or is_mark):
+            if not (has_usage or is_seg or is_mark or is_local):
                 continue
             try:
                 d = json.loads(line)
@@ -638,16 +660,17 @@ def scan_unit(iters, unit, rec, want_meta):
                 if key and key not in marks:
                     marks.add(key)
                     rec[key[0]] += 1
+            if is_local and d.get("parentUuid"):
+                # a built-in's reply, parented on the command line it answers
+                rec["_local"].add(d["parentUuid"])
             if is_seg:
                 uid = d.get("uuid")
                 if uid is None or ("seg", uid) not in marks:
-                    m = CMD_RE.search(line) if d.get("type") == "user" else None
-                    if m is None:
-                        m = SKILL_RE.search(line)
-                    if m:
+                    name = seg_name(d)
+                    if name:
                         if uid is not None:
                             marks.add(("seg", uid))
-                        rec["segs"].append([ts, m.group(1)])
+                        rec["segs"].append([ts, name, uid])
             if not has_usage or d.get("type") != "assistant":
                 continue
             msg = d.get("message") or {}
@@ -671,16 +694,19 @@ def parse_session(s):
     rec = {"rows": [], "segs": [], "slug": None, "title": None,
            "comp": 0, "intr": 0, "err": 0, "agents": {},
            "_mids": set(), "_marks": set(), "_branch": Counter(),
-           "_cwd": Counter()}
+           "_cwd": Counter(), "_local": set()}
     scan_unit(iters_for(s["main"]), "", rec, want_meta=True)
     for key, specs in sorted(s["subs"].items()):
         rec["agents"][key] = s["meta"].get(key) or "unresolved"
         scan_unit(iters_for(specs), key, rec, want_meta=False)
-    rec["segs"].sort(key=lambda x: x[0])
+    # a command that got a <local-command-stdout> reply was a built-in
+    rec["segs"] = sorted(([ts, name] for ts, name, uid in rec["segs"]
+                          if uid is None or uid not in rec["_local"]),
+                         key=lambda x: x[0])
     rec["branch"] = (rec["_branch"].most_common(1) or [(None, 0)])[0][0]
     rec["cwd"] = (min(rec["_cwd"].items(), key=lambda kv: (-kv[1], kv[0]))[0]
                   if rec["_cwd"] else None)
-    for k in ("_mids", "_marks", "_branch", "_cwd"):
+    for k in ("_mids", "_marks", "_branch", "_cwd", "_local"):
         del rec[k]
     return rec
 
