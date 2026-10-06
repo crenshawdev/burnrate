@@ -1444,6 +1444,47 @@ class TestBilledUnitIsLabeled(unittest.TestCase):
         self.assertIn("}weighted tokens, not a bill", br.PAGE)
 
 
+class TestCacheHitRate(unittest.TestCase):
+    """Cache read over every prompt token: fresh input + cache write + cache
+    read. cache write already holds the 1h half, so adding cache_write_1h
+    again undercounts the rate. Floored, so one miss never reads 100%."""
+
+    def test_the_run_summary_prints_it(self):
+        proc, _ = run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        line = next(ln for ln in proc.stdout.splitlines()
+                    if ln.startswith("cache   :"))
+        want = EXP["cache_read"] * 1000 // EXP["prompt_tokens"] / 10
+        self.assertIn(f"{want:.1f}% hit rate", line)
+
+    def test_an_empty_tree_says_so_instead_of_dividing(self):
+        proc, _ = run(["--root", EMPTY_ROOT])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("cache   : no data", proc.stdout)
+
+    @unittest.skipIf(not NODE, "needs a JS engine")
+    def test_the_viewer_floors_and_handles_no_prompt_tokens(self):
+        _, out = run()
+        js = (viewer_slice(report(out), "const hitPct", ": null;")
+              + "\nconsole.log(JSON.stringify("
+                "[hitPct(1, 1, 9998), hitPct(100, 400, 1500), hitPct(0, 0, 0)]));")
+        path = os.path.join(tempfile.mkdtemp(dir=TMP), "hit.js")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(js)
+        r = subprocess.run([NODE, path], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout), [99.9, 75, None])
+
+    def test_every_viewer_call_passes_the_whole_cache_write(self):
+        # the rate's inputs are read in three places; none may reach for the
+        # 1h half, which would count those tokens twice
+        calls = re.findall(r"hitPct\(([^)]*)\)", br.PAGE)
+        self.assertGreaterEqual(len(calls), 4, calls)
+        self.assertFalse([c for c in calls if "cc1h" in c], calls)
+        block = br.PAGE.split("const perDayCache", 1)[1].split("const sum3", 1)[0]
+        self.assertIn("c[1] += r[D.cc];", block)
+
+
 def viewer_slice(html, start, end):
     """The verbatim text between two markers in the generated report's script
     block, so a case runs the shipped code rather than a paraphrase of it."""
@@ -1630,6 +1671,13 @@ class TestSkillAnswers(unittest.TestCase):
                          by_proj["total"]["billed_equiv"])
         self.assertTrue(by_day["reused"] or by_proj["reused"],
                         "a second answer inside the freshness window rebuilt")
+
+    def test_the_cache_hit_rate_counts_every_prompt_token_once(self):
+        got = self.answer("ask", "--by", "project")
+        want = round(EXP["cache_read"] / EXP["prompt_tokens"], 4)
+        self.assertEqual(got["total"]["cache_hit_rate"], want, got["total"])
+        for r in got["rows"]:
+            self.assertGreater(r["cache_hit_rate"], 0, r)
 
     def test_words_reach_this_repos_own_burnrate(self):
         argv = json.loads(

@@ -283,6 +283,11 @@ def build(root):
         "label_be": {k: round(v) for k, v in label_be.items()},
         "total_be": round(sum(label_be.values())),
         "messages": msgs,
+        # every message reads CRD from cache and writes CC; input is what
+        # billed-equiv leaves once the fixed BE_EXTRA is taken off
+        "cache_read": CRD * msgs,
+        "prompt_tokens": round(sum(label_be.values()) - BE_EXTRA * msgs)
+                         + (CC + CRD) * msgs,
         "title": TITLE,
         "worktree_label": PRIMARY[3][2],
         "nocwd_label": PRIMARY[7][2],

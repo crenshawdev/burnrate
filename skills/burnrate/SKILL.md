@@ -48,9 +48,9 @@ Look at the words the user passed:
 
 ## Reporting a run
 
-`run` streams the tool's own output. Report back the `wrote:` path and the
-one-line totals (range, billed-equiv, blocks, projects). Do not paste the whole
-output.
+`run` streams the tool's own output. Report back the `wrote:` path, the
+one-line totals (range, billed-equiv, blocks, projects) and the `cache:` hit
+rate. Do not paste the whole output.
 
 That `wrote:` path is under the user's own platform cache directory, not inside
 this plugin, so report it exactly as the tool printed it.
@@ -72,6 +72,12 @@ python3 <helper> ask --by command,model --project web
 Pick the `--by` / `--day` / `--since` / `--until` / `--project` combination the
 question implies; `python3 <helper> ask --help` lists them all. `ask` reuses a
 payload under 15 minutes old, rebuilds it otherwise, and never opens a browser.
+
+For a cache hit rate question, read `cache_hit_rate` from the same `ask`
+output: each row and the total carry one, a fraction you report as a
+percentage with one decimal. Never derive it from the token columns yourself;
+`cache_write` already includes `cache_write_1h`, so adding the two undercounts
+the rate.
 
 For a question about 5h rate-limit windows ("how much is left in this block",
 "when does it reset"), use `blocks` instead: `python3 <helper> blocks --last 1`.

@@ -246,6 +246,13 @@ def positive_int(v):
     return n
 
 
+def hit_rate(g):
+    """cache_read over every prompt token, as a fraction, or None with no
+    prompt tokens. cache_write already holds the 1h half: not added again."""
+    p = g["input"] + g["cache_write"] + g["cache_read"]
+    return round(g["cache_read"] / p, 4) if p else None
+
+
 def emit(obj):
     json.dump(obj, sys.stdout, indent=1)
     sys.stdout.write("\n")
@@ -312,6 +319,8 @@ def cmd_ask(a):
             total[m] += r[COLS[m]]
 
     rows = list(groups.values())
+    for g in rows + [total]:
+        g["cache_hit_rate"] = hit_rate(g)
     if by[0] == "day":
         rows.sort(key=lambda g: tuple(str(g[b]) for b in by))
     else:
@@ -398,7 +407,9 @@ def build_parser():
                     "cache-creation total and ALREADY INCLUDES "
                     "`cache_write_1h`, which is the 1-hour-TTL half of it -- "
                     "the two are nested, not disjoint, so adding them "
-                    "double-counts.")
+                    "double-counts. `cache_hit_rate` is cache_read over "
+                    "input + cache_write + cache_read, a fraction from 0 to "
+                    "1, null when the group had no prompt tokens.")
     k.add_argument("--by", default="day",
                    help="comma list of " + ", ".join(GROUP_KEYS)
                         + " (default: day)")

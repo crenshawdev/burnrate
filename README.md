@@ -69,6 +69,7 @@ transcripts and says so in the report subtitle instead of failing.
 /burnrate all no-archive               live transcripts only, full history
 /burnrate how much did I burn yesterday   answered in chat, no browser
 /burnrate which project burned most this week
+/burnrate what was my cache hit rate this week
 /burnrate how much is left in this block
 ```
 
@@ -102,11 +103,17 @@ Per assistant message, deduped globally by `message.id`:
 
 - input, cache-write (5m and 1h), cache-read and output tokens
 - **billed-equiv** = `input + 1.25*cache_write_5m + 2*cache_write_1h + 0.10*cache_read`
+- **cache hit rate** = `cache_read / (input + cache_creation + cache_read)`, the
+  share of prompt tokens read from cache instead of sent fresh or written
 - context footprint = `input + cache_creation + cache_read`, the live window size
 
 From those it reconstructs daily burn at day x project x command x model x
 effort x main/agent grain, account-wide 5-hour rate-limit blocks, and
 per-session summaries (peak context, compactions, interrupts, subagents).
+
+The hit rate is floored to one decimal, so a range with any miss at all never
+shows 100%. `cache_creation` already holds the 1h writes, so they are not added
+a second time.
 
 ### Which command burned it
 
@@ -151,7 +158,7 @@ never converts it to currency.
 
 Across the top: a date-range picker and a project filter. Both run client-side,
 so narrowing the range or picking projects re-renders every panel below without
-re-running the tool. Six summary tiles follow the filters:
+re-running the tool. Seven summary tiles follow the filters:
 
 | Tile | Reads |
 |---|---|
@@ -159,6 +166,7 @@ re-running the tool. Six summary tiles follow the filters:
 | Daily average | Total over active days, not calendar days |
 | Peak day | Heaviest single day and its date |
 | Output tokens | Output total and the message count behind it |
+| Cache hit rate | Share of prompt tokens read from cache, the share missed, and the change in percentage points against the prior window |
 | 5h blocks | How many rate-limit blocks the range covers, and their median burn |
 | Peak context | Largest live window reached, and the session count |
 
@@ -175,9 +183,13 @@ Then the panels:
   cache read. This is where a cache-heavy pattern becomes visible. The ×1.25
   band is every write not reported as 1h, so it also carries the writes in
   transcripts too old to declare a TTL.
+- **Cache hit rate**, the tile's rate per day. The axis starts just below the
+  lowest day, so a drop from 98% to 96%, which doubles the misses, is visible
+  rather than flattened against a 0-100 scale.
 - **By command**, **by model**, **by effort**, and **main vs subagents**, four
-  breakdown bars over the filtered range. See
-  [Which command burned it](#which-command-burned-it) for what a command owns.
+  breakdown bars over the filtered range. Hovering a bar shows its cache hit
+  rate. See [Which command burned it](#which-command-burned-it) for what a
+  command owns.
 - **Rate-limit windows**, logged used-percentage from the statusline payload.
   Renders only when the [cap card](#the-5h7d-cap-card) logger has been running.
 - **Top sessions**, the heaviest sessions in range. Its `Billed-equiv` column
