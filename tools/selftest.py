@@ -458,13 +458,23 @@ class TestDiscovery(unittest.TestCase):
         self.assertIn("agent-1", s["subs"])
 
 
-def typed_command(uuid, name):
-    """A slash command line, exactly as Claude Code writes one."""
-    return {"type": "user", "uuid": uuid,
-            "message": {"role": "user",
-                        "content": f"<command-name>/{name}</command-name>\n"
-                                   f"<command-message>{name}</command-message>\n"
-                                   "<command-args></command-args>"}}
+def typed_command(uuid, name, human=True):
+    """A slash command line, exactly as Claude Code writes one. Skill commands
+    carry origin human; built-ins carry no origin at all."""
+    d = {"type": "user", "uuid": uuid,
+         "message": {"role": "user",
+                     "content": f"<command-name>/{name}</command-name>\n"
+                                f"<command-message>{name}</command-message>\n"
+                                "<command-args></command-args>"}}
+    if human:
+        d["origin"] = {"kind": "human"}
+    return d
+
+
+def typed_prompt(uuid, text, source="typed"):
+    return {"type": "user", "uuid": uuid, "promptSource": source,
+            "origin": {"kind": "human"},
+            "message": {"role": "user", "content": text}}
 
 
 def local_stdout(parent, as_system=False):
@@ -516,11 +526,47 @@ class TestCommandAttribution(unittest.TestCase):
     def test_a_builtin_command_opens_no_segment(self):
         got = self.by_command(
             [typed_command("c1", "plan"), billed_reply("m1", 100),
-             typed_command("c2", "model"), local_stdout("c2"),
+             typed_command("c2", "model", human=False), local_stdout("c2"),
              billed_reply("m2", 20)],
-            [typed_command("c3", "clear"), local_stdout("c3", as_system=True),
-             billed_reply("m3", 3)])
+            [typed_command("c3", "clear", human=False),
+             local_stdout("c3", as_system=True), billed_reply("m3", 3)])
         self.assertEqual(got, {"plan": 120, "": 3})
+
+    def test_a_builtin_still_opens_none_once_it_carries_an_origin(self):
+        # the stdout reply decides, so a later Claude Code stamping built-ins
+        # human cannot bring them back
+        got = self.by_command(
+            [typed_command("c1", "plan"), billed_reply("m1", 100),
+             typed_command("c2", "effort"), local_stdout("c2"),
+             billed_reply("m2", 20)])
+        self.assertEqual(got, {"plan": 120})
+
+    def test_the_next_typed_prompt_ends_the_command(self):
+        # the 09-24 shape: a command, then free-form work that is not its own
+        got = self.by_command(
+            [typed_command("c1", "plan"), billed_reply("m1", 100),
+             typed_prompt("p1", "now on to the audit"), billed_reply("m2", 20),
+             typed_prompt("p2", "and this", source="queued"),
+             billed_reply("m3", 3)])
+        self.assertEqual(got, {"plan": 100, "": 23})
+
+    def test_lines_the_user_did_not_type_leave_the_command_open(self):
+        notice = {"type": "user", "uuid": "n1", "promptSource": "system",
+                  "origin": {"kind": "task-notification"},
+                  "message": {"role": "user",
+                              "content": "<task-notification> done"}}
+        sdk = {"type": "user", "uuid": "k1", "promptSource": "sdk",
+               "message": {"role": "user", "content": "EVIDENCE: ok"}}
+        meta = dict(typed_prompt("x1", "Base directory for this skill"),
+                    isMeta=True)
+        answer = {"type": "user", "uuid": "a1", "parentUuid": "u-m1",
+                  "message": {"role": "user", "content": [
+                      {"type": "tool_result", "tool_use_id": "toolu_3",
+                       "content": "User answered: A"}]}}
+        got = self.by_command(
+            [typed_command("c1", "plan"), meta, billed_reply("m1", 100),
+             answer, notice, sdk, billed_reply("m2", 20)])
+        self.assertEqual(got, {"plan": 120})
 
     def test_a_tool_result_quoting_a_command_opens_no_segment(self):
         quoted = {"type": "user", "uuid": "r1", "parentUuid": "u-m1",

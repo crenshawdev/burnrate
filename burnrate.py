@@ -24,9 +24,10 @@ What it reconstructs:
     - the rate-limit logger's samples (extras/usage_logger.sh), when installed
 
 Attribution: a slash command the user typed, or a skill the model invoked,
-opens a segment that stays open until the next one; a subagent attaches to the
-segment open at its first timestamp. Built-ins like /clear and /model change a
-setting rather than do work, so they open none.
+opens a segment that stays open until the user's next typed prompt or the next
+command; a subagent attaches to the segment open at its first timestamp.
+Built-ins like /clear and /model change a setting rather than do work, so they
+open none.
 
 Stdlib + zstandard (archive only). The parse cache is one gzipped file per
 source set under the platform's cache directory: $XDG_CACHE_HOME/burnrate
@@ -610,6 +611,15 @@ def seg_name(d):
     return None
 
 
+def typed_by_user(d):
+    """A prompt the user typed, pasted or accepted. Claude Code marks those
+    origin.kind == "human"; task notifications, hook feedback, SDK prompts and
+    ! shell input carry no such origin. Transcripts that predate the field
+    never end a segment early."""
+    o = d.get("origin")
+    return (d.get("type") == "user" and not d.get("isMeta")
+            and isinstance(o, dict) and o.get("kind") == "human")
+
 
 def scan_unit(iters, unit, rec, want_meta):
     """Stream one logical file (live + archive generations). Appends usage rows
@@ -624,12 +634,13 @@ def scan_unit(iters, unit, rec, want_meta):
             has_usage = '"usage"' in line
             is_seg = want_meta and ("<command-name>" in line or '"skill"' in line)
             is_local = want_meta and "<local-command-stdout>" in line
+            is_prompt = want_meta and '"human"' in line
             is_mark = want_meta and (
                 '"compact_boundary"' in line or '"isCompactSummary":true' in line
                 or '"interruptedMessageId"' in line
                 or '"isApiErrorMessage":true' in line
                 or '"aiTitle"' in line)
-            if not (has_usage or is_seg or is_mark or is_local):
+            if not (has_usage or is_seg or is_mark or is_local or is_prompt):
                 continue
             try:
                 d = json.loads(line)
@@ -663,11 +674,13 @@ def scan_unit(iters, unit, rec, want_meta):
             if is_local and d.get("parentUuid"):
                 # a built-in's reply, parented on the command line it answers
                 rec["_local"].add(d["parentUuid"])
-            if is_seg:
+            if is_seg or is_prompt:
                 uid = d.get("uuid")
                 if uid is None or ("seg", uid) not in marks:
                     name = seg_name(d)
-                    if name:
+                    if name is None and is_prompt and typed_by_user(d):
+                        name = ""   # the user moved on: back to conversation
+                    if name is not None:
                         if uid is not None:
                             marks.add(("seg", uid))
                         rec["segs"].append([ts, name, uid])

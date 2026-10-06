@@ -111,8 +111,10 @@ per-session summaries (peak context, compactions, interrupts, subagents).
 ### Which command burned it
 
 A slash command you type, or a skill Claude invokes, owns the work from that
-point until the next command. A subagent belongs to the command that was open
-when it started.
+point until your next typed prompt. Answering the command's own multiple-choice
+questions does not end it. Typing a new prompt does, and everything after that
+is conversation until the next command. A subagent belongs to the command that
+was open when it started.
 
 Built-in commands such as `/clear`, `/model`, `/effort` and `/mcp` change a
 setting and do no work, so they never own anything. burnrate tells them apart
@@ -314,6 +316,11 @@ Code prunes its own transcripts. See
 **`/burnrate 7d` reports a range wider than seven days.** The run line reports
 the whole parsed dataset. The window word sets the preset the opened report
 starts on and nothing else, so that line and the chart disagree by design.
+
+**By command shows most of the burn as `(conversation)`.** Expected. A command
+owns its work only until your next typed prompt, so follow-up work you asked
+for in plain words counts as conversation. See
+[Which command burned it](#which-command-burned-it).
 
 **Archives are being skipped.** `.zst` archives need the optional `zstandard`
 package. Without it the tool runs on your live transcripts and says so in the
