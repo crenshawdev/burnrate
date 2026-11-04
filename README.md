@@ -1,6 +1,6 @@
 # burnrate
 
-[![CI](https://github.com/jcrenshaw-dev/burnrate/actions/workflows/ci.yml/badge.svg)](https://github.com/jcrenshaw-dev/burnrate/actions/workflows/ci.yml)
+[![CI](https://github.com/crenshawdev/burnrate/actions/workflows/ci.yml/badge.svg)](https://github.com/crenshawdev/burnrate/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A single-file, on-demand dashboard of your own Claude Code token usage.
@@ -34,14 +34,14 @@ account required.
 burnrate installs as a Claude Code plugin. Two commands:
 
 ```sh
-claude plugin marketplace add jcrenshaw-dev/burnrate
+claude plugin marketplace add crenshawdev/burnrate
 claude plugin install burnrate@burnrate
 ```
 
 The same two steps work inside a running session:
 
 ```
-/plugin marketplace add jcrenshaw-dev/burnrate
+/plugin marketplace add crenshawdev/burnrate
 /plugin install burnrate@burnrate
 ```
 
@@ -303,7 +303,7 @@ The logger is the one part that does need a clone, because you run its installer
 yourself:
 
 ```sh
-git clone https://github.com/jcrenshaw-dev/burnrate.git
+git clone https://github.com/crenshawdev/burnrate.git
 cd burnrate
 bash extras/install_usage_logger.sh
 ```

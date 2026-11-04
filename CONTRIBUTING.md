@@ -30,7 +30,7 @@ Forking needs no permission at all, ever. The license hands you that outright. Y
 
 ## Where the code lives
 
-The project lives on GitHub at [jcrenshaw-dev/burnrate](https://github.com/jcrenshaw-dev/burnrate), and that is the copy that matters. The issues and the pull requests belong there. Open yours there.
+The project lives on GitHub at [crenshawdev/burnrate](https://github.com/crenshawdev/burnrate), and that is the copy that matters. The issues and the pull requests belong there. Open yours there.
 
 ## Signing
 
