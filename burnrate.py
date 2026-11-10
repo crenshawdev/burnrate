@@ -18,9 +18,6 @@ What it measures (per assistant message, deduped globally by .message.id):
 
 What it reconstructs:
     - daily burn at (day x project x command x model x effort x main|agent) grain
-    - 5-hour rate-limit blocks, account-wide: a block opens at the top of the
-      hour of the first activity after the previous block expires (matches how
-      resets_at lands on the hour) and lasts 5h
     - per-session summaries: peak context, compactions, interrupts, agents
     - the rate-limit logger's samples (extras/usage_logger.sh), when installed
 
@@ -53,7 +50,6 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
 CW5, CW1H, CR = 1.25, 2.00, 0.10
-BLOCK_H = 5 * 3600
 CACHE_VER = 3
 
 CMD_RE = re.compile(r"<command-name>/?([A-Za-z0-9:_.-]+)</command-name>")
@@ -959,36 +955,16 @@ def aggregate(sessions, tz_offset, rl_log):
                    round(a[3]), round(a[4]), round(a[5]), int(a[6])]
                   for (d, p, c, m, e, k), a in sorted(daily.items())]
 
-    # 5h blocks, account-wide: window opens at the top of the hour of the first
-    # activity after the previous window ends, lasts 5h
-    blocks = []
-    cur = None
-    for ts, proj, *_rest, r in sorted(all_rows, key=lambda x: x[0]):
-        if cur is None or ts >= cur["t0"] + BLOCK_H:
-            cur = {"t0": (ts // 3600) * 3600, "first": ts, "last": ts,
-                   "be": 0.0, "out": 0.0, "n": 0, "pp": Counter()}
-            blocks.append(cur)
-        b = be_of(r)
-        cur["be"] += b
-        cur["out"] += r[9]
-        cur["n"] += 1
-        cur["last"] = max(cur["last"], ts)
-        cur["pp"][pidx[proj]] += b
-    block_rows = [[b["t0"], b["first"], b["last"], round(b["be"]),
-                   round(b["out"]), b["n"],
-                   {str(i): round(v) for i, v in b["pp"].most_common(6)}]
-                  for b in blocks]
-
     sess_rows.sort(key=lambda s: -s[5])
     return {
         "v": 1,
         "generated": gen.isoformat(timespec="seconds"),
-        # a single number by design: the viewer uses it only for block times
-        # and block-to-day placement, never for the day buckets above
+        # a single number by design: the viewer uses it for session days, rl
+        # sample days and the MAXDAY fallback, and the skill's resolve_day
+        # reads it, but it never buckets the daily rows above
         "tz_offset": offset,
         "projects": [{"id": p, "be": round(proj_be[p])} for p in projects],
         "daily": daily_rows,
-        "blocks": block_rows,
         "sessions": sess_rows[:400],
         "rl": read_rl_log(rl_log),
     }
@@ -1081,7 +1057,6 @@ def main():
     print(f"range   : {days[0]} -> {days[-1]} ({len(days)} active days)"
           if days else "range   : no data")
     print(f"billed  : {tot:,.0f} billed-equiv tokens, "
-          f"{len(data['blocks'])} five-hour blocks, "
           f"{len(data['projects'])} projects")
     # floored like the report's tile, so one miss never prints as 100%
     prompt = sum(r[7] + r[8] + r[10] for r in data["daily"])
@@ -1243,12 +1218,6 @@ footer{color:var(--muted);font-size:11.5px;margin:18px 0 8px}
     <div id="dailyChart"></div>
   </div>
 
-  <div class="card">
-    <h2>Five-hour blocks</h2>
-    <div class="note" id="blocksNote"></div>
-    <div id="blocksChart"></div>
-  </div>
-
   <div class="grid3" style="margin-bottom:14px">
     <div class="card" style="margin:0">
       <h2>Rolling 7-day burn</h2>
@@ -1309,7 +1278,6 @@ const epochDay = e => new Date((e + TZ*3600) * 1000).toISOString().slice(0,10);
 const addDays  = (d, n) => new Date((dayEpoch(d) + n*DAY)*1000).toISOString().slice(0,10);
 const fmtDay   = d => { const t = new Date(dayEpoch(d)*1000);
   return t.toLocaleDateString('en-US',{month:'short',day:'numeric',timeZone:'UTC'}); };
-const fmtTime  = e => new Date((e + TZ*3600)*1000).toISOString().slice(11,16);
 const fmt = n => n >= 1e9 ? (n/1e9).toFixed(2)+'B' : n >= 1e6 ? (n/1e6).toFixed(1)+'M'
   : n >= 1e3 ? (n/1e3).toFixed(n<1e4?1:0)+'k' : Math.round(n).toString();
 const fmtFull = n => Math.round(n).toLocaleString('en-US');
@@ -1563,51 +1531,8 @@ function lineChart(elId, days, seriesArr, unit, lo){
   svg.addEventListener('pointerleave', () => { xh.setAttribute('opacity',0); ttHide(); });
 }
 
-// ---- blocks chart ----
-function blocksChart(blocks, d0, d1){
-  const W = 960, H = 210, padT = 12, padB = 22, padL = 46;
-  const plotH = H - padT - padB;
-  const el = $('#blocksChart');
-  if (!blocks.length){ el.innerHTML = '<div class="empty">No blocks in range</div>'; return; }
-  const t0 = dayEpoch(d0) - TZ*3600, t1 = dayEpoch(d1) + DAY - TZ*3600;
-  const span = t1 - t0;
-  const max = niceMax(Math.max(...blocks.map(b => b[3])));
-  const xOf = t => padL + (t - t0)/span * (W - padL);
-  let marks = '', labels = '';
-  blocks.forEach((b, bi) => {
-    const x = xOf(b[0]), w = Math.max(2, 5*3600/span*(W-padL) - 1);
-    const h = plotH * b[3]/max, y = padT + plotH - h;
-    marks += `<path d="${barPath(x, y, w, h, 3)}" fill="var(--s1)" data-b="${bi}"></path>`;
-  });
-  const nd = Math.max(1, Math.round(span/DAY));
-  const step = Math.max(1, Math.ceil(nd/9));
-  for (let i = 0; i < nd; i += step){
-    const d = addDays(d0, i);
-    labels += `<text x="${xOf(dayEpoch(d) - TZ*3600 + DAY/2)}" y="${H-6}" text-anchor="middle">${fmtDay(d)}</text>`;
-  }
-  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="aspect-ratio:${W}/${H}">
-    ${axisTicks(max, plotH, padT, padL, W)}
-    <line x1="${padL}" x2="${W}" y1="${padT+plotH}" y2="${padT+plotH}" stroke="var(--axis)"></line>
-    ${marks}${labels}</svg>`;
-  el.firstElementChild.addEventListener('pointermove', e => {
-    const p = e.target.closest('[data-b]');
-    if (!p){ ttHide(); return; }
-    const b = blocks[+p.dataset.b];
-    const rows = [['transparent','burned', fmtFull(b[3])],
-                  ['transparent','output', fmtFull(b[4])],
-                  ['transparent','rate', fmt(b[3]/5) + '/h'],
-                  ['transparent','active', fmtTime(b[1]) + '–' + fmtTime(b[2])]];
-    for (const [pi, v] of Object.entries(b[6]))
-      rows.push([cssVar(colorOf(+pi)), DATA.projects[+pi].id, fmtFull(v)]);
-    ttShow(e.clientX, e.clientY,
-      fmtDay(epochDay(b[0])) + ' · ' + fmtTime(b[0]) + ' + 5h', rows);
-  });
-  el.firstElementChild.addEventListener('pointerleave', ttHide);
-}
-
 // project color: fixed by all-time rank, never repainted by filters
 let topSlots = new Map();
-function colorOf(pi){ return topSlots.has(pi) ? topSlots.get(pi) : '--other'; }
 
 // ---- horizontal bar lists ----
 function hbars(elId, items){
@@ -1686,12 +1611,6 @@ function render(){
   const dHit = hit != null && prevHit != null ? hit - prevHit : null;
   const active = perDayTotal.filter(v => v > 0).length;
   const pk = perDayTotal.indexOf(Math.max(...perDayTotal));
-  const blocks = DATA.blocks.filter(b => {
-    const d = epochDay(b[0]);
-    return d >= state.d0 && d <= state.d1;
-  });
-  const bVals = blocks.map(b => b[3]).sort((a,b) => a-b);
-  const med = bVals.length ? bVals[bVals.length >> 1] : 0;
   const sess = DATA.sessions.filter(s =>
     inRange(epochDay(s[3])) && (!state.projs ||
       [...state.projs].some(i => DATA.projects[i].id === s[1])));
@@ -1714,15 +1633,8 @@ function render(){
       <div class="d">${hit == null ? 'no prompt tokens' : (100 - hit).toFixed(1) + '% missed'}${dHit == null ? '' :
         ` · <span class="${dHit >= 0 ? 'good' : 'bad'}">${dHit >= 0 ? '+' : ''}${dHit.toFixed(1)} pts</span> vs prior`
       }</div></div>
-    <div class="tile"><div class="l">5h blocks</div><div class="v">${blocks.length}</div>
-      <div class="d">median ${fmt(med)}</div></div>
     <div class="tile"><div class="l">Peak context</div><div class="v">${fmt(peakCtx)}</div>
       <div class="d">${sess.length} sessions</div></div>`;
-
-  // blocks
-  $('#blocksNote').textContent = 'Account-wide (all projects), regardless of the project filter. '
-    + 'A block opens on the hour of first activity and lasts five hours; height is billed-equivalent burn.';
-  blocksChart(blocks, state.d0, state.d1);
 
   // rolling 7d (from project-filtered rows, all days incl. before range start)
   const byDayAll = new Map();

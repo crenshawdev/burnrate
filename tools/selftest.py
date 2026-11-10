@@ -1597,6 +1597,30 @@ console.log(JSON.stringify({
         self.assertEqual(got["calls"], [])
 
 
+FIVE_HOUR_WORDING = re.compile(
+    r"5h|5-hour|five[_ -]hour|resets5|BLOCK_", re.IGNORECASE)
+
+
+class TestNoFiveHourWindow(unittest.TestCase):
+    """Phase 7: burnrate no longer reconstructs or describes a 5-hour window.
+    These pins fail if the blocks come back under any name."""
+
+    def test_the_payload_has_no_blocks_key(self):
+        _, out = run()
+        data = payload(out)
+        self.assertTrue(data["daily"], "no daily rows: the pin is vacuous")
+        self.assertNotIn("blocks", data)
+
+    def test_the_cli_output_describes_no_five_hour_window(self):
+        proc, _ = run(flags=("--json", "--no-open"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        billed = [ln for ln in proc.stdout.splitlines()
+                  if ln.startswith("billed  :")]
+        self.assertEqual(len(billed), 1, proc.stdout)
+        self.assertNotIn("block", billed[0].lower())
+        self.assertIsNone(FIVE_HOUR_WORDING.search(proc.stdout), proc.stdout)
+
+
 SKILL_DIR = os.path.join(REPO, "skills", "burnrate")
 SKILL_MD = os.path.join(SKILL_DIR, "SKILL.md")
 SKILL_SCRIPT = os.path.join(SKILL_DIR, "scripts", "burnrate_skill.py")
