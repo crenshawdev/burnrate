@@ -199,7 +199,8 @@ describe('overlapping work and stale readings', () => {
     on('store.set', (_$, e) => { stored = (e as unknown as { value: unknown }).value; return { value: undefined } as never })
     await $.turn.complete(turn(0, 0, 99))
     await $.turn.complete(turn(0, 0, 99))
-    expect(stored).toEqual({ input: 100, output: 14, read: 799, write: 100 })
+    // the turn whose read failed is held and added once a read works, so no usage is lost
+    expect(stored).toEqual({ input: 100, output: 19, read: 898, write: 100 })
   })
 
   test('a slow first usage read does not replace a newer session.measure', async ($, on) => {
@@ -238,6 +239,30 @@ describe('overlapping work and stale readings', () => {
     await drawn.clock.settle()
     await $.session.measure(NO_WEEK)
     slow.open()
+    await late
+    expect(last(drawn)).toBe('')
+  })
+
+  test('a draw that waited across the reset does not bring the expired week back', async ($, on) => {
+    // the window closes 30 minutes in; the held draw comes back at 40, between two ticks
+    const MIN = 60_000, HELD = 40 * MIN - 30_000
+    let held = false
+    let clock!: { sleep: (ms: number) => Promise<void> }
+    const drawn = world(on, undefined, {
+      id: async () => {
+        const mine = held
+        held = false
+        // the wait is on the test clock, so the ticks draw past the reset while this one is held
+        if (mine) await clock.sleep(HELD)
+        return { value: SESSION }
+      },
+    })
+    clock = drawn.clock
+    await $.session.measure(week(40, 30 * MIN))
+    expect(last(drawn)).toContain('Week: 40%')
+    held = true
+    const late = $.session.start(START)
+    await drawn.clock.advance(HELD)
     await late
     expect(last(drawn)).toBe('')
   })

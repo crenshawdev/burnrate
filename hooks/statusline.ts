@@ -16,6 +16,8 @@ let tick: { cancel: () => void } | undefined
 const sums = new Map<string, Promise<Counts>>()
 // per session id, the tail of its store writes: each write waits for the one before it
 const writes = new Map<string, Promise<unknown>>()
+// per session id, usage from turns whose store read failed: it is added once a later read succeeds
+const pending = new Map<string, Counts>()
 
 const WEEK_MS = 7 * 86400e3
 const TICK_MS = 60_000
@@ -68,11 +70,19 @@ const sumsFor = ($: EngineInterface, id: string) => {
 // no await between the add and its write being queued, so parallel subagents ending together lose nothing
 async function count($: EngineInterface, usage: Record<string, unknown>) {
   const id = await $.session.id()
+  // held first, so a failed read below leaves this turn waiting instead of losing it
+  const held = pending.get(id) ?? zero()
+  pending.set(id, held)
+  held.input += num(usage.input_tokens)
+  held.output += num(usage.output_tokens)
+  held.read += num(usage.cache_read_input_tokens)
+  held.write += num(usage.cache_creation_input_tokens)
   const c = await sumsFor($, id)
-  c.input += num(usage.input_tokens)
-  c.output += num(usage.output_tokens)
-  c.read += num(usage.cache_read_input_tokens)
-  c.write += num(usage.cache_creation_input_tokens)
+  const owed = pending.get(id)
+  if (owed) {
+    pending.delete(id)
+    for (const k of KEYS) c[k] += owed[k]
+  }
   // the snapshot is taken when the write's turn comes, so the last write to land holds every add
   const prev = writes.get(id) ?? Promise.resolve()
   const next = prev.catch(() => {}).then(() => $.store.set(id, { ...c }))
@@ -104,9 +114,9 @@ async function draw($: EngineInterface) {
   }
   // a reload cancels the old environment's waits, so the first draw of a new one starts the tick again
   if (!tick) tick = $.clock.every(TICK_MS, () => { draw($).catch(() => {}) })
-  const now = await $.clock.now()
   const c = await sumsFor($, await $.session.id()).catch(() => undefined)
-  // both parts are read after the last await, so a draw that waited long cannot publish what a newer one replaced
+  const now = await $.clock.now()
+  // the clock is the last await and both parts follow it, so a draw that waited long cannot publish what a newer one replaced
   const parts = [weekPart(now), c && hitPart(c)].filter(Boolean)
   $.ui.status(parts.length ? parts.join(' | ') : undefined)
 }
@@ -114,7 +124,7 @@ async function draw($: EngineInterface) {
 export const register: Register = (on, options) => {
   show = options.showStatusLine !== false
   // a reload may hand this module over with the old tick gone, so start clean
-  tick?.cancel(); tick = undefined; seen = false; cleared = false; sums.clear(); writes.clear()
+  tick?.cancel(); tick = undefined; seen = false; cleared = false; sums.clear(); writes.clear(); pending.clear()
 
   // a plugin reload fires neither of the hooks below, so this is what clears or draws the line at once
   on('session.start', async ($, e, next) => {
