@@ -652,11 +652,23 @@ def scan_unit(iters, unit, rec, want_meta):
                 or '"interruptedMessageId"' in line
                 or '"isApiErrorMessage":true' in line
                 or '"aiTitle"' in line)
-            if not (has_usage or is_seg or is_mark or is_local or is_prompt):
+            is_turn = want_meta and '"turn_duration"' in line
+            if not (has_usage or is_seg or is_mark or is_local or is_prompt
+                    or is_turn):
                 continue
             try:
                 d = json.loads(line)
             except Exception:
+                continue
+            if is_turn and d.get("type") == "system" \
+                    and d.get("subtype") == "turn_duration":
+                # feeds the duration only: these lines carry cwd and gitBranch
+                # on every turn and must not vote on the labels below
+                ms, uid = d.get("durationMs"), d.get("uuid")
+                if (uid and isinstance(uid, str) and uid not in rec["_dur"]
+                        and isinstance(ms, (int, float))
+                        and not isinstance(ms, bool) and 0 <= ms < 1e15):
+                    rec["_dur"][uid] = ms
                 continue
             ts = parse_ts(d.get("timestamp") or "")
             if ts is None:
@@ -739,7 +751,7 @@ def parse_session(s):
     rec = {"rows": [], "segs": [], "slug": None, "title": None,
            "comp": 0, "intr": 0, "err": 0, "agents": {},
            "_byid": {}, "_marks": set(), "_branch": Counter(),
-           "_cwd": Counter(), "_local": set()}
+           "_cwd": Counter(), "_local": set(), "_dur": {}}
     scan_unit(iters_for(s["main"]), "", rec, want_meta=True)
     for key, specs in sorted(s["subs"].items()):
         rec["agents"][key] = s["meta"].get(key) or "unresolved"
@@ -751,7 +763,8 @@ def parse_session(s):
     rec["branch"] = (rec["_branch"].most_common(1) or [(None, 0)])[0][0]
     rec["cwd"] = (min(rec["_cwd"].items(), key=lambda kv: (-kv[1], kv[0]))[0]
                   if rec["_cwd"] else None)
-    for k in ("_byid", "_marks", "_branch", "_cwd", "_local"):
+    rec["dur"] = [[u, ms] for u, ms in rec["_dur"].items()]
+    for k in ("_byid", "_marks", "_branch", "_cwd", "_local", "_dur"):
         del rec[k]
     return rec
 
@@ -936,6 +949,7 @@ def aggregate(sessions, tz_offset, rl_log):
     plab = {proj: labels[path] for proj, path in ppaths.items()}
 
     seen = set()
+    claimed = set()         # turn_duration uuids, first session wins
     proj_be = Counter()
     all_rows = []           # (ts, proj_label, cmd, model, effort, unit, row)
     sess_rows = []
@@ -945,6 +959,16 @@ def aggregate(sessions, tz_offset, rl_log):
         rows = [r for r in rec["rows"] if not (r[0] in seen or seen.add(r[0]))]
         if not rows:
             continue
+        # null = no turn_duration lines, which is not the same as 0 ms; a
+        # record cached before the key existed reads as none
+        dur = None
+        if rec.get("dur"):
+            dur = 0
+            for u, ms in rec["dur"]:
+                if u not in claimed:
+                    claimed.add(u)
+                    dur += ms
+            dur = int(round(dur))
         segs = rec["segs"]
         agent_first = {}
         for r in rows:
@@ -967,7 +991,8 @@ def aggregate(sessions, tz_offset, rl_log):
         sess_rows.append([ent["sid"][:8], proj,
                           rec.get("title") or rec.get("slug") or "",
                           t0, t1, round(be), round(out), len(rows), peak_ctx,
-                          rec["comp"], len(rec["agents"]), rec["intr"], int(bg)])
+                          rec["comp"], len(rec["agents"]), rec["intr"], int(bg),
+                          dur])
 
     projects = [p for p, _ in proj_be.most_common()]
     pidx = {p: i for i, p in enumerate(projects)}

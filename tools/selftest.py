@@ -830,6 +830,68 @@ class TestStampedAttribution(TreeCase):
                          {"plan": 1007, "acme:audit": 40})
 
 
+def turn_line(uuid, ms, **top):
+    """A system/turn_duration line, as Claude Code writes one per turn. It
+    carries cwd and gitBranch like any other line."""
+    d = {"type": "system", "subtype": "turn_duration", "uuid": uuid,
+         "durationMs": ms}
+    d.update(top)
+    return d
+
+
+class TestSessionDuration(TreeCase):
+    """A session's active time is the sum of durationMs over unique uuids,
+    sessions row position 13. Null means the session has no turn_duration
+    lines, which is not the same as zero."""
+
+    def durations(self, got):
+        return {s[0]: s[13] for s in got["sessions"]}
+
+    def three(self, **kw):
+        return self.tree(
+            [msg_line("m1"), turn_line("u1", 1000), turn_line("u2", 2000),
+             turn_line("u1", 1000)],
+            [msg_line("m2"), turn_line("u2", 2000), turn_line("u3", 500)],
+            [msg_line("m3")], **kw)
+
+    def test_unique_uuids_count_once_and_no_lines_is_null(self):
+        got = self.three()
+        want = {"sess-0": 3000, "sess-1": 500, "sess-2": None}
+        self.assertEqual(self.durations(got), want)
+        self.assertEqual(sum(v for v in want.values() if v), 3500)
+
+    def test_a_subagent_file_never_reads_turn_duration(self):
+        got = self.three(subs={(0, "agent-1"): [msg_line("a1"),
+                                                turn_line("u9", 7777)],
+                               (2, "agent-1"): [msg_line("a2"),
+                                                turn_line("u8", 5)]})
+        self.assertEqual(self.durations(got),
+                         {"sess-0": 3000, "sess-1": 500, "sess-2": None})
+
+    def test_a_fully_claimed_session_shows_zero_and_a_line_without_uuid_is_skipped(self):
+        got = self.tree([msg_line("m1"), turn_line("u1", 1000)],
+                        [msg_line("m2"), turn_line("u1", 1000)],
+                        [msg_line("m3"), dict(turn_line("x", 9), uuid=None)])
+        self.assertEqual(self.durations(got),
+                         {"sess-0": 1000, "sess-1": 0, "sess-2": None})
+
+    def test_turn_duration_lines_do_not_vote_on_the_label(self):
+        got = self.tree([
+            msg_line("m1", cwd="/home/alice/work/api"),
+            turn_line("u1", 10, cwd="/home/alice/other"),
+            turn_line("u2", 10, cwd="/home/alice/other"),
+            turn_line("u3", 10, cwd="/home/alice/other")])
+        self.assertEqual([p["id"] for p in got["projects"]], ["api"])
+
+    def test_the_existing_fixture_rows_are_14_wide_with_null_duration(self):
+        _, out = run(["--root", P["primary"]])
+        rows = payload(out)["sessions"]
+        self.assertTrue(rows)
+        for r in rows:
+            self.assertEqual(len(r), 14)
+            self.assertIsNone(r[13])
+
+
 class TestZstandardAbsent(unittest.TestCase):
     """The optional dependency is missing on most machines, so every branch
     that drops an arch source has to hold there -- which is precisely where the
