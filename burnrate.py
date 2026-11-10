@@ -254,8 +254,9 @@ def terminus_key_parts(key):
 
 
 def terminus_sessions(entries):
-    """{(proj, sid): {"main": (key, watermark), "subs": [(unit, key,
-    watermark)]}} from the list's entries, keyed the way the live tree is.
+    """{(proj, sid): {"main": (key, watermark, evicted), "subs": [(unit, key,
+    watermark, evicted)]}} from the list's entries, keyed the way the live tree
+    is.
 
     `proj` is Claude Code's folder-name encoding (every character outside
     ASCII letters and digits becomes "-") of the main's launch directory. That
@@ -275,12 +276,13 @@ def terminus_sessions(entries):
                 or wm < 0):
             continue
         sid, unit = parts
+        ev = bool(e.get("evicted"))
         if unit is None:
-            mains[sid] = (e, key, wm)
+            mains[sid] = (e, key, wm, ev)
         else:
-            subs[sid][key] = (unit, key, wm)
+            subs[sid][key] = (unit, key, wm, ev)
     out = {}
-    for sid, (e, key, wm) in mains.items():
+    for sid, (e, key, wm, ev) in mains.items():
         project = e.get("project")
         if not isinstance(project, str) or not project:
             continue
@@ -288,7 +290,8 @@ def terminus_sessions(entries):
         if not isinstance(launch, str) or not launch:
             launch = project
         out[(re.sub(r"[^A-Za-z0-9]", "-", launch), sid)] = {
-            "main": (key, wm), "subs": sorted(subs.get(sid, {}).values())}
+            "main": (key, wm, ev),
+            "subs": sorted(subs.get(sid, {}).values())}
     return out
 
 
@@ -886,14 +889,18 @@ def _discover_terminus(tsessions, root, seen, sessions):
     """Add the files terminus has and the root's live tree doesn't. Live wins per
     file: a file joins a session only when the live walk found nothing at its
     proj and key. A subagent read from terminus has no agentType of its own; a
-    live .meta.json where its file would sit under the root still names it."""
+    live .meta.json where its file would sit under the root still names it.
+    A file terminus supplies that it marks evicted makes the whole session
+    evicted (D-03); a file the live tree has never gets that far."""
     for (proj, sid), t in sorted(tsessions.items()):
         s = None
-        for unit, key, wm in [(None, *t["main"])] + t["subs"]:
+        for unit, key, wm, ev in [(None, *t["main"])] + t["subs"]:
             if (proj, key) in seen:
                 continue
             if s is None:
                 s = sessions[proj][sid]
+            if ev:
+                s["evicted"] = True
             spec = ("terminus", (key, wm))
             if unit is None:
                 s["main"].append(spec)
@@ -910,7 +917,8 @@ def discover(sources, terminus=None):
     resolved source, primary first. A terminus handle adds its sessions' files
     as ('terminus', (session_key, watermark)) entries."""
     sessions = defaultdict(lambda: defaultdict(
-        lambda: {"main": [], "subs": defaultdict(list), "meta": {}}))
+        lambda: {"main": [], "subs": defaultdict(list), "meta": {},
+                 "evicted": False}))
     root = sources[0][1] if sources else None
     seen = set()
     for layout, path in sources:
@@ -1247,10 +1255,21 @@ def collect(cache_path, sources, rebuild, quiet, terminus=None):
     done, plan, keys = 0, [], []
     for proj, sids in sorted(found.items()):
         for sid, s in sorted(sids.items()):
-            done += 1
             key = f"{proj}/{sid}"
-            sig = session_sig(s)
             hit = cache.get(key)
+            if s["evicted"]:
+                # D-03: never exported, and the record burnrate already holds
+                # is kept as it is, whatever the list says now. This departs
+                # from the rule that only rediscovered sessions are kept: the
+                # evicted usage exists nowhere else. No record, no session.
+                if hit:
+                    done += 1
+                    plan.append((key, proj, sid, s, done, hit, []))
+                else:
+                    total -= 1
+                continue
+            done += 1
+            sig = session_sig(s)
             if hit and hit["sig"] == sig:
                 plan.append((key, proj, sid, s, done, hit, []))
                 continue

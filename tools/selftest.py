@@ -4084,5 +4084,63 @@ class TestTerminusFailure(unittest.TestCase):
                          EXP["total_be"] + TM_BE + 3000 + 111)
 
 
+class TestTerminusEvicted(unittest.TestCase):
+    """D-03, AC5: an evicted session is never exported, and the record burnrate
+    already cached for it stays in the payload."""
+
+    def go(self, stub, c, args=()):
+        proc, out = run(args, env=stub.env(XDG_CACHE_HOME=c))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return payload(out)
+
+    def evict(self, stub, keys):
+        for k in keys:
+            stub.entry(k)["evicted"] = True
+        stub.save()
+
+    def test_a_cached_session_keeps_its_usage_once_it_is_evicted(self):
+        stub, c = tm_store(), tempfile.mkdtemp(dir=TMP)
+        self.assertEqual(total_be(self.go(stub, c)),
+                         EXP["total_be"] + TM_BE)
+        n = len(stub.exports())
+        for k in TM_KEYS:
+            stub.entry(k)["evicted"] = True
+            stub.entry(k)["lines"] = []
+        stub.save()
+        for _ in range(2):
+            self.assertEqual(total_be(self.go(stub, c)),
+                             EXP["total_be"] + TM_BE)
+            self.assertEqual([k for keys in stub.exports()[n:]
+                              for k in keys], [])
+
+    def test_a_session_evicted_the_first_time_it_is_seen_is_absent(self):
+        # one evicted file is enough to make the session evicted
+        stub = tm_store()
+        self.evict(stub, [TM_KEYS[1]])
+        data = self.go(stub, tempfile.mkdtemp(dir=TMP))
+        self.assertEqual(total_be(data), EXP["total_be"])
+        self.assertNotIn("proj", [p["id"] for p in data["projects"]])
+        self.assertEqual(stub.exports(), [])
+
+    def test_a_vanished_session_that_was_not_evicted_still_drops_out(self):
+        stub, c = tm_store(), tempfile.mkdtemp(dir=TMP)
+        self.go(stub, c)
+        stub.data["entries"] = [e for e in stub.data["entries"]
+                                if not e["session_key"].startswith("tm-sess-0")]
+        stub.save()
+        self.assertEqual(total_be(self.go(stub, c)), EXP["total_be"])
+
+    def test_an_evicted_copy_of_a_live_file_changes_nothing(self):
+        stub = tm_store()
+        self.evict(stub, ["p0-sess-0.jsonl", "p0-sess-0/subagents/agent-1.jsonl"])
+        data = self.go(stub, tempfile.mkdtemp(dir=TMP))
+        self.assertEqual(total_be(data), EXP["total_be"] + TM_BE)
+        self.assertEqual(
+            next(p["be"] for p in data["projects"]
+                 if p["id"] == "home/alice/work/api"),
+            EXP["label_be"]["home/alice/work/api"])
+        self.assertEqual(stub.exports(), [TM_KEYS])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
