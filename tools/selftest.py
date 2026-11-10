@@ -13,6 +13,7 @@ import ast
 import atexit
 import contextlib
 import getpass
+import gzip
 import importlib.util
 import io
 import json
@@ -130,10 +131,23 @@ br = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(br)
 
 
+def holds_terminus(d):
+    """Does PATH entry `d` hold an executable named terminus? An empty entry
+    means the cwd, as it does to a shell."""
+    p = os.path.join(d or ".", "terminus")
+    return os.path.isfile(p) and os.access(p, os.X_OK)
+
+
 def base_env(**over):
     env = dict(os.environ)
     for k in ("CLAUDE_PROJECTS", "CLAUDE_CONFIG_DIR", "TZ", "BROWSER"):
         env.pop(k, None)
+    # burnrate auto-detects a terminus on PATH, so a machine that has the real
+    # one (and its whole transcript archive) would feed every case below. Only
+    # the stub from StubTerminus.env() may be reachable.
+    if "PATH" in env:
+        env["PATH"] = os.pathsep.join(
+            d for d in env["PATH"].split(os.pathsep) if not holds_terminus(d))
     env["HOME"] = P["home"]
     env["XDG_CACHE_HOME"] = os.path.join(TMP, "cache")
     env["XDG_CONFIG_HOME"] = EMPTY_CONF
@@ -189,6 +203,160 @@ def total_be(data):
     return sum(p["be"] for p in data["projects"])
 
 
+STUB_MARKER = "TERMINUS-STUB-STDERR-MARKER"
+
+# A stand-in for the three read calls burnrate may make of terminus 2.0.0. It
+# keeps its store and its call log beside itself, so nothing about it depends on
+# the environment a case hands the run. Any other argv is logged and refused,
+# which is how a case proves burnrate never ran a command that writes.
+STUB_SRC = r'''#!@PY@
+import json, os, sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+MARKER = "@MARKER@"
+NOTICE = ("NOTICE: this export holds verbatim, unredacted transcripts. "
+          + MARKER + "\n")
+with open(os.path.join(HERE, "store.json"), encoding="utf-8") as fh:
+    S = json.load(fh)
+argv = sys.argv[1:]
+sys.stderr.write(MARKER + "\n")
+sys.stderr.flush()
+
+
+def log(**extra):
+    with open(os.path.join(HERE, "calls.log"), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(dict(argv=argv, pid=os.getpid(), **extra)) + "\n")
+
+
+def body_of(e):
+    return "".join((x if isinstance(x, str) else json.dumps(x)) + "\n"
+                   for x in e["lines"]).encode("utf-8")
+
+
+fail = S.get("fail")
+if argv == ["--version"]:
+    log()
+    if fail == "version":
+        sys.exit(1)
+    print(S.get("version", "2.0.0"))
+elif argv == ["sessions", "--project", "*", "--json"]:
+    log()
+    if fail == "sessions":
+        sys.exit(1)
+    if S.get("bad_json"):
+        print("not json {")
+        sys.exit(0)
+    if S.get("no_store"):
+        print(json.dumps({"command": "sessions", "data": {"sessions": []},
+                          "ok": True,
+                          "reason": "no terminus store at /nowhere " + MARKER}))
+        sys.exit(0)
+    ents = []
+    for e in S["entries"]:
+        ent = {"project": e["project"], "session_key": e["session_key"],
+               "watermark": e.get("watermark", len(body_of(e))),
+               "evicted": bool(e.get("evicted")), "turns": len(e["lines"])}
+        if "project_pre_worktree" in e:
+            ent["project_pre_worktree"] = e["project_pre_worktree"]
+        ents.append(ent)
+    bad = bool(S.get("not_ok"))
+    print(json.dumps({"command": "sessions", "data": {"sessions": ents},
+                      "ok": not bad, "reason": "stub failure" if bad else None}))
+elif argv == ["export", "--stdout"]:
+    keys = [k for k in sys.stdin.read().split("\n") if k]
+    log(keys=keys)
+    sys.stderr.write(NOTICE)
+    sys.stderr.flush()
+    if fail == "export":
+        sys.exit(1)
+    by_key = {e["session_key"]: e for e in S["entries"]}
+    # what the real binary does with nothing on stdin: everything
+    keys = keys or [e["session_key"] for e in S["entries"]]
+    out = sys.stdout.buffer
+    try:
+        for k in keys:
+            e = by_key.get(k)
+            if e is None or e.get("no_frame"):
+                sys.stderr.write(k + ": not found\n")
+                continue
+            body = body_of(e)
+            hdr = {"project": e["project"], "session_key": k,
+                   "watermark": len(body) + e.get("short_by", 0)}
+            if e.get("evicted") or e.get("frame_evicted"):
+                hdr["evicted"] = True
+                body = b""
+            out.write(json.dumps({"terminus": hdr}).encode("utf-8") + b"\n")
+            out.write(body)
+        out.flush()
+    except BrokenPipeError:
+        sys.exit(0)
+else:
+    log()
+    sys.exit(2)
+'''.replace("@PY@", sys.executable).replace("@MARKER@", STUB_MARKER)
+
+
+class StubTerminus:
+    """A throwaway stub terminus plus its store. `triples` are (project path,
+    session_key, lines); a line is a str or a dict that gets json-dumped. Top
+    level switches (`version`, `fail` = a command name, `not_ok`, `bad_json`,
+    `no_store` = ok with an empty list and a reason) go in `top`; per-key ones (`watermark`, `evicted`, `project_pre_worktree`,
+    `no_frame`, `short_by`, `frame_evicted` = only the export's header says
+    so) go in `per`, keyed by session_key."""
+
+    def __init__(self, triples=(), per=None, **top):
+        self.dir = tempfile.mkdtemp(dir=TMP, prefix="terminus-stub-")
+        self.exe = os.path.join(self.dir, "terminus")
+        with open(self.exe, "w", encoding="utf-8") as fh:
+            fh.write(STUB_SRC)
+        os.chmod(self.exe, 0o755)
+        self.data = dict(top, entries=[])
+        for project, key, lines in triples:
+            self.add(project, key, lines, **(per or {}).get(key, {}))
+        self.save()
+
+    def add(self, project, key, lines, **kw):
+        self.data["entries"].append(dict(kw, project=project, session_key=key,
+                                         lines=list(lines)))
+
+    def entry(self, key):
+        return next(e for e in self.data["entries"]
+                    if e["session_key"] == key)
+
+    def save(self):
+        with open(os.path.join(self.dir, "store.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump(self.data, fh)
+
+    def env(self, **over):
+        """base_env() with this stub's directory first on the filtered PATH."""
+        env = base_env(**over)
+        if "PATH" not in over:
+            env["PATH"] = os.pathsep.join(
+                [self.dir] + ([env["PATH"]] if env.get("PATH") else []))
+        return env
+
+    def run(self, *argv, stdin=b""):
+        return subprocess.run([self.exe, *argv], input=stdin,
+                              capture_output=True)
+
+    def calls(self):
+        try:
+            with open(os.path.join(self.dir, "calls.log"),
+                      encoding="utf-8") as fh:
+                return [json.loads(x) for x in fh if x.strip()]
+        except OSError:
+            return []
+
+    def exports(self):
+        """The keys each export call read, call by call."""
+        return [c["keys"] for c in self.calls() if c["argv"][0] == "export"]
+
+    def forget(self):
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(self.dir, "calls.log"))
+
+
 class TestRootResolution(unittest.TestCase):
     """D-04/D-16: --root > $CLAUDE_PROJECTS > $CLAUDE_CONFIG_DIR/projects >
     ~/.claude/projects, and the rate-limit log follows the resolved root."""
@@ -230,18 +398,19 @@ class TestRootResolution(unittest.TestCase):
         self.assertFalse(payload(out2)["rl_installed"])
 
     def test_rl_rows_carry_the_shape_the_logger_writes(self):
-        """A row count says nothing about the row. The logger writes SCALAR
-        percentages; against nested {"used_percentage": n} objects the payload
+        """A row count says nothing about the row. The logger writes a SCALAR
+        percentage; against nested {"used_percentage": n} objects the payload
         still carries four rows, and the chart's `v > 0` test then fails on
         every one of them and renders 'Not enough data in range'."""
         _, out = run()
         rl = payload(out)["rl"]
         self.assertEqual(rl, EXP["rl_rows"])
-        for ts, five, seven in rl:
+        for row in rl:
+            self.assertEqual(len(row), 2, row)
+            ts, seven = row
             self.assertIsInstance(ts, int)
-            for v in (five, seven):
-                self.assertIsInstance(v, (int, float))
-                self.assertNotIsInstance(v, bool)
+            self.assertIsInstance(seven, (int, float))
+            self.assertNotIsInstance(seven, bool)
 
     def test_missing_root_exits_two_with_its_own_message(self):
         # match the MESSAGE: argparse's own usage error is also exit 2, so an
@@ -568,6 +737,25 @@ class TestCommandAttribution(unittest.TestCase):
              answer, notice, sdk, billed_reply("m2", 20)])
         self.assertEqual(got, {"plan": 120})
 
+    def turn_origin(self, origin, **extra):
+        """/plan, a billed message, a user line carrying only turnOrigin, then
+        another billed message."""
+        mid = {"type": "user", "uuid": "p1", "turnOrigin": origin,
+               "message": {"role": "user", "content": "now the audit"}}
+        mid.update(extra)
+        return self.by_command(
+            [typed_command("c1", "plan"), billed_reply("m1", 100), mid,
+             billed_reply("m2", 20)])
+
+    def test_a_human_turn_origin_alone_ends_the_command(self):
+        self.assertEqual(self.turn_origin("human"), {"plan": 100, "": 20})
+
+    def test_a_task_notification_turn_origin_leaves_the_command_open(self):
+        self.assertEqual(self.turn_origin("task_notification"), {"plan": 120})
+
+    def test_a_meta_line_leaves_the_command_open_whatever_its_turn_origin(self):
+        self.assertEqual(self.turn_origin("human", isMeta=True), {"plan": 120})
+
     def test_a_tool_result_quoting_a_command_opens_no_segment(self):
         quoted = {"type": "user", "uuid": "r1", "parentUuid": "u-m1",
                   "message": {"role": "user", "content": [
@@ -588,6 +776,297 @@ class TestCommandAttribution(unittest.TestCase):
         got = self.by_command(
             [billed_reply("m1", 100), invoke, billed_reply("m2", 20)])
         self.assertEqual(got, {"": 100, "cadence:cad-plan": 20})
+
+
+def msg_line(mid, inp=10, cr=0, out=1, details=None, server=None, **top):
+    """One assistant line for message `mid`. Streaming writes several of these
+    per message; `top` are top-level fields (stamps, sessionKind, ...)."""
+    u = {"input_tokens": inp, "cache_read_input_tokens": cr,
+         "output_tokens": out}
+    if details is not None:
+        u["output_tokens_details"] = details
+    if server is not None:
+        u["server_tool_use"] = server
+    d = {"type": "assistant", "uuid": f"u-{mid}-{inp}-{cr}-{out}",
+         "message": {"id": mid, "role": "assistant",
+                     "model": "claude-opus-4-6", "usage": u}}
+    d.update(top)
+    return d
+
+
+class TreeCase(unittest.TestCase):
+    T0 = 1772366400  # 2026-03-01T12:00:00Z
+
+    def tree(self, *sessions, subs=None):
+        """The payload of a real run over these sessions. `subs` maps
+        (session index, agent key) to that subagent file's lines. A line
+        without a timestamp gets one a minute after the previous line's."""
+        root = os.path.join(tempfile.mkdtemp(dir=TMP), "projects")
+        pdir = os.path.join(root, "-home-alice-work-api")
+        files = {os.path.join(pdir, f"sess-{n}.jsonl"): lines
+                 for n, lines in enumerate(sessions)}
+        for (n, key), lines in (subs or {}).items():
+            files[os.path.join(pdir, f"sess-{n}", "subagents",
+                               key + ".jsonl")] = lines
+        for path, lines in files.items():
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                for i, d in enumerate(lines):
+                    if isinstance(d, str):
+                        fh.write(d + "\n")
+                        continue
+                    d.setdefault("timestamp", time.strftime(
+                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.T0 + 60 * i)))
+                    fh.write(json.dumps(d) + "\n")
+        proc, out = run(["--root", root])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.out = out
+        return payload(out)
+
+
+class TestUsageLine(TreeCase):
+    """A message streams as several lines. The early ones are partials, so the
+    row takes its usage from the line with the largest output_tokens."""
+
+    def test_the_fullest_line_supplies_every_column(self):
+        got = self.tree([msg_line("m1", inp=10, cr=0, out=5),
+                         msg_line("m1", inp=10, cr=2000, out=300)])
+        self.assertEqual(len(got["daily"]), 1)
+        row = got["daily"][0]
+        self.assertEqual(row[11], 300)   # output
+        self.assertEqual(row[6], 210)    # 10 + 0.10 x 2000
+        self.assertEqual(row[12], 1)
+
+    def test_a_smaller_later_line_does_not_replace_the_row(self):
+        got = self.tree([msg_line("m1", inp=10, cr=2000, out=300),
+                         msg_line("m1", inp=10, cr=0, out=5)])
+        self.assertEqual((got["daily"][0][11], got["daily"][0][6]), (300, 210))
+
+    def test_a_tie_keeps_the_first_line(self):
+        got = self.tree([msg_line("m2", inp=100, out=7),
+                         msg_line("m2", inp=999, out=7)])
+        self.assertEqual(got["daily"][0][6], 100)
+
+
+class TestMessageFields(TreeCase):
+    """The fields Claude Code now records on each message reach the payload's
+    daily rows: 13 agent, 14 plugin, 15 mcp server, 16 mcp tool, 17 background
+    flag, 18 requested cache ttl, then 19 thinking, 20 web search, 21 web fetch."""
+
+    def total(self, got, col):
+        return sum(r[col] for r in got["daily"])
+
+    def test_thinking_comes_from_the_fullest_line(self):
+        got = self.tree([
+            msg_line("m1", out=5, details={"thinking_tokens": 2}),
+            msg_line("m1", out=300, details={"thinking_tokens": 120})])
+        self.assertEqual((self.total(got, 11), self.total(got, 19)), (300, 120))
+
+    def test_thinking_never_exceeds_output(self):
+        got = self.tree([msg_line("m1", out=300,
+                                  details={"thinking_tokens": 500})])
+        self.assertEqual(self.total(got, 19), 300)
+
+    def test_thinking_is_not_billed_on_top_of_output(self):
+        plain = self.tree([msg_line("m1", inp=10, cr=2000, out=300)])
+        think = self.tree([msg_line("m1", inp=10, cr=2000, out=300,
+                                    details={"thinking_tokens": 120})])
+        self.assertEqual(self.total(plain, 19), 0)
+        self.assertEqual((self.total(think, 6), self.total(think, 11)),
+                         (self.total(plain, 6), self.total(plain, 11)))
+
+    def test_web_counts_are_summed(self):
+        got = self.tree([
+            msg_line("m1", server={"web_search_requests": 2,
+                                   "web_fetch_requests": 0}),
+            msg_line("m2", server={"web_search_requests": 1,
+                                   "web_fetch_requests": 3}),
+            msg_line("m3")])
+        self.assertEqual((self.total(got, 20), self.total(got, 21)), (3, 3))
+
+    def test_background_rows_are_flagged_and_kind_is_unchanged(self):
+        got = self.tree(
+            [msg_line("m1", sessionKind="bg"), msg_line("m2"),
+             msg_line("m3", sessionKind="interactive")],
+            subs={(0, "agent-1"): [msg_line("m4", sessionKind="bg"),
+                                   msg_line("m5")]})
+        flags = {}
+        for r in got["daily"]:
+            flags[(r[5], r[17])] = flags.get((r[5], r[17]), 0) + r[12]
+        self.assertEqual(flags, {("m", 1): 1, ("m", 0): 2,
+                                 ("a", 1): 1, ("a", 0): 1})
+        self.assertEqual([s[12] for s in got["sessions"]], [2])
+
+    def test_requested_cache_ttl_is_carried_as_written(self):
+        got = self.tree([msg_line("m1", promptCacheRequested="1h"),
+                         msg_line("m2", promptCacheRequested="5m"),
+                         msg_line("m3")])
+        self.assertEqual(sorted(r[18] for r in got["daily"]), ["", "1h", "5m"])
+
+    def test_stamps_are_carried_as_written(self):
+        got = self.tree([
+            msg_line("m1", attributionAgent="acme-auditor",
+                     attributionPlugin="acme",
+                     attributionMcpServer="srv", attributionMcpTool="lookup"),
+            msg_line("m2", attributionAgent=7, attributionPlugin="")])
+        rows = {r[13:17] == ["acme-auditor", "acme", "srv", "lookup"]
+                for r in got["daily"]}
+        self.assertEqual(rows, {True, False})
+        bare = [r for r in got["daily"] if r[13:17] == ["", "", "", ""]]
+        self.assertEqual(len(bare), 1)
+
+    def test_a_warm_v3_cache_is_discarded(self):
+        root = os.path.join(tempfile.mkdtemp(dir=TMP), "projects")
+        os.makedirs(os.path.join(root, "-home-alice-work-api"))
+        with open(os.path.join(root, "-home-alice-work-api", "s.jsonl"), "w",
+                  encoding="utf-8") as fh:
+            fh.write(json.dumps(dict(msg_line("m1"), timestamp="2026-03-01T12:00:00Z")) + "\n")
+        cdir = tempfile.mkdtemp(dir=TMP)
+        env = base_env(XDG_CACHE_HOME=cdir)
+        flags = ("--json", "--no-open")
+        proc, _ = run(["--root", root], env=env, flags=flags)
+        self.assertIn("1 parsed", proc.stderr)
+        (cache,) = [os.path.join(cdir, "burnrate", f)
+                    for f in os.listdir(os.path.join(cdir, "burnrate"))]
+        with gzip.open(cache, "rt", encoding="utf-8") as fh:
+            blob = json.load(fh)
+        self.assertEqual(blob["ver"], 4)
+        blob["ver"] = 3
+        with gzip.open(cache, "wt", encoding="utf-8") as fh:
+            json.dump(blob, fh)
+        proc, _ = run(["--root", root], env=env, flags=flags)
+        self.assertNotIn("0 parsed", proc.stderr)
+        self.assertIn("1 parsed", proc.stderr)
+        with gzip.open(cache, "rt", encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["ver"], 4)
+
+    def test_the_existing_fixture_rows_carry_no_new_values(self):
+        proc, out = run(["--root", P["primary"]])
+        got = payload(out)
+        self.assertTrue(got["daily"])
+        for r in got["daily"]:
+            self.assertEqual(len(r), 22)
+            self.assertEqual(r[13:19], ["", "", "", "", 0, ""])
+            self.assertEqual(r[19:22], [0, 0, 0])
+        self.assertEqual(sum(r[6] for r in got["daily"]), EXP["total_be"])
+
+
+def iso_at(ts):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+class TestStampedAttribution(TreeCase):
+    """A message stamped with the skill it ran is filed under that skill; one
+    without a stamp keeps the segment guess, and absence never means
+    conversation."""
+
+    def by_command(self, got):
+        out = {}
+        for r in got["daily"]:
+            out[r[2]] = out.get(r[2], 0) + r[6]
+        return out
+
+    def test_the_existing_fixture_files_by_command_as_before(self):
+        proc, out = run(["--root", P["primary"]])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.by_command(payload(out)), EXP["cmd_be"])
+
+    def test_stamped_rows_go_under_their_skill_and_the_rest_under_the_segment(self):
+        got = self.tree([
+            msg_line("m0", inp=1, attributionSkill="acme:early"),
+            typed_command("c1", "plan"),
+            msg_line("m1", inp=100),
+            msg_line("m2", inp=20, attributionSkill="acme:review"),
+            msg_line("m3", inp=3)])
+        self.assertEqual(self.by_command(got),
+                         {"acme:early": 1, "plan": 103, "acme:review": 20})
+
+    def test_the_other_stamps_never_replace_the_command(self):
+        got = self.tree([
+            typed_command("c1", "plan"),
+            msg_line("m1", inp=100, attributionAgent="acme-auditor",
+                     attributionPlugin="acme", attributionMcpServer="srv",
+                     attributionMcpTool="lookup")])
+        self.assertEqual(self.by_command(got), {"plan": 100})
+
+    def test_a_partly_stamped_subagent_splits_across_two_commands(self):
+        late = self.T0 + 120
+        got = self.tree(
+            [typed_command("c1", "plan"), msg_line("m1", inp=1000)],
+            subs={(0, "agent-1"): [
+                msg_line("a1", inp=40, attributionSkill="acme:audit",
+                         timestamp=iso_at(late)),
+                msg_line("a2", inp=7, timestamp=iso_at(late + 60))]})
+        self.assertEqual(self.by_command(got),
+                         {"plan": 1007, "acme:audit": 40})
+
+
+def turn_line(uuid, ms, **top):
+    """A system/turn_duration line, as Claude Code writes one per turn. It
+    carries cwd and gitBranch like any other line."""
+    d = {"type": "system", "subtype": "turn_duration", "uuid": uuid,
+         "durationMs": ms}
+    d.update(top)
+    return d
+
+
+class TestSessionDuration(TreeCase):
+    """A session's active time is the sum of durationMs over unique uuids,
+    sessions row position 13. Null means the session has no turn_duration
+    lines, which is not the same as zero."""
+
+    def durations(self, got):
+        return {s[0]: s[13] for s in got["sessions"]}
+
+    def three(self, **kw):
+        return self.tree(
+            [msg_line("m1"), turn_line("u1", 1000), turn_line("u2", 2000),
+             turn_line("u1", 1000)],
+            [msg_line("m2"), turn_line("u2", 2000), turn_line("u3", 500)],
+            [msg_line("m3")], **kw)
+
+    def test_unique_uuids_count_once_and_no_lines_is_null(self):
+        got = self.three()
+        want = {"sess-0": 3000, "sess-1": 500, "sess-2": None}
+        self.assertEqual(self.durations(got), want)
+        self.assertEqual(sum(v for v in want.values() if v), 3500)
+
+    def test_a_subagent_file_never_reads_turn_duration(self):
+        got = self.three(subs={(0, "agent-1"): [msg_line("a1"),
+                                                turn_line("u9", 7777)],
+                               (2, "agent-1"): [msg_line("a2"),
+                                                turn_line("u8", 5)]})
+        self.assertEqual(self.durations(got),
+                         {"sess-0": 3000, "sess-1": 500, "sess-2": None})
+
+    def test_a_fully_claimed_session_shows_zero_and_a_line_without_uuid_is_skipped(self):
+        got = self.tree([msg_line("m1"), turn_line("u1", 1000)],
+                        [msg_line("m2"), turn_line("u1", 1000)],
+                        [msg_line("m3"), dict(turn_line("x", 9), uuid=None)])
+        self.assertEqual(self.durations(got),
+                         {"sess-0": 1000, "sess-1": 0, "sess-2": None})
+
+    def test_turn_duration_lines_do_not_vote_on_the_label(self):
+        got = self.tree([
+            msg_line("m1", cwd="/home/alice/work/api"),
+            turn_line("u1", 10, cwd="/home/alice/other"),
+            turn_line("u2", 10, cwd="/home/alice/other"),
+            turn_line("u3", 10, cwd="/home/alice/other")])
+        self.assertEqual([p["id"] for p in got["projects"]], ["api"])
+
+    def test_a_line_that_decodes_to_a_list_is_skipped(self):
+        got = self.tree([msg_line("m1"), turn_line("u1", 1000),
+                         '["turn_duration","timestamp"]',
+                         '["usage","timestamp"]'])
+        self.assertEqual(self.durations(got), {"sess-0": 1000})
+
+    def test_the_existing_fixture_rows_are_14_wide_with_null_duration(self):
+        _, out = run(["--root", P["primary"]])
+        rows = payload(out)["sessions"]
+        self.assertTrue(rows)
+        for r in rows:
+            self.assertEqual(len(r), 14)
+            self.assertIsNone(r[13])
 
 
 class TestZstandardAbsent(unittest.TestCase):
@@ -1007,6 +1486,43 @@ class TestCache(unittest.TestCase):
         self.assertIsNotNone(re.search(r"\b0 parsed\b", warm.stderr),
                              warm.stderr)
 
+    def test_a_file_that_grows_during_the_parse_is_read_again(self):
+        # the signature is the file as it was BEFORE the read: taken after, it
+        # records bytes the parse never saw and the next run serves the cache
+        root = os.path.join(tempfile.mkdtemp(dir=TMP), "projects")
+        sess = os.path.join(root, "-home-alice-work-api", "grow.jsonl")
+        ts = "2026-03-05T12:00:00Z"
+
+        def put(*lines, mode="w"):
+            os.makedirs(os.path.dirname(sess), exist_ok=True)
+            with open(sess, mode, encoding="utf-8") as fh:
+                for mid, inp in lines:
+                    fh.write(json.dumps(msg_line(mid, inp=inp,
+                                                 timestamp=ts)) + "\n")
+
+        put(("g1", 1000))
+        cpath = os.path.join(tempfile.mkdtemp(dir=TMP), "sessions.json.gz")
+        real, grown = br.parse_session, []
+
+        def growing(*a, **kw):
+            rec = real(*a, **kw)
+            if not grown:
+                grown.append(1)
+                put(("g2", 2000), mode="a")
+            return rec
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            br.parse_session = growing
+            try:
+                first = br.collect(cpath, [("live", root)], False, True)
+            finally:
+                br.parse_session = real
+            again = br.collect(cpath, [("live", root)], False, True)
+        key = "-home-alice-work-api/grow"
+        self.assertEqual([r[0] for r in first[key]["rec"]["rows"]], ["g1"])
+        self.assertEqual([r[0] for r in again[key]["rec"]["rows"]],
+                         ["g1", "g2"])
+
 
 def encodingless_opens(path):
     """Line numbers of every text-mode open()/gzip.open() with no encoding=.
@@ -1107,7 +1623,8 @@ class TestPlatform(unittest.TestCase):
 
     PERMITTED = {"__future__", "argparse", "collections", "datetime", "glob",
                  "gzip", "hashlib", "json", "os", "pathlib", "re",
-                 "subprocess", "sys", "webbrowser", "zstandard"}
+                 "subprocess", "sys", "tempfile", "webbrowser",
+                 "zstandard"}
 
     def test_cache_dir_darwin(self):
         self.assertEqual(
@@ -1567,7 +2084,7 @@ console.log(JSON.stringify({
         self.assertEqual(call["elId"], "#rlChart")
         self.assertEqual(len(call["days"]), 2, call["days"])
         self.assertEqual([s["name"] for s in call["series"]],
-                         ["5-hour window", "7-day window"])
+                         ["7-day window"])
         for s in call["series"]:
             self.assertEqual(len(s["values"]), 2, s)
             for v in s["values"]:
@@ -1595,6 +2112,268 @@ console.log(JSON.stringify({
         self.assertEqual(got["rl"], 1)
         self.assertEqual(got["display"], "none")
         self.assertEqual(got["calls"], [])
+
+
+PAGE_STUBS = """
+// DOM stand-ins, enough for render(): elements record what is set on them.
+class El {
+  constructor(tag){ this.tag = tag; this.children = []; this.style = {};
+    this.dataset = {}; this.textContent = ''; this.innerHTML = '';
+    this.className = ''; this.classList = {add(){}, remove(){}, toggle(){}}; }
+  appendChild(c){ this.children.push(c); return c; }
+  append(...cs){ cs.forEach(c => this.appendChild(c)); }
+  setAttribute(){} addEventListener(){} contains(){ return false; }
+  querySelector(){ return new El('x'); } querySelectorAll(){ return []; }
+}
+const ELS = {};
+globalThis.document = {
+  querySelector: s => (ELS[s] = ELS[s] || new El(s)),
+  createElement: t => new El(t), addEventListener(){}, body: {} };
+globalThis.getComputedStyle = () => ({getPropertyValue: () => ''});
+"""
+
+
+def rendered(html, setup=""):
+    """Run the report's own script, render() included, under node against DOM
+    stubs, with the chart drawers and hbars replaced by recorders. Returns the
+    KPI markup, the sessions table's header and cells, each hbars call and each
+    element's display. `setup` is JS run just before render() (a range move)."""
+    body = html[html.index("<script>") + len("<script>"):]
+    script = body[body.index("const DATA ="):body.index("// ---- boot ----")]
+    js = PAGE_STUBS + script + """
+const CALLS = [];
+hbars = (elId, items) => CALLS.push({elId, items});
+lineChart = stackedChart = () => {};
+buildFilters = () => {};
+""" + setup + """
+render();
+const tbl = ELS['#sessTable'].children[0];
+console.log(JSON.stringify({
+  kpis: ELS['#kpis'].innerHTML,
+  head: tbl ? tbl.innerHTML : null,
+  rows: tbl ? tbl.children[0].children.map(tr => tr.children.map(td => td.textContent)) : [],
+  empty: ELS['#sessTable'].innerHTML,
+  display: Object.fromEntries(Object.entries(ELS).map(([k, e]) => [k, e.style.display])),
+  hbars: CALLS}));
+"""
+    path = os.path.join(tempfile.mkdtemp(dir=TMP), "render.js")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(js)
+    r = subprocess.run([NODE, path], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return json.loads(r.stdout)
+
+
+@unittest.skipIf(not NODE, "needs a JS engine")
+class TestSessionsTable(TreeCase):
+    """D-17: Top sessions gains an Active column and marks background
+    sessions; an unknown time never reads as zero."""
+
+    def table(self, *sessions):
+        self.tree(*sessions)
+        return rendered(report(self.out))
+
+    def test_active_time_and_the_background_marker(self):
+        got = self.table(
+            [msg_line("m1", inp=300), turn_line("u1", 3723000)],
+            [msg_line("m2", inp=200)],
+            [msg_line("m3", inp=100, sessionKind="bg")])
+        self.assertIn("Active", got["head"])
+        self.assertIn("Billed-equiv", got["head"])
+        self.assertEqual([(r[0], r[3]) for r in got["rows"]],
+                         [("sess-0", "1h 2m"), ("sess-1", "—"),
+                          ("sess-2 · background", "—")])
+
+    def test_a_zero_duration_is_not_a_dash(self):
+        got = self.table([msg_line("m1"), turn_line("u1", 0)])
+        self.assertEqual(got["rows"][0][3], "0h 0m")
+
+    def test_the_existing_fixture_has_no_times_and_no_marker(self):
+        _, out = run(["--root", P["primary"]])
+        got = rendered(report(out))
+        self.assertTrue(got["rows"])
+        for r in got["rows"]:
+            self.assertEqual(r[3], "—")
+            self.assertFalse(r[0].endswith(" · background"), r)
+
+
+def output_tile(kpis):
+    m = re.search(r'Output tokens</div>\s*<div class="v">([^<]*)</div>\s*'
+                  r'<div class="d">([^<]*)</div>', kpis)
+    return m.group(1), m.group(2)
+
+
+@unittest.skipIf(not NODE, "needs a JS engine")
+class TestThinkingShare(TreeCase):
+    """D-15: thinking shows as a share of output on the Output tokens tile.
+    It is already inside output, so the value never grows."""
+
+    def tile(self, *sessions):
+        self.tree(*sessions)
+        return output_tile(rendered(report(self.out))["kpis"])
+
+    def test_the_share_rides_the_detail_line_and_the_value_stays_output(self):
+        value, detail = self.tile([
+            msg_line("m1", out=200, details={"thinking_tokens": 100}),
+            msg_line("m2", out=100, details={"thinking_tokens": 20})])
+        self.assertEqual(value, "300")
+        self.assertIn("2 messages", detail)
+        self.assertRegex(detail, r"\b40% thinking")
+
+    def test_a_range_without_thinking_shows_no_share(self):
+        _, detail = self.tile([msg_line("m1", out=300)])
+        self.assertEqual(detail, "1 messages")
+
+    def test_the_existing_fixture_shows_no_share(self):
+        _, out = run(["--root", P["primary"]])
+        _, detail = output_tile(rendered(report(out))["kpis"])
+        self.assertRegex(detail, r"^[\d,]+ messages$")
+
+    def test_the_composition_block_never_mentions_thinking(self):
+        _, out = run()
+        block = viewer_slice(report(out), "// composition", "stackedChart(")
+        self.assertNotIn("think", block.lower())
+
+
+@unittest.skipIf(not NODE, "needs a JS engine")
+class TestStampCards(TreeCase):
+    """D-16: agent, plugin and MCP each get a bar card built like By model,
+    from the stamps as written, with unstamped rows left out."""
+
+    def calls(self, got):
+        return {c["elId"]: [(i["label"], i["v"]) for i in c["items"]]
+                for c in got["hbars"]}
+
+    def test_cards_carry_the_stamped_names_and_their_billed_equiv(self):
+        self.tree(
+            [typed_command("c1", "plan"),
+             msg_line("m1", inp=100, attributionAgent="acme-auditor",
+                      attributionPlugin="acme", attributionMcpServer="srv",
+                      attributionMcpTool="lookup"),
+             msg_line("m2", inp=20, attributionAgent="acme-auditor"),
+             msg_line("m3", inp=7, attributionPlugin="other",
+                      attributionMcpServer="srv2", attributionMcpTool="fetch"),
+             msg_line("m4", inp=1000)])
+        calls = self.calls(rendered(report(self.out)))
+        self.assertEqual(calls["#byAgent"], [("acme-auditor", 120)])
+        self.assertEqual(calls["#byPlugin"], [("acme", 100), ("other", 7)])
+        self.assertEqual(calls["#byMcp"],
+                         [("srv / lookup", 100), ("srv2 / fetch", 7)])
+        # the stamps never move By command (same numbers as the phase base)
+        self.assertEqual(calls["#byCmd"], [("plan", 1127)])
+
+    def test_the_existing_fixture_gives_the_cards_nothing(self):
+        _, out = run(["--root", P["primary"]])
+        calls = self.calls(rendered(report(out)))
+        for el in ("#byAgent", "#byPlugin", "#byMcp"):
+            self.assertEqual(calls[el], [])
+        self.assertTrue(calls["#byCmd"])
+
+    def test_every_new_card_says_it_counts_stamped_messages_only(self):
+        _, out = run()
+        html = report(out)
+        for title, el in (("By agent", "byAgent"), ("By plugin", "byPlugin"),
+                          ("By MCP tool", "byMcp")):
+            self.assertRegex(
+                html, rf'<h2>{title}</h2>\s*<div class="note">Stamped messages '
+                      rf'only</div><div class="hb" id="{el}">')
+
+
+def at_day(day, *lines):
+    """These lines stamped on `day` (YYYY-MM-DD) at noon, a minute apart."""
+    for i, d in enumerate(lines):
+        d["timestamp"] = f"{day}T12:{i:02d}:00Z"
+    return list(lines)
+
+
+@unittest.skipIf(not NODE, "needs a JS engine")
+class TestConditionalCards(TreeCase):
+    """D-18: the web card and the foreground/background split show only when
+    the selected range has something for them, and hide again on every render."""
+
+    def view(self, *sessions, setup=""):
+        self.tree(*sessions)
+        got = rendered(report(self.out), setup)
+        return got["display"], {c["elId"]: [(i["label"], i["v"]) for i in c["items"]]
+                                for c in got["hbars"]}
+
+    def web_tree(self):
+        return [at_day("2026-03-01", msg_line(
+                    "m1", inp=10, server={"web_search_requests": 2,
+                                          "web_fetch_requests": 0})),
+                at_day("2026-03-02", msg_line("m2", inp=5))]
+
+    def test_the_existing_fixture_hides_both_cards(self):
+        _, out = run(["--root", P["primary"]])
+        got = rendered(report(out))
+        self.assertEqual(got["display"]["#webCard"], "none")
+        self.assertEqual(got["display"]["#bgCard"], "none")
+        called = {c["elId"] for c in got["hbars"]}
+        self.assertFalse(called & {"#byWeb", "#byBg"})
+
+    def test_the_web_card_shows_the_range_counts(self):
+        disp, calls = self.view(*self.web_tree())
+        self.assertEqual(disp["#webCard"], "")
+        self.assertEqual(calls["#byWeb"], [("searches", 2), ("fetches", 0)])
+
+    def test_the_web_card_hides_when_the_range_holds_no_request(self):
+        disp, calls = self.view(
+            *self.web_tree(), setup="state.d0 = state.d1 = '2026-03-02';")
+        self.assertEqual(disp["#webCard"], "none")
+        self.assertNotIn("#byWeb", calls)
+
+    def test_the_split_shows_when_a_row_is_background(self):
+        disp, calls = self.view(
+            at_day("2026-03-01", msg_line("m1", inp=100, sessionKind="bg"),
+                   msg_line("m2", inp=20)),
+            at_day("2026-03-02", msg_line("m3", inp=7)))
+        self.assertEqual(disp["#bgCard"], "")
+        self.assertEqual(calls["#byBg"],
+                         [("background", 100), ("foreground", 27)])
+        self.assertEqual(calls["#byKind"], [("main session", 127)])
+
+    def test_the_split_hides_when_the_range_leaves_the_background_day(self):
+        disp, calls = self.view(
+            at_day("2026-03-01", msg_line("m1", inp=100, sessionKind="bg")),
+            at_day("2026-03-02", msg_line("m3", inp=7)),
+            setup="state.d0 = state.d1 = '2026-03-02';")
+        self.assertEqual(disp["#bgCard"], "none")
+        self.assertNotIn("#byBg", calls)
+
+    def test_both_cards_start_hidden_in_the_markup(self):
+        html = report(run()[1])
+        for card in ("webCard", "bgCard"):
+            self.assertRegex(html, rf'id="{card}"[^>]*style="[^"]*display:none')
+        for title in ("Web search and fetch", "Foreground vs background"):
+            self.assertIn(f"<h2>{title}</h2>", html)
+
+
+FIVE_HOUR_WORDING = re.compile(
+    r"5h|5-hour|five[_ -]hour|resets5|BLOCK_", re.IGNORECASE)
+
+
+class TestNoFiveHourWindow(unittest.TestCase):
+    """Phase 7: burnrate no longer reconstructs or describes a 5-hour window.
+    These pins fail if the blocks come back under any name."""
+
+    def test_the_payload_has_no_blocks_key(self):
+        _, out = run()
+        data = payload(out)
+        self.assertTrue(data["daily"], "no daily rows: the pin is vacuous")
+        self.assertNotIn("blocks", data)
+
+    def test_the_report_page_describes_no_five_hour_window(self):
+        self.assertIn("rlCard", br.PAGE, "no cap card in PAGE: pin is vacuous")
+        self.assertIsNone(FIVE_HOUR_WORDING.search(br.PAGE))
+
+    def test_the_cli_output_describes_no_five_hour_window(self):
+        proc, _ = run(flags=("--json", "--no-open"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        billed = [ln for ln in proc.stdout.splitlines()
+                  if ln.startswith("billed  :")]
+        self.assertEqual(len(billed), 1, proc.stdout)
+        self.assertNotIn("block", billed[0].lower())
+        self.assertIsNone(FIVE_HOUR_WORDING.search(proc.stdout), proc.stdout)
 
 
 SKILL_DIR = os.path.join(REPO, "skills", "burnrate")
@@ -1692,15 +2471,10 @@ class TestSkillAnswers(unittest.TestCase):
         proc = self.skill("run", "--dry-run", "bogus", expect=2)
         self.assertIn("bogus", proc.stderr)
 
-    def test_blocks_join_projects_and_close_five_hours_later(self):
-        got = self.answer("blocks", "--last", "1")
-        data = self.written_payload()
-        self.assertEqual(len(got["blocks"]), 1)
-        b = got["blocks"][0]
-        self.assertEqual(b["billed_equiv"], data["blocks"][-1][3])
-        self.assertEqual(b["window_end_epoch"] - b["start_epoch"], 5 * 3600)
-        ids = {p["id"] for p in data["projects"]}
-        self.assertLessEqual(set(b["top_projects"]), ids)
+    def test_the_blocks_subcommand_is_gone(self):
+        """No deprecated stub: argparse itself must refuse the word."""
+        proc = self.skill("blocks", expect=2)
+        self.assertIn("invalid choice", proc.stderr)
 
     def test_an_exact_project_label_beats_the_one_it_prefixes(self):
         """The fixture's 'home/alice/work/api' is a prefix of
@@ -1729,12 +2503,11 @@ class TestSkillAnswers(unittest.TestCase):
             self.assertIn(flag, proc.stderr)
 
     def test_a_last_below_one_is_refused(self):
-        """rows[-0:] is the WHOLE list and rows[1:] drops the current window --
-        the one a 'how much is left' question is about."""
+        """rows[-0:] is the WHOLE list and a negative N silently drops the
+        oldest days instead of failing."""
         for n in ("0", "-1"):
-            for cmd in ("blocks", "ask"):
-                proc = self.skill(cmd, "--last", n, expect=2)
-                self.assertIn("N >= 1", proc.stderr)
+            proc = self.skill("ask", "--last", n, expect=2)
+            self.assertIn("N >= 1", proc.stderr)
 
     def test_a_bad_day_word_fails_before_the_payload_is_built(self):
         """Validation after ensure_payload pays for a full transcript reparse
@@ -1943,7 +2716,8 @@ class TestPluginPackaging(unittest.TestCase):
 class TestRateLimitLogReader(unittest.TestCase):
     """LOG-01: the reader parses a file another program appends to many times a
     second, so its ordering has to survive the shapes that file really takes --
-    a second holding several samples, and a window the payload omitted."""
+    a second holding several samples, and lines written before the logger
+    stopped recording a second window."""
 
     def log(self, *lines):
         d = tempfile.mkdtemp(dir=TMP)
@@ -1952,40 +2726,43 @@ class TestRateLimitLogReader(unittest.TestCase):
             fh.write("".join(ln + "\n" for ln in lines))
         return path
 
-    def test_an_absent_window_in_a_shared_second_does_not_raise(self):
-        """Sorting whole rows compares None against a float as soon as two
-        samples share a timestamp and one window is missing -- the wrapper's
-        timestamps are second-resolution and each window is independently
-        absent, so this is a normal file. The TypeError escapes past the
-        per-line guard and the whole run produces no report."""
+    def test_an_old_format_line_reads_as_a_two_element_row(self):
+        """Logs written before the change carry two more keys per line. They
+        are ignored by name: no migration, no rewrite."""
         path = self.log(
-            '{"ts":"2026-07-31T15:31:11Z","five_hour":null,"seven_day":30}',
-            '{"ts":"2026-07-31T15:31:11Z","five_hour":23.5,"seven_day":30}')
+            '{"ts":"2026-07-31T15:31:11Z","five_hour":23.5,"seven_day":30,'
+            '"resets5":1,"resets7":2}')
+        self.assertEqual(br.read_rl_log(path),
+                         [[int(br.parse_ts("2026-07-31T15:31:11Z")), 30]])
+
+    def test_a_null_seven_day_line_is_dropped_without_raising(self):
+        path = self.log(
+            '{"ts":"2026-07-31T15:31:11Z","five_hour":23.5,"seven_day":null}',
+            '{"ts":"2026-07-31T15:31:11Z","five_hour":23.5,"seven_day":30}',
+            '{"ts":"2026-07-31T15:31:12Z","five_hour":23.5}')
         rows = br.read_rl_log(path)
-        self.assertEqual([r[1] for r in rows], [None, 23.5], rows)
+        self.assertEqual([r[1] for r in rows], [30], rows)
 
     def test_samples_in_one_second_keep_the_order_they_were_written(self):
         """File order is write order, so the last row of a second is the newest
         sample. Sorting on the values instead makes the viewer's lastOf() report
-        the LARGEST sample of that second -- visibly wrong right after a 5-hour
-        window resets, which is exactly when several samples land together."""
+        the LARGEST sample of that second, not the latest."""
         path = self.log(
-            '{"ts":"2026-07-31T15:31:11Z","five_hour":88.0,"seven_day":40}',
-            '{"ts":"2026-07-31T15:31:11Z","five_hour":91.0,"seven_day":40}',
-            '{"ts":"2026-07-31T15:31:11Z","five_hour":3.0,"seven_day":41}')
+            '{"ts":"2026-07-31T15:31:11Z","seven_day":88.0}',
+            '{"ts":"2026-07-31T15:31:11Z","seven_day":91.0}',
+            '{"ts":"2026-07-31T15:31:11Z","seven_day":3.0}')
         rows = br.read_rl_log(path)
         self.assertEqual([r[1] for r in rows], [88.0, 91.0, 3.0], rows)
 
     def test_rows_from_different_seconds_still_sort_ascending(self):
         path = self.log(
-            '{"ts":"2026-07-31T15:31:20Z","five_hour":2}',
-            '{"ts":"2026-07-31T15:31:11Z","five_hour":1}')
+            '{"ts":"2026-07-31T15:31:20Z","seven_day":2}',
+            '{"ts":"2026-07-31T15:31:11Z","seven_day":1}')
         self.assertEqual([r[1] for r in br.read_rl_log(path)], [1, 2])
 
     def test_a_run_over_such_a_log_still_writes_its_report(self):
-        # the user-visible half: the raise is outside read_rl_log's per-line
-        # try, so a single duplicated second cost the entire dashboard and the
-        # only recovery was hand-editing the log
+        # the user-visible half: a null seven_day line must cost neither the
+        # report nor a sample in the count
         d = tempfile.mkdtemp(dir=TMP)
         root = os.path.join(d, ".claude", "projects")
         shutil.copytree(P["primary"], root)
@@ -1995,12 +2772,11 @@ class TestRateLimitLogReader(unittest.TestCase):
             body = fh.read()
         with open(log, "w", encoding="utf-8") as fh:
             fh.write(body)
-            fh.write('{"ts":"2026-03-01T12:00:00Z","five_hour":null,'
-                     '"seven_day":30}\n')
+            fh.write('{"ts":"2026-03-01T12:00:00Z","seven_day":null}\n')
         proc, out = run(["--root", root])
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue(os.path.exists(os.path.join(out, "dashboard.html")))
-        self.assertEqual(len(payload(out)["rl"]), EXP["rl_samples"] + 1)
+        self.assertEqual(len(payload(out)["rl"]), EXP["rl_samples"])
 
 
 def rl_payload(five=23.5, seven=41.2, sid="sess-1", model="Sonnet 4.6"):
@@ -2079,22 +2855,32 @@ class TestUsageLoggerWrapper(unittest.TestCase):
         self.assertEqual(proc.stdout, "")
         self.assertEqual(proc.returncode, 0)
 
-    def test_one_line_per_change_with_scalar_percentages(self):
+    def test_one_line_per_seven_day_change_with_a_scalar_percentage(self):
         d = self.logger_dir()
         self.feed(d, rl_payload(23.5, 41.2))
         lines = self.log_lines(d)
         self.assertEqual(len(lines), 1, lines)
         rec = json.loads(lines[0])
         self.assertRegex(rec["ts"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
-        for key in ("five_hour", "seven_day"):
-            self.assertIsInstance(rec[key], (int, float), rec)
-            self.assertNotIsInstance(rec[key], bool)
-        # the statusline fires many times a second, so an unchanged pair must
-        # not become a row
+        self.assertEqual(sorted(rec), ["model", "resets7", "session_id",
+                                       "seven_day", "ts"], rec)
+        self.assertIsInstance(rec["seven_day"], (int, float), rec)
+        self.assertNotIsInstance(rec["seven_day"], bool)
+        # the statusline fires many times a second, so an unchanged percentage
+        # must not become a row, and neither may a move in the other window
         self.feed(d, rl_payload(23.5, 41.2))
         self.assertEqual(len(self.log_lines(d)), 1)
         self.feed(d, rl_payload(24.5, 41.2))
+        self.assertEqual(len(self.log_lines(d)), 1)
+        self.feed(d, rl_payload(24.5, 42.0))
         self.assertEqual(len(self.log_lines(d)), 2)
+
+    def test_a_payload_carrying_only_the_other_window_writes_nothing(self):
+        d = self.logger_dir()
+        only = json.dumps({"session_id": "s", "rate_limits": {
+            "five_hour": {"used_percentage": 23.5, "resets_at": 1772380800}}})
+        self.feed(d, only)
+        self.assertFalse(os.path.exists(os.path.join(d, "usage-log.jsonl")))
 
     def test_a_payload_past_the_pipe_buffer_keeps_the_inner_status(self):
         """Nothing obliges a statusline command to read its stdin, and the
@@ -2138,13 +2924,11 @@ class TestUsageLoggerWrapper(unittest.TestCase):
         self.feed(d, rl_payload(24.5, 42.5))
         rows = br.read_rl_log(os.path.join(d, "usage-log.jsonl"))
         self.assertEqual(len(rows), 2, rows)
-        for ts, five, seven in rows:
+        for ts, seven in rows:
             self.assertIsInstance(ts, int)
-            self.assertIsInstance(five, float)
             self.assertIsInstance(seven, float)
         self.assertLessEqual(rows[0][0], rows[1][0])
-        self.assertEqual([r[1] for r in rows], [23.5, 24.5])
-        self.assertEqual([r[2] for r in rows], [41.2, 42.5])
+        self.assertEqual([r[1] for r in rows], [41.2, 42.5])
 
 
 FULL_SETTINGS = {
@@ -2650,6 +3434,885 @@ class TestHindsightConfig(unittest.TestCase):
 
     def test_absent_config_is_not_an_error(self):
         self.assertIsNone(br.hindsight_archive({"XDG_CONFIG_HOME": EMPTY_CONF}))
+
+
+class TestTerminusStub(unittest.TestCase):
+    """The stub is how the suite stays off the real terminus, so the stub and
+    the filter that keeps the real one off PATH are checked on their own."""
+
+    def test_base_env_drops_a_dir_that_holds_a_terminus(self):
+        d = tempfile.mkdtemp(dir=TMP)
+        _write(os.path.join(d, "terminus"), b"#!/bin/sh\n")
+        os.chmod(os.path.join(d, "terminus"), 0o755)
+        old = os.environ.get("PATH", "")
+        os.environ["PATH"] = os.pathsep.join([d, old]) if old else d
+        try:
+            got = base_env()["PATH"].split(os.pathsep)
+            want = [x for x in os.environ["PATH"].split(os.pathsep)
+                    if x != d and not holds_terminus(x)]
+        finally:
+            os.environ["PATH"] = old
+        self.assertNotIn(d, got)
+        self.assertEqual(got, want)
+        # the filter only drops: every other entry survived, in order
+        self.assertEqual(got, [x for x in old.split(os.pathsep)
+                               if not holds_terminus(x)])
+
+    def test_no_path_entry_of_base_env_reaches_a_terminus(self):
+        for d in base_env()["PATH"].split(os.pathsep):
+            self.assertFalse(holds_terminus(d), d)
+
+    def test_version_defaults_and_follows_the_store(self):
+        self.assertEqual(StubTerminus().run("--version").stdout, b"2.0.0\n")
+        self.assertEqual(
+            StubTerminus(version="1.9.0").run("--version").stdout, b"1.9.0\n")
+
+    def test_sessions_lists_each_body_size_as_its_watermark(self):
+        stub = StubTerminus([("/p/a", "s1.jsonl", [{"x": 1}, "plain"]),
+                             ("/p/a", "s1/subagents/agent-a.jsonl", ["z"])])
+        proc = stub.run("sessions", "--project", "*", "--json")
+        self.assertEqual(proc.returncode, 0)
+        got = json.loads(proc.stdout)
+        self.assertTrue(got["ok"])
+        self.assertIsNone(got["reason"])
+        ents = got["data"]["sessions"]
+        self.assertEqual([e["session_key"] for e in ents],
+                         ["s1.jsonl", "s1/subagents/agent-a.jsonl"])
+        self.assertEqual([e["watermark"] for e in ents],
+                         [len(b'{"x": 1}\nplain\n'), 2])
+        for e in ents:
+            self.assertEqual(
+                set(e) >= {"project", "session_key", "watermark", "evicted",
+                           "turns"}, True)
+            self.assertFalse(e["evicted"])
+            self.assertNotIn("project_pre_worktree", e)
+
+    def test_export_frames_a_held_key_and_reports_an_unknown_one(self):
+        stub = StubTerminus([("/p/a", "s1.jsonl", [{"x": 1}, "plain"])])
+        proc = stub.run("export", "--stdout", stdin=b"nope.jsonl\ns1.jsonl\n")
+        self.assertEqual(proc.returncode, 0)
+        head, _, body = proc.stdout.partition(b"\n")
+        hdr = json.loads(head)["terminus"]
+        self.assertEqual((hdr["project"], hdr["session_key"]),
+                         ("/p/a", "s1.jsonl"))
+        self.assertEqual(len(body), hdr["watermark"])
+        self.assertEqual(body, b'{"x": 1}\nplain\n')
+        err = proc.stderr.decode("utf-8")
+        self.assertIn(STUB_MARKER, err)
+        self.assertIn("nope.jsonl: not found", err)
+        self.assertIn("unredacted", err)
+
+    def test_a_write_command_is_refused_and_logged(self):
+        stub = StubTerminus([("/p/a", "s1.jsonl", ["x"])])
+        self.assertNotEqual(stub.run("ingest").returncode, 0)
+        self.assertNotEqual(stub.run("sessions", "--json").returncode, 0)
+        self.assertNotEqual(stub.run("export", "/tmp/somewhere").returncode, 0)
+
+    def test_every_call_reaches_the_log(self):
+        stub = StubTerminus([("/p/a", "s1.jsonl", ["x"])])
+        stub.run("--version")
+        stub.run("sessions", "--project", "*", "--json")
+        stub.run("export", "--stdout", stdin=b"s1.jsonl\n")
+        stub.run("ingest")
+        self.assertEqual([c["argv"] for c in stub.calls()],
+                         [["--version"],
+                          ["sessions", "--project", "*", "--json"],
+                          ["export", "--stdout"], ["ingest"]])
+        self.assertEqual(stub.exports(), [["s1.jsonl"]])
+
+    def test_the_failure_switches_do_what_they_say(self):
+        row = [("/p/a", "s1.jsonl", ["abc"])]
+        self.assertEqual(StubTerminus(row, fail="sessions").run(
+            "sessions", "--project", "*", "--json").returncode, 1)
+        self.assertEqual(StubTerminus(row, fail="export").run(
+            "export", "--stdout", stdin=b"s1.jsonl\n").returncode, 1)
+        bad = StubTerminus(row, not_ok=True).run(
+            "sessions", "--project", "*", "--json")
+        self.assertFalse(json.loads(bad.stdout)["ok"])
+        with self.assertRaises(ValueError):
+            json.loads(StubTerminus(row, bad_json=True).run(
+                "sessions", "--project", "*", "--json").stdout)
+        short = StubTerminus(row, per={"s1.jsonl": {"short_by": 5}}).run(
+            "export", "--stdout", stdin=b"s1.jsonl\n")
+        head, _, body = short.stdout.partition(b"\n")
+        self.assertEqual(json.loads(head)["terminus"]["watermark"],
+                         len(body) + 5)
+        pre = StubTerminus(row, per={"s1.jsonl": {
+            "project_pre_worktree": "/p/a/.claude/worktrees/w",
+            "watermark": 99}}).run("sessions", "--project", "*", "--json")
+        ent = json.loads(pre.stdout)["data"]["sessions"][0]
+        self.assertEqual((ent["project_pre_worktree"], ent["watermark"]),
+                         ("/p/a/.claude/worktrees/w", 99))
+
+
+def resolve_in(env, **kw):
+    """resolve_sources in-process under exactly this env: (result, stderr)."""
+    kw.setdefault("archive", None)
+    kw.setdefault("no_archive", False)
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        src = br.resolve_sources(types.SimpleNamespace(**kw), env=env)
+    return src, err.getvalue()
+
+
+def in_cwd(path):
+    @contextlib.contextmanager
+    def cm():
+        old = os.getcwd()
+        os.chdir(path)
+        try:
+            yield
+        finally:
+            os.chdir(old)
+    return cm()
+
+
+TERMINUS_ENTRY = ("terminus", br.TERMINUS_SOURCE)
+
+
+class TestTerminusSource(unittest.TestCase):
+    """D-07/D-09/D-16/D-17: an installed terminus 2.0.0 or later is one more
+    source of the run, found on the env's PATH and nowhere else."""
+
+    ROW = [("/home/zed/x", "s1.jsonl", ["{}"])]
+
+    def env_for(self, stub, **over):
+        return dict({"HOME": P["home"], "XDG_CONFIG_HOME": EMPTY_CONF,
+                     "PATH": stub.dir}, **over)
+
+    def test_a_terminus_2_0_0_joins_the_sources(self):
+        stub = StubTerminus(self.ROW)
+        src, err = resolve_in(self.env_for(stub))
+        self.assertIn(TERMINUS_ENTRY, src["sources"])
+        self.assertTrue(src["archive_used"])
+        self.assertEqual(err, "")
+
+    def test_an_older_terminus_is_left_out_after_one_version_call(self):
+        stub = StubTerminus(self.ROW, version="1.9.0")
+        src, err = resolve_in(self.env_for(stub))
+        self.assertNotIn(TERMINUS_ENTRY, src["sources"])
+        self.assertFalse(src["archive_used"])
+        self.assertEqual(err, "")
+        self.assertEqual([c["argv"] for c in stub.calls()], [["--version"]])
+
+    def test_a_version_that_is_not_a_bare_version_is_left_out(self):
+        stub = StubTerminus(self.ROW, version="Terminus 3.1.0")
+        src, _ = resolve_in(self.env_for(stub))
+        self.assertNotIn(TERMINUS_ENTRY, src["sources"])
+        self.assertEqual([c["argv"] for c in stub.calls()], [["--version"]])
+
+    def test_the_process_path_is_never_consulted(self):
+        stub = StubTerminus(self.ROW)
+        old = os.environ.get("PATH", "")
+        os.environ["PATH"] = os.pathsep.join([stub.dir, old])
+        try:
+            src, _ = resolve_in({"HOME": P["home"],
+                                 "XDG_CONFIG_HOME": EMPTY_CONF})
+        finally:
+            os.environ["PATH"] = old
+        self.assertNotIn(TERMINUS_ENTRY, src["sources"])
+        self.assertEqual(stub.calls(), [])
+
+    def test_win32_tries_the_envs_pathext(self):
+        d = tempfile.mkdtemp(dir=TMP)
+        _write(os.path.join(d, "terminus.BAT"))
+        got = br.find_terminus({"PATH": d, "PATHEXT": ".COM;.BAT"},
+                               platform="win32")
+        self.assertEqual(got, os.path.join(d, "terminus.BAT"))
+        self.assertTrue(os.path.isabs(got))
+        # without a PATHEXT the default list applies, and it holds .BAT
+        self.assertEqual(br.find_terminus({"PATH": d}, platform="win32"),
+                         os.path.join(d, "terminus.BAT"))
+        # the same dir means nothing on linux: no extension is tried
+        self.assertIsNone(br.find_terminus({"PATH": d}, platform="linux"))
+
+    def test_the_cwd_is_never_searched(self):
+        d = tempfile.mkdtemp(dir=TMP)
+        _write(os.path.join(d, "terminus"), b"#!/bin/sh\n")
+        os.chmod(os.path.join(d, "terminus"), 0o755)
+        with in_cwd(d):
+            for path in (os.pathsep.join(["", "."]), ".", "", os.pathsep):
+                self.assertIsNone(br.find_terminus({"PATH": path}), path)
+            self.assertIsNone(br.find_terminus({"PATH": os.path.basename(d)}))
+
+    def test_posix_wants_the_execute_bit(self):
+        d = tempfile.mkdtemp(dir=TMP)
+        _write(os.path.join(d, "terminus"), b"#!/bin/sh\n")
+        os.chmod(os.path.join(d, "terminus"), 0o644)
+        self.assertIsNone(br.find_terminus({"PATH": d}, platform="linux"))
+        os.chmod(os.path.join(d, "terminus"), 0o755)
+        self.assertEqual(br.find_terminus({"PATH": d}, platform="linux"),
+                         os.path.join(d, "terminus"))
+
+    def test_no_archive_makes_no_call_and_root_does_not_turn_it_off(self):
+        stub = StubTerminus(self.ROW)
+        proc, _ = run(["--no-archive"], env=stub.env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(stub.calls(), [])
+        proc, _ = run(["--root", P["primary"]], env=stub.env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(["--version"], [c["argv"] for c in stub.calls()])
+
+    def test_terminus_runs_beside_an_archive(self):
+        stub = StubTerminus(self.ROW)
+        src, _ = resolve_in(self.env_for(stub), archive=P["backup"])
+        self.assertIn(("live", P["backup"]), src["sources"])
+        self.assertIn(TERMINUS_ENTRY, src["sources"])
+        self.assertEqual(src["archive_label"], "archive: backup + Terminus")
+
+    def test_three_runs_leave_two_cache_files(self):
+        c = tempfile.mkdtemp(dir=TMP)
+        bd = os.path.join(c, "burnrate")
+        stub = StubTerminus(self.ROW)
+        run(env=stub.env(XDG_CACHE_HOME=c))
+        run(["--no-archive"], env=stub.env(XDG_CACHE_HOME=c))
+        run(env=base_env(XDG_CACHE_HOME=c))
+        files = [f for f in os.listdir(bd) if f.endswith(".json.gz")]
+        self.assertEqual(len(files), 2, files)
+
+    def test_the_cache_key_ignores_where_terminus_sits_and_the_cwd(self):
+        cenv = {"XDG_CACHE_HOME": os.path.join(TMP, "cache")}
+        keys = set()
+        for _ in range(2):
+            src, _ = resolve_in(self.env_for(StubTerminus(self.ROW)))
+            keys.add(br.cache_path(src["sources"], platform="linux", env=cenv))
+        for d in (tempfile.mkdtemp(dir=TMP), tempfile.mkdtemp(dir=TMP)):
+            with in_cwd(d):
+                keys.add(br.cache_path(src["sources"], platform="linux",
+                                       env=cenv))
+        self.assertEqual(len(keys), 1, keys)
+        plain, _ = resolve_in({"HOME": P["home"],
+                               "XDG_CONFIG_HOME": EMPTY_CONF})
+        self.assertNotIn(br.cache_path(plain["sources"], platform="linux",
+                                       env=cenv), keys)
+
+    def test_discover_never_walks_the_terminus_entry(self):
+        d = tempfile.mkdtemp(dir=TMP)
+        _write(os.path.join(d, br.TERMINUS_SOURCE, "-p", "s.jsonl"))
+        with in_cwd(d):
+            self.assertEqual(len(br.discover([TERMINUS_ENTRY])), 0)
+
+
+TM_PROJ = "-home-zed-solo-proj"
+TM_SOLO = "/home/zed/solo/proj"
+TM_BE = 5000 + 5001 + 5100 + 5200   # what the Terminus-only session's rows sum to
+API = "/home/alice/work/api"
+WORKTREE = API + "/.claude/worktrees/agent-abc"
+
+
+def tm_msg(mid, inp, cwd=TM_SOLO):
+    return msg_line(mid, inp=inp, cwd=cwd, timestamp="2026-03-05T12:00:00Z")
+
+
+def tm_store(**kw):
+    """One stub store for the Terminus cases: a session only Terminus has (its
+    subagent filed under a different project than its main), copies of two
+    sessions the fixture's live tree already holds, and the keys burnrate must
+    refuse."""
+    solo = TM_SOLO
+    triples = [
+        (solo, "tm-sess-0.jsonl", [tm_msg("tm-main-0", 5000),
+                                    tm_msg("tm-main-1", 5001)]),
+        ("/home/zed/solo/other", "tm-sess-0/subagents/agent-a1.jsonl",
+         [tm_msg("tm-sub-0", 5100)]),
+        (solo, "tm-sess-0/subagents/workflows/wf_9/agent-w1.jsonl",
+         [tm_msg("tm-wf-0", 5200)]),
+        # not transcripts: a journal, a path trick, a doubled slash, a
+        # subagent whose main Terminus doesn't have
+        (solo, "tm-sess-0/subagents/workflows/wf_9/journal.jsonl", ["{}"]),
+        (solo, "../evil.jsonl", [tm_msg("tm-evil", 1)]),
+        (solo, "a//b.jsonl", [tm_msg("tm-dbl", 1)]),
+        (solo, "orphan/subagents/agent-o.jsonl", [tm_msg("tm-orphan", 1)]),
+        # sessions the live tree has: the live copy wins
+        (API, "p0-sess-0.jsonl", [tm_msg("tm-extra-p0", 9999, API)]),
+        (API, "p0-sess-0/subagents/agent-1.jsonl",
+         [tm_msg("tm-extra-p0a", 9997, API)]),
+        (API, "p3-sess-0.jsonl", [tm_msg("tm-extra-p3", 9998, API)]),
+        (None, "nul-sess.jsonl", []),
+    ]
+    stub = StubTerminus(triples, **kw)
+    stub.entry("p3-sess-0.jsonl")["project_pre_worktree"] = WORKTREE
+    stub.save()
+    return stub
+
+
+class TestTerminusSessions(unittest.TestCase):
+    """D-01/D-02/D-13/D-14/D-15: Terminus files join the session map under the
+    live tree's own keys, and only for the files the live tree lacks."""
+
+    def found(self, stub, **kw):
+        env = {"HOME": P["home"], "XDG_CONFIG_HOME": EMPTY_CONF,
+               "PATH": stub.dir}
+        src, _ = resolve_in(env, **kw)
+        return src, br.discover(src["sources"], src["terminus"])
+
+    def test_a_terminus_only_session_files_under_its_mains_project(self):
+        _, found = self.found(tm_store())
+        s = found[TM_PROJ]["tm-sess-0"]
+        self.assertEqual([(k, v[0]) for k, v in s["main"]],
+                         [("terminus", "tm-sess-0.jsonl")])
+        self.assertEqual(
+            {u: [(k, v[0]) for k, v in specs]
+             for u, specs in s["subs"].items()},
+            {"agent-a1": [("terminus",
+                           "tm-sess-0/subagents/agent-a1.jsonl")],
+             "agent-w1": [("terminus", "tm-sess-0/subagents/workflows/wf_9/"
+                                       "agent-w1.jsonl")]})
+        self.assertEqual(s["meta"], {})
+
+    def test_a_session_the_live_tree_has_keeps_only_its_live_sources(self):
+        _, found = self.found(tm_store())
+        s = found["-home-alice-work-api"]["p0-sess-0"]
+        self.assertEqual({k for k, _ in s["main"]}, {"live"})
+        self.assertEqual({k for specs in s["subs"].values()
+                          for k, _ in specs}, {"live"})
+        self.assertIn("agent-1", s["subs"])
+
+    def test_a_worktree_session_is_found_once_under_the_worktrees_dir(self):
+        _, found = self.found(tm_store())
+        wt = "-home-alice-work-api--claude-worktrees-agent-abc"
+        s = found[wt]["p3-sess-0"]
+        self.assertEqual({k for k, _ in s["main"]}, {"live"})
+        self.assertNotIn("p3-sess-0", found["-home-alice-work-api"])
+        self.assertEqual(sum("p3-sess-0" in sids for sids in found.values()), 1)
+
+    def test_a_pre_worktree_subdirectory_still_finds_the_live_copy(self):
+        # real terminus sets project_pre_worktree to a plain subdirectory for
+        # sessions the live tree files under `project`
+        stub = tm_store()
+        stub.entry("p0-sess-0.jsonl")["project_pre_worktree"] = API + "/.planning"
+        stub.save()
+        _, found = self.found(stub)
+        s = found["-home-alice-work-api"]["p0-sess-0"]
+        self.assertEqual({k for k, _ in s["main"]}, {"live"})
+        self.assertEqual({k for specs in s["subs"].values()
+                          for k, _ in specs}, {"live"})
+        self.assertEqual(sum("p0-sess-0" in sids for sids in found.values()), 1)
+        self.assertEqual(br.terminus_keys(s), [])
+
+    def test_what_is_not_a_transcript_never_becomes_a_session(self):
+        _, found = self.found(tm_store())
+        sids = {sid for sids in found.values() for sid in sids}
+        self.assertTrue({"nul-sess", "orphan", "evil", "b"}.isdisjoint(sids))
+        for sids in found.values():
+            for sess in sids.values():
+                for _k, v in sess["main"]:
+                    self.assertNotIn("journal", str(v))
+                for specs in sess["subs"].values():
+                    for _k, v in specs:
+                        self.assertNotIn("journal", str(v))
+
+    def test_a_live_meta_json_names_a_terminus_only_subagent(self):
+        root = os.path.join(tempfile.mkdtemp(dir=TMP), "projects")
+        _write(os.path.join(root, "-home-other", "z.jsonl"))
+        _write(os.path.join(root, TM_PROJ, "tm-sess-0", "subagents",
+                            "agent-a1.meta.json"),
+               b'{"agentType": "cad-planner"}')
+        _, found = self.found(tm_store(), root=root)
+        self.assertEqual(found[TM_PROJ]["tm-sess-0"]["meta"],
+                         {"agent-a1": "cad-planner"})
+
+    def test_the_signature_moves_with_a_listed_watermark(self):
+        stub = tm_store()
+        sig = [br.session_sig(self.found(stub)[1][TM_PROJ]["tm-sess-0"])
+               for _ in range(2)]
+        self.assertEqual(sig[0], sig[1])
+        self.assertEqual(json.loads(json.dumps(sig[0])), sig[0])
+        self.assertEqual(
+            [e[:2] for e in sig[0]],
+            [["terminus", k] for k in (
+                "tm-sess-0.jsonl", "tm-sess-0/subagents/agent-a1.jsonl",
+                "tm-sess-0/subagents/workflows/wf_9/agent-w1.jsonl")])
+        stub.entry("tm-sess-0/subagents/agent-a1.jsonl")["watermark"] = 12345
+        stub.save()
+        moved = br.session_sig(self.found(stub)[1][TM_PROJ]["tm-sess-0"])
+        self.assertNotEqual(moved, sig[0])
+        self.assertIn(["terminus", "tm-sess-0/subagents/agent-a1.jsonl",
+                       12345], moved)
+
+    def test_one_sessions_call_per_run_and_it_asks_for_every_project(self):
+        c = tempfile.mkdtemp(dir=TMP)
+        stub = tm_store()
+        proc, _ = run(env=stub.env(XDG_CACHE_HOME=c))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lists = [x["argv"] for x in stub.calls() if x["argv"][0] == "sessions"]
+        self.assertEqual(lists, [["sessions", "--project", "*", "--json"]])
+
+    def test_a_list_that_is_not_ok_leaves_terminus_out(self):
+        for kw in ({"not_ok": True}, {"bad_json": True}, {"fail": "sessions"}):
+            src, _ = resolve_in({"HOME": P["home"],
+                                 "XDG_CONFIG_HOME": EMPTY_CONF,
+                                 "PATH": tm_store(**kw).dir})
+            self.assertNotIn(TERMINUS_ENTRY, src["sources"], kw)
+            self.assertIsNone(src["terminus"])
+
+
+TM_KEYS = ["tm-sess-0.jsonl", "tm-sess-0/subagents/agent-a1.jsonl",
+           "tm-sess-0/subagents/workflows/wf_9/agent-w1.jsonl"]
+STUB_SHAPES = [["--version"], ["sessions", "--project", "*", "--json"],
+               ["export", "--stdout"]]
+
+
+class TestTerminusExport(unittest.TestCase):
+    """D-05/D-06/D-11/D-12/D-13/D-15: only the sessions whose watermarks
+    changed are exported, one call per run, read as frames."""
+
+    def go(self, stub, cache, args=(), flags=("--json", "--no-open", "--quiet")):
+        return run(args, env=stub.env(XDG_CACHE_HOME=cache), flags=flags)
+
+    def be(self, data, label):
+        return next(p["be"] for p in data["projects"] if p["id"] == label)
+
+    def test_the_terminus_only_project_is_in_the_payload(self):
+        stub = tm_store()
+        proc, out = self.go(stub, tempfile.mkdtemp(dir=TMP),
+                            flags=("--json", "--no-open"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = payload(out)
+        self.assertEqual(self.be(data, "proj"), TM_BE)
+        self.assertEqual(total_be(data), EXP["total_be"] + TM_BE)
+        self.assertTrue(data["archive_used"])
+        self.assertEqual([c["argv"] for c in stub.calls()], STUB_SHAPES)
+        self.assertEqual(stub.exports(), [TM_KEYS])
+        # D-11: nothing terminus said to stderr reaches this run's output
+        self.assertNotIn(STUB_MARKER, proc.stdout + proc.stderr)
+
+    def test_a_session_the_live_tree_has_is_counted_once_from_live(self):
+        stub = tm_store()
+        proc, out = self.go(stub, tempfile.mkdtemp(dir=TMP))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.be(payload(out), "home/alice/work/api"),
+                         EXP["label_be"]["home/alice/work/api"])
+        for keys in stub.exports():
+            self.assertEqual([k for k in keys
+                              if k.startswith(("p0-sess-0", "p3-sess-0"))], [])
+
+    def test_a_warm_run_calls_no_export_and_one_raised_watermark_exports_one(self):
+        stub, c = tm_store(), tempfile.mkdtemp(dir=TMP)
+        _, out1 = self.go(stub, c)
+        _, out2 = self.go(stub, c)
+        self.assertEqual(stub.exports(), [TM_KEYS])
+        a, b = payload(out1), payload(out2)
+        a.pop("generated")
+        b.pop("generated")
+        self.assertEqual(a, b)
+        stub.entry(TM_KEYS[1])["lines"].append(tm_msg("tm-sub-1", 777))
+        stub.save()
+        proc, out3 = self.go(stub, c)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(stub.exports(), [TM_KEYS, TM_KEYS])
+        self.assertEqual(total_be(payload(out3)),
+                         EXP["total_be"] + TM_BE + 777)
+
+    def test_rebuild_exports_every_terminus_file_again(self):
+        stub, c = tm_store(), tempfile.mkdtemp(dir=TMP)
+        self.go(stub, c)
+        self.go(stub, c, ["--rebuild"])
+        self.assertEqual(stub.exports(), [TM_KEYS, TM_KEYS])
+
+    def test_the_frames_watermark_is_what_the_cache_records(self):
+        # an ingest landing between the list and the export: the list still
+        # reports the smaller number, the frame carries the newer bytes
+        stub, c = tm_store(), tempfile.mkdtemp(dir=TMP)
+        stub.entry(TM_KEYS[0])["watermark"] = 1
+        stub.save()
+        self.go(stub, c)
+        del stub.entry(TM_KEYS[0])["watermark"]
+        stub.save()
+        proc, _ = self.go(stub, c)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(stub.exports(), [TM_KEYS])
+
+    def test_burnrate_only_ever_makes_the_three_read_calls(self):
+        stub, c = tm_store(), tempfile.mkdtemp(dir=TMP)
+        self.go(stub, c)
+        self.go(stub, c, ["--rebuild"])
+        for call in stub.calls():
+            self.assertIn(call["argv"], STUB_SHAPES)
+
+    def falls_back(self, stub, why):
+        """Any export that doesn't frame is one warning and a run without
+        terminus (D-10), not the error exit Plan 1 stopped on."""
+        c = tempfile.mkdtemp(dir=TMP)
+        out = tempfile.mkdtemp(dir=TMP)
+        proc = subprocess.run(
+            [sys.executable, BR, "--out", out, "--json", "--no-open",
+             "--quiet"], env=stub.env(XDG_CACHE_HOME=c), timeout=60,
+            capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        warns = [x for x in proc.stderr.splitlines()
+                 if x.startswith("warning:")]
+        self.assertEqual(len(warns), 1, proc.stderr)
+        self.assertIn("terminus", warns[0])
+        self.assertIn(why, warns[0])
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertNotIn(STUB_MARKER, proc.stdout + proc.stderr)
+        data = payload(out)
+        self.assertFalse(data["archive_used"])
+        self.assertIsNone(data["archive_label"])
+        self.assertEqual(total_be(data), EXP["total_be"])
+        for call in stub.calls():
+            if call["argv"][0] == "export":
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(call["pid"], 0)
+
+    def test_a_key_with_no_frame_falls_back_and_leaves_no_process(self):
+        big = [tm_msg(f"tm-big-{i}", 1) for i in range(2000)]
+        stub = StubTerminus([
+            (TM_SOLO, "aa-gone.jsonl", ["{}"]),
+            (TM_SOLO, "zz-big.jsonl", big)],
+            per={"aa-gone.jsonl": {"no_frame": True}})
+        self.assertGreater(len(json.dumps(big)), 128 * 1024)
+        self.falls_back(stub, "where 'aa-gone.jsonl' was next")
+
+    def test_an_evicted_header_the_list_did_not_mention_falls_back(self):
+        stub = tm_store()
+        stub.entry(TM_KEYS[1])["frame_evicted"] = True
+        stub.save()
+        self.falls_back(stub, "came back evicted")
+
+    def test_a_cut_short_body_falls_back(self):
+        stub = tm_store()
+        stub.entry(TM_KEYS[2])["short_by"] = 5
+        stub.save()
+        self.falls_back(stub, "cut short")
+
+    def test_bytes_after_the_last_frame_fall_back(self):
+        stub = tm_store()
+        stub.entry(TM_KEYS[2])["short_by"] = -3
+        stub.save()
+        self.falls_back(stub, "bytes after the last frame")
+
+    def test_a_non_zero_export_falls_back(self):
+        stub = tm_store(fail="export")
+        self.falls_back(stub, "no frame header")
+
+
+class TestTerminusReport(unittest.TestCase):
+    """D-04: the report names Terminus beside any other archive it read, and
+    never where the binary or its data sits."""
+
+    def env_for(self, stub, **over):
+        return dict({"HOME": P["home"], "XDG_CONFIG_HOME": EMPTY_CONF,
+                     "PATH": stub.dir}, **over)
+
+    def test_terminus_is_named_beside_an_archive_by_name_only(self):
+        stub = tm_store()
+        proc, out = run(["--archive", P["backup"]], env=stub.env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = payload(out)
+        self.assertIn("archive: backup", data["archive_label"])
+        self.assertIn("Terminus", data["archive_label"])
+        self.assertTrue(data["archive_used"])
+
+    def test_terminus_alone_reads_terminus_and_leaks_no_path(self):
+        stub = tm_store()
+        proc, out = run(env=stub.env(), flags=("--json", "--no-open"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = payload(out)
+        self.assertEqual(data["archive_label"], "Terminus")
+        self.assertTrue(data["archive_used"])
+        for name in ("dashboard_data.json", "dashboard.html"):
+            with open(os.path.join(out, name), encoding="utf-8") as fh:
+                self.assertNotIn(stub.dir, fh.read(), name)
+
+    def test_an_archive_the_zstandard_drop_removed_is_not_named(self):
+        stub = tm_store()
+        with zstd_as(None):
+            src, err = resolve_in(self.env_for(stub), archive=FAKE_ARCH)
+        self.assertIn("zstandard not installed -- archive skipped", err)
+        self.assertEqual(src["archive_label"], "Terminus")
+        self.assertTrue(src["archive_used"])
+        with zstd_as(None):
+            src, err = resolve_in(
+                self.env_for(stub, XDG_CONFIG_HOME=P["config_home"]))
+        self.assertIn("zstandard not installed -- archive skipped", err)
+        self.assertEqual(src["archive_label"], "Terminus")
+
+    def test_a_terminus_that_failed_is_not_named(self):
+        src, err = resolve_in(self.env_for(tm_store(fail="sessions")),
+                              archive=P["backup"])
+        self.assertEqual(src["archive_label"], "archive: backup")
+        self.assertEqual(src["plain"]["archive_label"], "archive: backup")
+        self.assertEqual(len([x for x in err.splitlines()
+                              if x.startswith("warning:")]), 1)
+
+
+def payload_sans_generated(out):
+    d = payload(out)
+    d.pop("generated")
+    return d
+
+
+class TestTerminusFailure(unittest.TestCase):
+    """D-10/D-11, AC4: any Terminus failure is one burnrate warning and a run
+    exactly like one without Terminus, and none of the stub's stderr shows."""
+
+    def go(self, stub, args=()):
+        c = tempfile.mkdtemp(dir=TMP)
+        proc, out = run(args, env=stub.env(XDG_CACHE_HOME=c))
+        return proc, out, c
+
+    def warnings(self, proc):
+        return [x for x in proc.stderr.splitlines() if x.startswith("warning:")]
+
+    def test_the_payload_equals_a_run_without_terminus_in_every_case(self):
+        proc, out = run(env=base_env(XDG_CACHE_HOME=tempfile.mkdtemp(dir=TMP)))
+        self.assertEqual(self.warnings(proc), [])
+        want = payload_sans_generated(out)
+        self.assertFalse(want["archive_used"])
+
+        def short():
+            st = tm_store()
+            st.entry(TM_KEYS[2])["short_by"] = 5
+            st.save()
+            return st
+
+        def gone():
+            st = tm_store()
+            st.entry(TM_KEYS[1])["no_frame"] = True
+            st.save()
+            return st
+
+        silent = [("--no-archive", tm_store(), ["--no-archive"]),
+                  ("1.9.0", tm_store(version="1.9.0"), []),
+                  ("unparsed version", tm_store(version="Terminus 3.1"), [])]
+        loud = [("version exit", tm_store(fail="version"), []),
+                ("sessions exit", tm_store(fail="sessions"), []),
+                ("export exit", tm_store(fail="export"), []),
+                ("ok false", tm_store(not_ok=True), []),
+                ("bad json", tm_store(bad_json=True), []),
+                ("short frame", short(), []),
+                ("no frame", gone(), [])]
+        for name, stub, args in silent + loud:
+            with self.subTest(name):
+                proc, out, _ = self.go(stub, args)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                warns = self.warnings(proc)
+                if (name, stub, args) in silent:
+                    self.assertEqual(warns, [])
+                else:
+                    self.assertEqual(len(warns), 1, proc.stderr)
+                    self.assertIn("terminus", warns[0].lower())
+                self.assertNotIn(STUB_MARKER, proc.stdout + proc.stderr)
+                self.assertEqual(payload_sans_generated(out), want)
+
+    def test_a_failed_run_leaves_the_terminus_cache_for_the_next_one(self):
+        stub = tm_store()
+        stub.add(TM_SOLO, "tm-two.jsonl", [tm_msg("tm-two-0", 3000)])
+        stub.save()
+        c = tempfile.mkdtemp(dir=TMP)
+        cdir = os.path.join(c, "burnrate")
+        two = ["tm-two.jsonl"]
+
+        def go(**top):
+            stub.data.update(top)
+            stub.save()
+            return run(env=stub.env(XDG_CACHE_HOME=c))
+
+        def cached():
+            out = {}
+            for f in os.listdir(cdir):
+                with open(os.path.join(cdir, f), "rb") as fh:
+                    out[f] = fh.read()
+            return out
+
+        proc, _ = go()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(stub.exports(), [TM_KEYS + two])
+        before = cached()
+        self.assertEqual(len(before), 1)
+        stub.entry("tm-two.jsonl")["lines"].append(tm_msg("tm-two-1", 111))
+        proc, out = go(fail="export")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.warnings(proc)), 1, proc.stderr)
+        self.assertEqual(total_be(payload(out)), EXP["total_be"])
+        after = cached()
+        for f, body in before.items():
+            self.assertEqual(after[f], body)
+        stub.data.pop("fail")
+        proc, out = go()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.warnings(proc), [])
+        self.assertEqual(stub.exports()[-1], two)
+        self.assertEqual(len(stub.exports()), 3)
+        self.assertEqual(total_be(payload(out)),
+                         EXP["total_be"] + TM_BE + 3000 + 111)
+
+    def test_a_terminus_with_no_store_is_taken_as_absent(self):
+        stub = tm_store()
+        c = tempfile.mkdtemp(dir=TMP)
+        cdir = os.path.join(c, "burnrate")
+
+        def cached():
+            out = {}
+            for f in os.listdir(cdir):
+                with open(os.path.join(cdir, f), "rb") as fh:
+                    out[f] = fh.read()
+            return out
+
+        proc, _ = run(env=stub.env(XDG_CACHE_HOME=c))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        before = cached()
+        _, bare = run(env=base_env(XDG_CACHE_HOME=tempfile.mkdtemp(dir=TMP)))
+        stub.data["no_store"] = True
+        stub.save()
+        proc, out = run(env=stub.env(XDG_CACHE_HOME=c))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        warns = self.warnings(proc)
+        self.assertEqual(len(warns), 1, proc.stderr)
+        self.assertIn("terminus", warns[0].lower())
+        self.assertNotIn(STUB_MARKER, proc.stdout + proc.stderr)
+        self.assertEqual(payload_sans_generated(out),
+                         payload_sans_generated(bare))
+        for f, body in before.items():
+            self.assertEqual(cached()[f], body)
+
+    def test_an_empty_list_with_no_reason_is_a_real_empty_list(self):
+        proc, out, _ = self.go(StubTerminus())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.warnings(proc), [])
+        self.assertEqual(payload(out)["archive_label"], "Terminus")
+
+
+BACKUP = "/home/erin/backup/proj"
+LIVE_SUB = "p0-sess-0/subagents/agent-t1.jsonl"
+
+
+def live_stub(stub=None, evicted=False):
+    """A stub holding a main the live tree already has and one subagent of it
+    only Terminus has, evicted or not. Passed a stub, it rewrites that one."""
+    lines = [tm_msg("t1-0", 7000, API)]
+    if stub is None:
+        stub = StubTerminus([(API, "p0-sess-0.jsonl", []),
+                             (API, LIVE_SUB, lines)])
+    stub.entry(LIVE_SUB)["evicted"] = evicted
+    stub.save()
+    return stub
+
+
+class TestTerminusEvicted(unittest.TestCase):
+    """D-03, AC5: an evicted session is never exported, and the record burnrate
+    already cached for it stays in the payload."""
+
+    def go(self, stub, c, args=()):
+        proc, out = run(args, env=stub.env(XDG_CACHE_HOME=c))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return payload(out)
+
+    def evict(self, stub, keys):
+        for k in keys:
+            stub.entry(k)["evicted"] = True
+        stub.save()
+
+    def test_a_cached_session_keeps_its_usage_once_it_is_evicted(self):
+        stub, c = tm_store(), tempfile.mkdtemp(dir=TMP)
+        self.assertEqual(total_be(self.go(stub, c)),
+                         EXP["total_be"] + TM_BE)
+        n = len(stub.exports())
+        for k in TM_KEYS:
+            stub.entry(k)["evicted"] = True
+            stub.entry(k)["lines"] = []
+        stub.save()
+        for _ in range(2):
+            self.assertEqual(total_be(self.go(stub, c)),
+                             EXP["total_be"] + TM_BE)
+            self.assertEqual([k for keys in stub.exports()[n:]
+                              for k in keys], [])
+
+    def test_a_session_evicted_the_first_time_it_is_seen_is_absent(self):
+        # every one of its files is evicted and nothing is cached
+        stub = tm_store()
+        self.evict(stub, TM_KEYS)
+        data = self.go(stub, tempfile.mkdtemp(dir=TMP))
+        self.assertEqual(total_be(data), EXP["total_be"])
+        self.assertNotIn("proj", [p["id"] for p in data["projects"]])
+        self.assertEqual(stub.exports(), [])
+
+    def test_one_evicted_file_leaves_the_rest_of_its_session_in(self):
+        stub = tm_store()
+        self.evict(stub, [TM_KEYS[1]])
+        data = self.go(stub, tempfile.mkdtemp(dir=TMP))
+        self.assertEqual(total_be(data), EXP["total_be"] + 5000 + 5001 + 5200)
+        self.assertEqual(stub.exports(), [[TM_KEYS[0], TM_KEYS[2]]])
+
+    def test_an_evicted_main_keeps_its_rows_and_what_only_a_main_carries(self):
+        stub, c = tm_store(), tempfile.mkdtemp(dir=TMP)
+        stub.entry(TM_KEYS[0])["lines"][0].update(
+            slug="tm-slug", gitBranch="tm-branch")
+        stub.entry(TM_KEYS[0])["lines"].insert(
+            0, {"type": "ai-title", "uuid": "tm-title", "aiTitle": "Kept",
+                "timestamp": "2026-03-05T11:00:00Z"})
+        stub.save()
+        before = payload_sans_generated(
+            run(env=stub.env(XDG_CACHE_HOME=c))[1])
+        self.assertEqual(total_be(before), EXP["total_be"] + TM_BE)
+        self.evict(stub, [TM_KEYS[0]])
+        stub.entry(TM_KEYS[0])["lines"] = []
+        stub.save()
+        proc, out = run(env=stub.env(XDG_CACHE_HOME=c))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(payload_sans_generated(out), before)
+        self.assertEqual(stub.exports()[1:], [TM_KEYS[1:]])
+
+    def test_a_live_main_stays_when_a_terminus_only_subagent_is_evicted(self):
+        stub = live_stub(evicted=True)
+        data = self.go(stub, tempfile.mkdtemp(dir=TMP))
+        self.assertEqual(total_be(data), EXP["total_be"])
+        self.assertEqual(stub.exports(), [])
+
+    def test_a_live_main_grows_beside_its_evicted_subagents_cached_rows(self):
+        root = os.path.join(tempfile.mkdtemp(dir=TMP), "projects")
+        shutil.copytree(P["primary"], root)
+        stub, c = live_stub(), tempfile.mkdtemp(dir=TMP)
+        self.assertEqual(total_be(self.go(stub, c, ["--root", root])),
+                         EXP["total_be"] + 7000)
+        live_stub(stub, evicted=True)
+        main = os.path.join(root, "-home-alice-work-api", "p0-sess-0.jsonl")
+        with open(main, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(tm_msg("p0-grown", 300, API)) + "\n")
+        data = self.go(stub, c, ["--root", root])
+        self.assertEqual(total_be(data), EXP["total_be"] + 7000 + 300)
+        self.assertEqual(stub.exports(), [[LIVE_SUB]])
+        cdir = os.path.join(c, "burnrate")
+        (name,) = os.listdir(cdir)
+        with gzip.open(os.path.join(cdir, name), "rt", encoding="utf-8") as fh:
+            rec = json.load(fh)["sessions"][
+                "-home-alice-work-api/p0-sess-0"]["rec"]
+        self.assertEqual(rec["agents"]["agent-t1"], "unresolved")
+        self.assertEqual({(r[0], r[4]) for r in rec["rows"]
+                          if r[0] in ("t1-0", "p0-grown")},
+                         {("t1-0", "agent-t1"), ("p0-grown", "")})
+
+    def test_an_archive_main_stays_when_a_terminus_only_subagent_is_evicted(self):
+        stub = StubTerminus([
+            (BACKUP, "bk-sess-0.jsonl", []),
+            (BACKUP, "bk-sess-0/subagents/agent-t1.jsonl",
+             [tm_msg("bk-t1", 7000, BACKUP)])],
+            per={"bk-sess-0/subagents/agent-t1.jsonl": {"evicted": True}})
+        data = self.go(stub, tempfile.mkdtemp(dir=TMP),
+                       ["--archive", P["backup"]])
+        self.assertEqual(total_be(data),
+                         EXP["total_be"] + EXP["backup"]["be"])
+
+    def test_a_vanished_session_that_was_not_evicted_still_drops_out(self):
+        stub, c = tm_store(), tempfile.mkdtemp(dir=TMP)
+        self.go(stub, c)
+        stub.data["entries"] = [e for e in stub.data["entries"]
+                                if not e["session_key"].startswith("tm-sess-0")]
+        stub.save()
+        self.assertEqual(total_be(self.go(stub, c)), EXP["total_be"])
+
+    def test_an_evicted_copy_of_a_live_file_changes_nothing(self):
+        stub = tm_store()
+        self.evict(stub, ["p0-sess-0.jsonl", "p0-sess-0/subagents/agent-1.jsonl"])
+        data = self.go(stub, tempfile.mkdtemp(dir=TMP))
+        self.assertEqual(total_be(data), EXP["total_be"] + TM_BE)
+        self.assertEqual(
+            next(p["be"] for p in data["projects"]
+                 if p["id"] == "home/alice/work/api"),
+            EXP["label_be"]["home/alice/work/api"])
+        self.assertEqual(stub.exports(), [TM_KEYS])
 
 
 if __name__ == "__main__":

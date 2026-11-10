@@ -67,9 +67,9 @@ PROBE_EFFORT = {
     "probe_tokyo_rollover": "probe-roll",
 }
 
-# Rate-limit logger samples: (ts, five_hour, seven_day), written literally as
-# the shipped wrapper writes them -- one JSON object per line whose percentages
-# are SCALARS. Spread over TWO days so the fixture exercises both the viewer's
+# Rate-limit logger samples: (ts, seven_day), written literally as the
+# shipped wrapper writes them -- one JSON object per line whose percentage is
+# a SCALAR. Spread over TWO days so the fixture exercises both the viewer's
 # rl.length > 1 card gate and lineChart's refusal below two points.
 #
 # Every sample sits in a midday-UTC band on purpose. The viewer buckets rl
@@ -79,10 +79,10 @@ PROBE_EFFORT = {
 # days in the two bucketings, collapsing the day set to one on some machines and
 # not others. 12:00Z-15:00Z is outside that hazard for every real offset.
 RL_SAMPLES = [
-    ("2026-03-01T12:00:00Z", 10, 30),
-    ("2026-03-01T13:00:00Z", 15.5, 31),
-    ("2026-03-02T12:00:00Z", 20, 32.25),
-    ("2026-03-02T13:00:00Z", 25, 33),
+    ("2026-03-01T12:00:00Z", 30),
+    ("2026-03-01T13:00:00Z", 31),
+    ("2026-03-02T12:00:00Z", 32.25),
+    ("2026-03-02T13:00:00Z", 33),
 ]
 
 # Carries all three script-data breakout vectors in one string: "</script>"
@@ -197,6 +197,7 @@ def build(root):
     arch = os.path.join(root, "hindsight", "archive")
 
     label_be, msgs, slugs = {}, 0, []
+    plan_be = 0.0   # what the /plan segment holds: p0's first session + agent-1
 
     for idx, (cwd, dirname, label, base) in enumerate(PRIMARY):
         slug = f"p{idx}"
@@ -215,6 +216,8 @@ def build(root):
                 ]
         be, n = live_project(primary, cwd, dirname, slug, base, 1 + idx % 5,
                              extras=extras)
+        if idx == 0:
+            plan_be += sum(base + mi + BE_EXTRA for mi in range(3))
         label_be[label] = label_be.get(label, 0.0) + be
         msgs += n
 
@@ -228,6 +231,7 @@ def build(root):
               encoding="utf-8") as fh:
         json.dump({"agentType": "cad-executor"}, fh)
     label_be[PRIMARY[0][2]] += 900 + BE_EXTRA
+    plan_be += 900 + BE_EXTRA
     msgs += 1
 
     # the three timezone probes, carried by the 'web' project so each probe row
@@ -242,17 +246,17 @@ def build(root):
         msgs += 1
     write_lines(os.path.join(web_dir, "probes-sess.jsonl"), rows)
 
+    primary_be = sum(label_be.values())
+
     # rate-limit logger samples, beside the primary tree, in exactly the record
-    # extras/usage_logger.sh writes: SCALAR percentages, not nested objects.
+    # extras/usage_logger.sh writes: a SCALAR percentage, not a nested object.
     rl = os.path.join(home, ".claude", "usage-logger", "usage-log.jsonl")
     os.makedirs(os.path.dirname(rl), exist_ok=True)
     with open(rl, "w", encoding="utf-8") as fh:
-        for i, (when, five, seven) in enumerate(RL_SAMPLES):
+        for i, (when, seven) in enumerate(RL_SAMPLES):
             fh.write(json.dumps({
                 "ts": when,
-                "five_hour": five,
                 "seven_day": seven,
-                "resets5": 1772380800 + i,
                 "resets7": 1772985600 + i,
                 "session_id": f"rl-sess-{i}",
                 "model": "Sonnet 4.6"}) + "\n")
@@ -282,6 +286,10 @@ def build(root):
         "labels": sorted(label_be),
         "label_be": {k: round(v) for k, v in label_be.items()},
         "total_be": round(sum(label_be.values())),
+        # billed-equiv by command over the primary tree: p0's first session and
+        # its agent-1 sit inside the typed /plan segment, everything else is
+        # conversation
+        "cmd_be": {"plan": round(plan_be), "": round(primary_be - plan_be)},
         "messages": msgs,
         # every message reads CRD from cache and writes CC; input is what
         # billed-equiv leaves once the fixed BE_EXTRA is taken off
@@ -298,10 +306,10 @@ def build(root):
         "backup": {"label": "proj", "be": round(bk_be)},
         "archive": {"label": "thing", "be": round(arch_be)},
         "rl_samples": len(RL_SAMPLES),
-        # what read_rl_log must produce from the file above: [epoch, five,
-        # seven], ascending. Written from the literals rather than through the
+        # what read_rl_log must produce from the file above: [epoch,
+        # seven_day], ascending. Written from the literals rather than through the
         # reader, so a reader that drops or reshapes a field fails here.
-        "rl_rows": sorted([int(epoch(w)), f, s] for w, f, s in RL_SAMPLES),
+        "rl_rows": sorted([int(epoch(w)), s] for w, s in RL_SAMPLES),
         "zstd": zstd is not None,
         "probe_efforts": PROBE_EFFORT,
         "probe_days": PROBE_DAYS,

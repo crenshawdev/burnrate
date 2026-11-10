@@ -9,6 +9,11 @@ emits one self-contained HTML dashboard whose date-range and project filters run
 entirely client-side. Re-runs only parse sessions whose files changed, so "on
 demand" stays fast.
 
+When a `terminus` 2.0.0 or later is on the PATH it is read too, through its
+read-only commands only. The live copy of a file wins; Terminus supplies the
+files the live tree no longer has. A file it has evicted keeps the usage the
+cache holds for it, and a rebuild drops only that usage, not the whole session.
+
 What it measures (per assistant message, deduped globally by .message.id):
     input / cache-write (5m and 1h split) / cache-read / output tokens
     billed-equivalent = input + 1.25*cache_write_5m + 2*cache_write_1h
@@ -18,17 +23,15 @@ What it measures (per assistant message, deduped globally by .message.id):
 
 What it reconstructs:
     - daily burn at (day x project x command x model x effort x main|agent) grain
-    - 5-hour rate-limit blocks, account-wide: a block opens at the top of the
-      hour of the first activity after the previous block expires (matches how
-      resets_at lands on the hour) and lasts 5h
     - per-session summaries: peak context, compactions, interrupts, agents
     - the rate-limit logger's samples (extras/usage_logger.sh), when installed
 
-Attribution: a slash command the user typed, or a skill the model invoked,
-opens a segment that stays open until the user's next typed prompt or the next
-command; a subagent attaches to the segment open at its first timestamp.
-Built-ins like /clear and /model change a setting rather than do work, so they
-open none.
+Attribution: a message Claude Code stamped with the skill it ran is filed under
+that skill. A message without a stamp falls back to the segment rule: a slash
+command the user typed, or a skill the model invoked, opens a segment that stays
+open until the user's next typed prompt or the next command, and a subagent
+message attaches to the segment open at its agent's first timestamp. Built-ins
+like /clear and /model change a setting rather than do work, so they open none.
 
 Stdlib + zstandard (archive only). The parse cache is one gzipped file per
 source set under the platform's cache directory: $XDG_CACHE_HOME/burnrate
@@ -48,13 +51,13 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 import webbrowser
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
 CW5, CW1H, CR = 1.25, 2.00, 0.10
-BLOCK_H = 5 * 3600
-CACHE_VER = 3
+CACHE_VER = 4
 
 CMD_RE = re.compile(r"<command-name>/?([A-Za-z0-9:_.-]+)</command-name>")
 NAME_RE = re.compile(r"[A-Za-z0-9:_.-]+")
@@ -125,6 +128,217 @@ def hindsight_archive(env=None):
     except OSError:
         pass
     return None
+
+
+# the source entry standing for terminus in a sources list. cache_path hashes it
+# as written and discover never walks it: it names no directory, and a relative
+# token realpath'd against the cwd would fork the cache per directory
+TERMINUS_SOURCE = "terminus"
+TERMINUS_WAIT = 120   # seconds a short terminus call gets before it is dropped
+
+
+class TerminusError(Exception):
+    """terminus failed: a call that can't run or exits non-zero, a list that is
+    not ok, or an export stream that did not frame. The message is burnrate's
+    own short account; terminus's stderr never goes into it."""
+
+
+def terminus_warn(why):
+    """The one line a failed terminus costs the run (D-10), printed even under
+    --quiet the way the zstandard warnings are. Never terminus's own stderr."""
+    print(f"warning: terminus failed ({why}) -- continuing without it",
+          file=sys.stderr)
+
+
+def env_get(env, name, platform):
+    """env[name], matched case-insensitively on win32 where PATH may be Path."""
+    if name in env:
+        return env[name]
+    if platform == "win32":
+        for k, v in env.items():
+            if k.upper() == name:
+                return v
+    return None
+
+
+def find_terminus(env, platform=None):
+    """The absolute path of a `terminus` on env's PATH, or None.
+
+    Only env is searched, never the process's own PATH. An empty or relative
+    PATH entry is skipped and the cwd is never tried: /burnrate runs from
+    whatever project Claude Code was opened in, and a `terminus` file sitting
+    there must not execute. On win32 each PATHEXT extension is tried too; on
+    POSIX the file needs its execute bit."""
+    platform = sys.platform if platform is None else platform
+    win = platform == "win32"
+    path = env_get(env, "PATH", platform)
+    if not path:
+        return None
+    exts = [""]
+    if win:
+        pathext = env_get(env, "PATHEXT", platform) or ".COM;.EXE;.BAT;.CMD"
+        exts += [e for e in pathext.split(";") if e]
+    for d in path.split(";" if win else ":"):
+        d = d.strip('"') if win else d
+        if not d or not os.path.isabs(d):
+            continue
+        for ext in exts:
+            cand = os.path.join(d, "terminus" + ext)
+            if os.path.isfile(cand) and (win or os.access(cand, os.X_OK)):
+                return cand
+    return None
+
+
+def terminus_out(exe, argv, env):
+    """stdout of one read-only terminus call; TerminusError when it can't start,
+    runs past TERMINUS_WAIT or exits non-zero. Every terminus call is an argv
+    list with no shell, under the caller's env. Its stderr is captured and
+    dropped (it carries a transcript-privacy notice and a line per miss) and its
+    output is decoded as UTF-8, never by locale."""
+    try:
+        p = subprocess.run([exe, *argv], env=env, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=TERMINUS_WAIT)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise TerminusError(f"{argv[0]} can't run: {e.__class__.__name__}")
+    if p.returncode != 0:
+        raise TerminusError(f"{argv[0]} exited {p.returncode}")
+    return p.stdout.decode("utf-8", "replace")
+
+
+def terminus_usable(exe, env):
+    """True when `exe --version` prints MAJOR.MINOR.PATCH and it is 2.0.0 or
+    later. A binary that can't answer is a TerminusError, an answer that isn't
+    a version is just False. An older build might read `export --stdout` as
+    `export <dir>` and write its whole archive to disk; anything that isn't a
+    bare version is some other program called terminus."""
+    out = terminus_out(exe, ["--version"], env)
+    m = re.fullmatch(r"([0-9]+)\.([0-9]+)\.([0-9]+)", out.strip())
+    return bool(m) and tuple(int(g) for g in m.groups()) >= (2, 0, 0)
+
+
+KEY_BAD_RE = re.compile(r"[\\\x00-\x1f\x7f]")
+
+
+def terminus_key_parts(key):
+    """(sid, unit) for a session_key of one of the three shapes terminus files
+    a transcript under, else None. `unit` is None for a main:
+
+        <sid>.jsonl
+        <sid>/subagents/agent-<id>.jsonl
+        <sid>/subagents/workflows/wf_<id>/agent-<id>.jsonl
+
+    Anything else (a journal.jsonl, a sidecar) is no transcript. The key goes
+    on to a stdin line and into a path, so a backslash, a control character, an
+    empty segment or a "." or ".." segment rules it out; so does text that
+    can't be written as UTF-8. Real sids are uuids but nothing here needs that."""
+    if not isinstance(key, str):
+        return None
+    try:
+        key.encode("utf-8")
+    except UnicodeError:
+        return None
+    parts = key.split("/")
+    if any(p in ("", ".", "..") or KEY_BAD_RE.search(p) for p in parts):
+        return None
+
+    def agent(name):
+        return (name[:-6] if name.startswith("agent-")
+                and name.endswith(".jsonl") else None)
+
+    n = len(parts)
+    if n == 1 and parts[0].endswith(".jsonl"):
+        sid = parts[0][:-6]
+        return (sid, None) if sid not in ("", ".", "..") else None
+    if n == 3 and parts[1] == "subagents" and agent(parts[2]):
+        return parts[0], agent(parts[2])
+    if (n == 5 and parts[1] == "subagents" and parts[2] == "workflows"
+            and parts[3].startswith("wf_") and agent(parts[4])):
+        return parts[0], agent(parts[4])
+    return None
+
+
+def terminus_sessions(entries):
+    """{(proj, sid): {"main": (key, watermark, evicted), "subs": [(unit, key,
+    watermark, evicted)]}} from the list's entries, keyed the way the live tree
+    is.
+
+    `proj` is Claude Code's folder-name encoding (every character outside
+    ASCII letters and digits becomes "-") of the main's launch directory. That
+    is project_pre_worktree when the main has one: terminus files a session
+    started in a worktree under its parent project, the live tree files it under
+    the worktree, and encoding `project` would read the same session twice. It
+    isn't always a worktree, though, so `alt` keeps `project`'s encoding and
+    discovery takes whichever one the live tree already has the session under. A
+    subagent attaches to its main by sid, never by its own `project`. A main
+    with no project is dropped with whatever hangs off it, and so is a subagent
+    with no main."""
+    mains, subs = {}, defaultdict(dict)
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        key, wm = e.get("session_key"), e.get("watermark")
+        parts = terminus_key_parts(key)
+        if (parts is None or not isinstance(wm, int) or isinstance(wm, bool)
+                or wm < 0):
+            continue
+        sid, unit = parts
+        ev = bool(e.get("evicted"))
+        if unit is None:
+            mains[sid] = (e, key, wm, ev)
+        else:
+            subs[sid][key] = (unit, key, wm, ev)
+    out = {}
+    for sid, (e, key, wm, ev) in mains.items():
+        project = e.get("project")
+        if not isinstance(project, str) or not project:
+            continue
+        launch = e.get("project_pre_worktree")
+        if not isinstance(launch, str) or not launch:
+            launch = project
+        out[(re.sub(r"[^A-Za-z0-9]", "-", launch), sid)] = {
+            "main": (key, wm, ev),
+            "subs": sorted(subs.get(sid, {}).values()),
+            "alt": re.sub(r"[^A-Za-z0-9]", "-", project)}
+    return out
+
+
+def open_terminus(env):
+    """{"exe", "env", "sessions"} for a usable terminus on env's PATH, else None.
+
+    The list is asked for once, here, so a terminus that can't answer drops out
+    before the cache file is chosen. It is always `--project '*'`: without it
+    terminus scopes the list to the cwd's project. A version that is old or
+    isn't one is the silent not-installed case; any failure past that, or a
+    list that is empty because terminus holds no store, is one warning and the
+    run goes on without terminus (D-10)."""
+    exe = find_terminus(env)
+    if not exe:
+        return None
+    try:
+        if not terminus_usable(exe, env):
+            return None
+        out = terminus_out(exe, ["sessions", "--project", "*", "--json"], env)
+        try:
+            d = json.loads(out)
+            entries = d["data"]["sessions"]
+            ok = d["ok"] is True
+        except (TypeError, ValueError, KeyError):
+            raise TerminusError("the session list didn't parse")
+        if not ok:
+            raise TerminusError("the session list says ok: false")
+        if not isinstance(entries, list):
+            raise TerminusError("the session list isn't a list")
+        if not entries and d.get("reason"):
+            # no store at all is ok: true, an empty list and a reason, not an
+            # error. Taken as a real empty list it would overwrite the terminus
+            # cache file with a run that has no terminus-only session. The
+            # reason text is terminus's own and is never printed.
+            raise TerminusError("terminus has no store")
+    except TerminusError as e:
+        terminus_warn(e)
+        return None
+    return {"exe": exe, "env": env, "sessions": terminus_sessions(entries)}
 
 
 def file_uri(path, flavour=None):
@@ -333,14 +547,25 @@ def resolve_sources(args, env=None):
         # cache file -- each run overwriting the last one's sessions.
         sources.insert(0, ("live", root))
     # by PATH, not by source count: a mixed root contributes two sources and
-    # no archive at all, and a dropped arch source contributes neither
+    # no archive at all, and a dropped arch source contributes neither. The
+    # label names only what survived the drop above.
     used = any(p != root for _k, p in sources)
     if not used:
         label = None
+    # what the run is without terminus: what a failed terminus falls back to
+    plain = {"sources": sources, "archive_label": label, "archive_used": used}
+    # alongside whatever archive was chosen above, never instead of it, and
+    # named without a path: a report must not embed the user's directory tree
+    terminus = None if no_archive else open_terminus(env)
+    if terminus:
+        sources = sources + [("terminus", TERMINUS_SOURCE)]
+        label = f"{label} + Terminus" if label else "Terminus"
+        used = True
     return {"root": root, "config_dir": config_dir,
             "rl_log": os.path.join(config_dir, "usage-logger",
                                    "usage-log.jsonl"),
-            "sources": sources, "archive_label": label, "archive_used": used}
+            "sources": sources, "archive_label": label, "archive_used": used,
+            "terminus": terminus, "plain": plain}
 
 
 def path_segments(p):
@@ -486,13 +711,140 @@ def arch_lines(unit_dir):
             continue
 
 
-def iters_for(specs):
-    return [live_lines(p) if k == "live" else arch_lines(p) for k, p in specs]
+class TerminusExport:
+    """One `terminus export --stdout` run, read as frames: a header line
+    {"terminus": {"project", "session_key", "watermark"}} and then exactly
+    `watermark` bytes of transcript JSONL, nothing between frames.
+
+    Keys go in on stdin from a temp file, never a pipe burnrate itself writes:
+    a cold run sends thousands, which is past the OS pipe buffer, and writing
+    them all before reading any output deadlocks against an export that streams
+    while it reads. Frames come back in stdin order, and a key terminus doesn't
+    hold gets no frame and still exits 0, so the header's session_key is checked
+    against the key expected next. lines(key) is the generator parse_session
+    hands scan_unit; it reads the body in chunks as the pipe streams and never
+    holds more than one line past a chunk.
+
+    The stream didn't frame -- TerminusError, with the process killed first --
+    on a header for another key, an evicted header (no body follows it, so
+    reading `watermark` bytes would swallow the next frame), a cut-short body,
+    bytes after the last frame, or a non-zero exit. A killed process matters: one
+    with output left blocks writing into a full stdout pipe and a bare wait never
+    returns. Its stderr is discarded, so it can't fill a pipe nobody reads and
+    none of it reaches the run's output."""
+
+    def __init__(self, handle, keys):
+        self.keys, self.at, self.left, self.marks = keys, 0, 0, {}
+        self.feed = tempfile.TemporaryFile()
+        try:
+            self.feed.write("".join(k + "\n" for k in keys).encode("utf-8"))
+            self.feed.flush()
+            self.feed.seek(0)
+            self.proc = subprocess.Popen(
+                [handle["exe"], "export", "--stdout"], env=handle["env"],
+                stdin=self.feed, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL)
+        except OSError as e:
+            self.feed.close()
+            raise TerminusError(f"can't start terminus ({e.__class__.__name__})")
+
+    def close(self):
+        if self.proc.poll() is None:
+            self.proc.kill()
+        try:
+            self.proc.stdout.close()
+        except OSError:
+            pass
+        self.proc.wait()
+        self.feed.close()
+
+    def fail(self, why):
+        self.close()
+        raise TerminusError(why)
+
+    def _drain(self):
+        while self.left:
+            block = self.proc.stdout.read(min(self.left, 1 << 20))
+            if not block:
+                self.fail("a frame body was cut short")
+            self.left -= len(block)
+
+    def _open(self, key):
+        self._drain()
+        if self.at >= len(self.keys) or self.keys[self.at] != key:
+            self.fail("frames asked for out of the order they were requested")
+        line = self.proc.stdout.readline(1 << 16)
+        if not line.endswith(b"\n"):
+            self.fail(f"no frame header for {key!r}")
+        try:
+            top = json.loads(line)
+            hdr = top["terminus"]
+            got, wm = hdr["session_key"], hdr["watermark"]
+        except (ValueError, TypeError, KeyError):
+            self.fail(f"unreadable frame header for {key!r}")
+        if got != key:
+            self.fail(f"frame for {str(got)[:80]!r} where {key!r} was next")
+        if hdr.get("evicted") or top.get("evicted"):
+            self.fail(f"{key!r} came back evicted")
+        if not isinstance(wm, int) or isinstance(wm, bool) or wm < 0:
+            self.fail(f"bad watermark in the frame header for {key!r}")
+        self.at += 1
+        self.left = wm
+        self.marks[key] = wm
+
+    def lines(self, key):
+        self._open(key)
+        buf = b""
+        while self.left:
+            block = self.proc.stdout.read(min(self.left, 1 << 20))
+            if not block:
+                self.fail("a frame body was cut short")
+            self.left -= len(block)
+            buf += block
+            *whole, buf = buf.split(b"\n")
+            for line in whole:
+                if line:
+                    yield line.decode("utf-8", "replace")
+        if buf:
+            yield buf.decode("utf-8", "replace")
+
+    def finish(self):
+        """After the last frame was read: nothing more may follow it, and the
+        export has to have exited 0."""
+        self._drain()
+        if self.at != len(self.keys):
+            self.fail("fewer frames than keys")
+        if self.proc.stdout.read(1):
+            self.fail("bytes after the last frame")
+        if self.proc.wait() != 0:
+            self.fail("the export exited non-zero")
+        self.close()
+
+
+def iters_for(specs, export=None):
+    return [live_lines(p) if k == "live" else
+            export.lines(p[0]) if k == "terminus" else arch_lines(p)
+            for k, p in specs]
 
 
 # ---------------------------------------------------------------- discovery
 
-def _discover_live(live_root, sessions):
+def _read_meta(meta_p, s, key):
+    """The agentType in a live agent-*.meta.json, filed under `key`."""
+    if os.path.exists(meta_p):
+        try:
+            with open(meta_p, "r", encoding="utf-8") as mf:
+                at = (json.load(mf) or {}).get("agentType")
+            if at:
+                s["meta"][key] = at
+        except Exception:
+            pass
+
+
+def _discover_live(live_root, sessions, seen=None):
+    """`seen`, when given, collects (proj, session_key) for every file found: the
+    key terminus names the same file by, so discover can tell what the live
+    tree already has without building a path from terminus's data."""
     for proj_dir in sorted(dglob(live_root, "*")):
         if not os.path.isdir(proj_dir):
             continue
@@ -502,6 +854,8 @@ def _discover_live(live_root, sessions):
             s = sessions[proj][sid]
             if ("live", main_path) not in s["main"]:
                 s["main"].append(("live", main_path))
+            if seen is not None:
+                seen.add((proj, sid + ".jsonl"))
             sub_root = os.path.join(proj_dir, sid, "subagents")
             for ap in (dglob(sub_root, "agent-*.jsonl")
                        + dglob(sub_root, "workflows", "wf_*",
@@ -509,15 +863,10 @@ def _discover_live(live_root, sessions):
                 key = os.path.basename(ap)[:-6]
                 if ("live", ap) not in s["subs"][key]:
                     s["subs"][key].append(("live", ap))
-                meta_p = ap[:-6] + ".meta.json"
-                if os.path.exists(meta_p):
-                    try:
-                        with open(meta_p, "r", encoding="utf-8") as mf:
-                            at = (json.load(mf) or {}).get("agentType")
-                        if at:
-                            s["meta"][key] = at
-                    except Exception:
-                        pass
+                if seen is not None:
+                    rel = os.path.relpath(ap, sub_root).replace(os.sep, "/")
+                    seen.add((proj, f"{sid}/subagents/{rel}"))
+                _read_meta(ap[:-6] + ".meta.json", s, key)
 
 
 def _discover_arch(arch_root, sessions):
@@ -551,16 +900,62 @@ def _discover_arch(arch_root, sessions):
                     s["subs"][key].append(spec)
 
 
-def discover(sources):
+def _discover_terminus(tsessions, root, seen, sessions):
+    """Add the files terminus has and the root's live tree doesn't. Live wins per
+    file: a file joins a session only when the live walk found nothing at its
+    proj and key. A subagent read from terminus has no agentType of its own; a
+    live .meta.json where its file would sit under the root still names it.
+    A file terminus supplies that it marks evicted is not added at all: its unit
+    ("" for the main, the subagent key otherwise) goes into the session's
+    `evicted` set instead, so it is never exported or parsed and the rest of the
+    session reads as usual (D-03). A file the live tree has never gets that far."""
+    for (proj, sid), t in sorted(tsessions.items()):
+        files = [(None, *t["main"])] + t["subs"]
+        # project_pre_worktree isn't always where the live tree files a
+        # session; whichever folder already holds one of its files wins
+        alt = t.get("alt", proj)
+        if not any((proj, f[1]) in seen for f in files) \
+                and any((alt, f[1]) in seen for f in files):
+            proj = alt
+        s = None
+        for unit, key, wm, ev in files:
+            if (proj, key) in seen:
+                continue
+            if s is None:
+                s = sessions[proj][sid]
+            if ev:
+                s["evicted"].add(unit or "")
+                continue
+            spec = ("terminus", (key, wm))
+            if unit is None:
+                s["main"].append(spec)
+                continue
+            s["subs"][unit].append(spec)
+            if root and unit not in s["meta"]:
+                _read_meta(os.path.join(root, proj, *key[:-6].split("/"))
+                           + ".meta.json", s, unit)
+
+
+def discover(sources, terminus=None):
     """{proj_dir: {sid: {'main': [(kind,path)], 'subs': {key: [(kind,path)]},
                          'meta': {key: agentType}}}} merged across every
-    resolved source, primary first."""
+    resolved source, primary first. A terminus handle adds its sessions' files
+    as ('terminus', (session_key, watermark)) entries; 'evicted' is the set of
+    units ("" is the main) whose only terminus copy is evicted."""
     sessions = defaultdict(lambda: defaultdict(
-        lambda: {"main": [], "subs": defaultdict(list), "meta": {}}))
+        lambda: {"main": [], "subs": defaultdict(list), "meta": {},
+                 "evicted": set()}))
+    root = sources[0][1] if sources else None
+    seen = set()
     for layout, path in sources:
-        if not os.path.isdir(path):
+        if layout == "terminus" or not os.path.isdir(path):
             continue
-        (_discover_live if layout == "live" else _discover_arch)(path, sessions)
+        if layout == "live":
+            _discover_live(path, sessions, seen if path == root else None)
+        else:
+            _discover_arch(path, sessions)
+    if terminus:
+        _discover_terminus(terminus["sessions"], root, seen, sessions)
     return sessions
 
 
@@ -572,13 +967,22 @@ def session_sig(s):
     ~/.claude symlinked into a dotfiles checkout, a bind mount, a trailing
     separator from shell completion -- otherwise shares ONE cache file whose
     every entry each run rewrites under the other name's paths, so alternating
-    roots reparses the whole tree forever."""
-    files = []
+    roots reparses the whole tree forever.
+
+    Taken BEFORE the session is parsed: a file that grows during the read then
+    differs from its recorded signature and is read again next run."""
+    files, tfiles = [], []
     for kind, path in s["main"]:
+        if kind == "terminus":
+            tfiles.append(path)
+            continue
         files.extend([path] if kind == "live"
                      else sorted(dglob(path, "*.zst")))
     for specs in s["subs"].values():
         for kind, path in specs:
+            if kind == "terminus":
+                tfiles.append(path)
+                continue
             files.extend([path] if kind == "live"
                          else sorted(dglob(path, "*.zst")))
     sig = []
@@ -588,7 +992,20 @@ def session_sig(s):
             sig.append([f, int(st.st_mtime), st.st_size])
         except OSError:
             continue
+    # a terminus file is its (session_key, watermark); lists, not tuples, so the
+    # signature equals itself after the cache's JSON round trip
+    sig.extend(["terminus", key, wm] for key, wm in sorted(tfiles))
     return sig
+
+
+def with_marks(sig, marks):
+    """`sig` with each terminus watermark swapped for the one the export's frame
+    reported. When an ingest lands between the list and the export the frame
+    holds the newer bytes, and recording the list's number would export the
+    session again next run. Only the terminus entries change: the live and
+    archive half was taken before the parse and stays what it was then."""
+    return [["terminus", e[1], marks.get(e[1], e[2])] if e[0] == "terminus"
+            else e for e in sig]
 
 
 # ---------------------------------------------------------------- parsing
@@ -612,21 +1029,35 @@ def seg_name(d):
     return None
 
 
+def text_of(v):
+    """A stamp as written when it is a non-empty string, else ''. Transcript
+    fields are untrusted: a number or object where a name belongs is no name."""
+    return v if isinstance(v, str) and v else ""
+
+
+def count_of(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+
+
 def typed_by_user(d):
     """A prompt the user typed, pasted or accepted. Claude Code marks those
-    origin.kind == "human"; task notifications, hook feedback, SDK prompts and
-    ! shell input carry no such origin. Transcripts that predate the field
-    never end a segment early."""
+    turnOrigin == "human" or origin.kind == "human"; task notifications, hook
+    feedback, SDK prompts and ! shell input carry neither, and isMeta lines
+    never count. Lines carrying neither marker never end a segment early."""
     o = d.get("origin")
     return (d.get("type") == "user" and not d.get("isMeta")
-            and isinstance(o, dict) and o.get("kind") == "human")
+            and (d.get("turnOrigin") == "human"
+                 or (isinstance(o, dict) and o.get("kind") == "human")))
 
 
 def scan_unit(iters, unit, rec, want_meta):
     """Stream one logical file (live + archive generations). Appends usage rows
     and, for the main transcript, segments and session metadata. Dedupe within
-    the session: message rows by message.id, marker lines by uuid/value."""
-    rows, mids = rec["rows"], rec["_mids"]
+    the session: message rows by message.id, marker lines by uuid/value. A
+    message streams as several lines and the early ones are partials, so the
+    line with the largest output_tokens supplies the row's usage; on a tie the
+    first line stands."""
+    rows, byid = rec["rows"], rec["_byid"]
     marks = rec["_marks"]
     for it in iters:
         for line in it:
@@ -641,11 +1072,26 @@ def scan_unit(iters, unit, rec, want_meta):
                 or '"interruptedMessageId"' in line
                 or '"isApiErrorMessage":true' in line
                 or '"aiTitle"' in line)
-            if not (has_usage or is_seg or is_mark or is_local or is_prompt):
+            is_turn = want_meta and '"turn_duration"' in line
+            if not (has_usage or is_seg or is_mark or is_local or is_prompt
+                    or is_turn):
                 continue
             try:
                 d = json.loads(line)
             except Exception:
+                continue
+            # the substring checks above pass a list just as happily as an object
+            if not isinstance(d, dict):
+                continue
+            if is_turn and d.get("type") == "system" \
+                    and d.get("subtype") == "turn_duration":
+                # feeds the duration only: these lines carry cwd and gitBranch
+                # on every turn and must not vote on the labels below
+                ms, uid = d.get("durationMs"), d.get("uuid")
+                if (uid and isinstance(uid, str) and uid not in rec["_dur"]
+                        and isinstance(ms, (int, float))
+                        and not isinstance(ms, bool) and 0 <= ms < 1e15):
+                    rec["_dur"][uid] = ms
                 continue
             ts = parse_ts(d.get("timestamp") or "")
             if ts is None:
@@ -692,27 +1138,75 @@ def scan_unit(iters, unit, rec, want_meta):
                 continue
             mid = msg.get("id")
             u = msg.get("usage") or {}
-            if not mid or mid in mids or not u:
+            if not mid or not u:
                 continue
-            mids.add(mid)
             cc = u.get("cache_creation_input_tokens") or 0
             cc1h = (u.get("cache_creation") or {}).get("ephemeral_1h_input_tokens") or 0
-            rows.append([mid, int(ts), msg.get("model") or "?",
-                         d.get("effort") or "-", unit,
-                         u.get("input_tokens") or 0, cc, min(cc1h, cc),
-                         u.get("cache_read_input_tokens") or 0,
-                         u.get("output_tokens") or 0])
+            out = u.get("output_tokens") or 0
+            det, srv = u.get("output_tokens_details"), u.get("server_tool_use")
+            det = det if isinstance(det, dict) else {}
+            srv = srv if isinstance(srv, dict) else {}
+            # one line supplies the whole row: usage, then thinking (part of
+            # output, so capped at it), web counts and the per-line stamps
+            cols = [u.get("input_tokens") or 0, cc, min(cc1h, cc),
+                    u.get("cache_read_input_tokens") or 0, out,
+                    min(count_of(det.get("thinking_tokens")), out),
+                    count_of(srv.get("web_search_requests")),
+                    count_of(srv.get("web_fetch_requests")),
+                    text_of(d.get("promptCacheRequested")),
+                    1 if d.get("sessionKind") == "bg" else 0,
+                    text_of(d.get("attributionSkill")),
+                    text_of(d.get("attributionAgent")),
+                    text_of(d.get("attributionPlugin")),
+                    text_of(d.get("attributionMcpServer")),
+                    text_of(d.get("attributionMcpTool"))]
+            held = byid.get(mid)
+            if held is None:
+                row = [mid, int(ts), msg.get("model") or "?",
+                       d.get("effort") or "-", unit] + cols
+                byid[mid] = row
+                rows.append(row)
+            elif out > held[9]:
+                held[5:] = cols
 
 
-def parse_session(s):
+def terminus_keys(s):
+    """The keys parse_session will read from terminus for this session, in the
+    order it reads them: the main's, then each subagent unit's by sorted name."""
+    keys = [p[0] for k, p in s["main"] if k == "terminus"]
+    for _unit, specs in sorted(s["subs"].items()):
+        keys.extend(p[0] for k, p in specs if k == "terminus")
+    return keys
+
+
+MAIN_ONLY = ("slug", "title", "segs", "comp", "intr", "err", "branch", "cwd",
+             "dur")
+
+
+def parse_session(s, export=None, old=None):
+    """The record for one session. `old` is the cached entry for it: an evicted
+    unit is never read, so its rows (and a subagent's `agents` entry) are taken
+    from there, and so is everything only a main carries when the main is the
+    evicted one and nothing else supplies it. With no `old` an evicted unit
+    contributes nothing."""
     rec = {"rows": [], "segs": [], "slug": None, "title": None,
            "comp": 0, "intr": 0, "err": 0, "agents": {},
-           "_mids": set(), "_marks": set(), "_branch": Counter(),
-           "_cwd": Counter(), "_local": set()}
-    scan_unit(iters_for(s["main"]), "", rec, want_meta=True)
+           "_byid": {}, "_marks": set(), "_branch": Counter(),
+           "_cwd": Counter(), "_local": set(), "_dur": {}}
+    kept = (old or {}).get("rec") or {}
+    for unit in sorted(s["evicted"]):
+        # seeded first, so a message a live file replays is not counted twice
+        for r in kept.get("rows", []):
+            if r[4] == unit and r[0] not in rec["_byid"]:
+                row = list(r)
+                rec["rows"].append(row)
+                rec["_byid"][row[0]] = row
+        if unit and unit in kept.get("agents", {}):
+            rec["agents"][unit] = kept["agents"][unit]
+    scan_unit(iters_for(s["main"], export), "", rec, want_meta=True)
     for key, specs in sorted(s["subs"].items()):
         rec["agents"][key] = s["meta"].get(key) or "unresolved"
-        scan_unit(iters_for(specs), key, rec, want_meta=False)
+        scan_unit(iters_for(specs, export), key, rec, want_meta=False)
     # a command that got a <local-command-stdout> reply was a built-in
     rec["segs"] = sorted(([ts, name] for ts, name, uid in rec["segs"]
                           if uid is None or uid not in rec["_local"]),
@@ -720,7 +1214,12 @@ def parse_session(s):
     rec["branch"] = (rec["_branch"].most_common(1) or [(None, 0)])[0][0]
     rec["cwd"] = (min(rec["_cwd"].items(), key=lambda kv: (-kv[1], kv[0]))[0]
                   if rec["_cwd"] else None)
-    for k in ("_mids", "_marks", "_branch", "_cwd", "_local"):
+    rec["dur"] = [[u, ms] for u, ms in rec["_dur"].items()]
+    if "" in s["evicted"] and not s["main"]:
+        for k in MAIN_ONLY:
+            if k in kept:
+                rec[k] = kept[k]
+    for k in ("_byid", "_marks", "_branch", "_cwd", "_local", "_dur"):
         del rec[k]
     return rec
 
@@ -760,7 +1259,8 @@ def cache_path(sources, platform=None, env=None):
     a path forge a record boundary: one source named "/a\\narch\\t/b" and the
     two sources ("live", "/a") + ("arch", "/b") produce the same joined string,
     so two unrelated source sets share a file and evict each other."""
-    real = [(k, os.path.realpath(p)) for k, p in sources]
+    real = [(k, p if k == "terminus" else os.path.realpath(p))
+            for k, p in sources]
 
     def digest(pair):
         k, p = pair
@@ -805,26 +1305,59 @@ def save_cache(path, sessions):
         return False
 
 
-def collect(cache_path, sources, rebuild, quiet):
-    found = discover(sources)
+def collect(cache_path, sources, rebuild, quiet, terminus=None):
+    found = discover(sources, terminus)
     cache = {} if rebuild else load_cache(cache_path)
     out, parsed, total = {}, 0, sum(len(v) for v in found.values())
-    done = 0
+    done, plan, keys = 0, [], []
     for proj, sids in sorted(found.items()):
         for sid, s in sorted(sids.items()):
-            done += 1
             key = f"{proj}/{sid}"
+            old = cache.get(key)
+            if s["evicted"] and not (s["main"] or any(s["subs"].values())):
+                # D-03: every unit of it is evicted, so nothing is exported and
+                # the record burnrate already holds is kept as it is, whatever
+                # the list says now. This departs from the rule that only
+                # rediscovered sessions are kept: the evicted usage exists
+                # nowhere else. No record, no session.
+                if old:
+                    done += 1
+                    plan.append((key, proj, sid, s, done, old, [], None, None))
+                else:
+                    total -= 1
+                continue
+            done += 1
             sig = session_sig(s)
-            hit = cache.get(key)
-            if hit and hit["sig"] == sig:
+            if old and old["sig"] == sig:
+                plan.append((key, proj, sid, s, done, old, [], sig, None))
+                continue
+            # D-03 per file: an evicted unit drops out of the signature, so a
+            # newly evicted one lands here, parses the units still readable and
+            # takes the evicted one's usage from `old`
+            tkeys = terminus_keys(s)
+            keys.extend(tkeys)
+            plan.append((key, proj, sid, s, done, None, tkeys, sig, old))
+    # one export for every session that changed and holds a terminus file, in
+    # the order parse_session reads them; none at all when nothing changed,
+    # since an empty stdin streams the whole archive
+    export = TerminusExport(terminus, keys) if keys else None
+    try:
+        for key, proj, sid, s, done, hit, tkeys, sig, old in plan:
+            if hit:
                 out[key] = hit
                 continue
             parsed += 1
             if not quiet and parsed % 50 == 0:
                 print(f"  parsing {done}/{total} sessions "
                       f"({parsed} changed)...", file=sys.stderr)
-            out[key] = {"sig": sig, "proj": proj, "sid": sid,
-                        "rec": parse_session(s)}
+            rec = parse_session(s, export, old)
+            out[key] = {"sig": with_marks(sig, export.marks) if tkeys else sig,
+                        "proj": proj, "sid": sid, "rec": rec}
+        if export:
+            export.finish()
+    finally:
+        if export:
+            export.close()
     save_cache(cache_path, out)
     if not quiet:
         print(f"  {total} sessions, {parsed} parsed, "
@@ -839,7 +1372,7 @@ def be_of(r):
     of cache_creation cannot share a weight. Transcripts that predate the
     cache_creation breakdown report cc1h = 0, which weights their writes as 5m
     -- an undercount, but the only reading their data supports."""
-    _, _, _, _, _, inp, cc, cc1h, cr, _ = r
+    inp, cc, cc1h, cr = r[5], r[6], r[7], r[8]
     return inp + CW5 * (cc - cc1h) + CW1H * cc1h + CR * cr
 
 
@@ -865,20 +1398,16 @@ def read_rl_log(rl_log):
                         d = json.loads(line)
                         ts = parse_ts(d.get("ts") or "")
                         if ts:
-                            rows.append([int(ts), d.get("five_hour"),
-                                         d.get("seven_day")])
+                            if d.get("seven_day") is not None:
+                                rows.append([int(ts), d["seven_day"]])
                     except Exception:
                         continue
         except OSError:
             continue
-    # Sort on the timestamp ALONE, never on the whole row. Either window can be
-    # absent (the payload carries them independently), so a default sort
-    # compares None against a float the moment two samples share a second and
-    # raises TypeError out of here, past every per-line guard, and the run
-    # produces no report at all. Sorting on ts is also what keeps ties in file
-    # order -- Python's sort is stable, and file order is write order, so the
-    # viewer's lastOf() reports the LAST sample of a second rather than the
-    # largest one, which is what a 5h window reset looks like.
+    # Sort on the timestamp ALONE, never on the whole row: Python's sort is
+    # stable and file order is write order, so same-second samples keep their
+    # write order and the viewer's lastOf() reports the LAST sample of a
+    # second, not the largest one.
     rows.sort(key=lambda r: r[0])
     return rows
 
@@ -909,6 +1438,7 @@ def aggregate(sessions, tz_offset, rl_log):
     plab = {proj: labels[path] for proj, path in ppaths.items()}
 
     seen = set()
+    claimed = set()         # turn_duration uuids, first session wins
     proj_be = Counter()
     all_rows = []           # (ts, proj_label, cmd, model, effort, unit, row)
     sess_rows = []
@@ -918,6 +1448,16 @@ def aggregate(sessions, tz_offset, rl_log):
         rows = [r for r in rec["rows"] if not (r[0] in seen or seen.add(r[0]))]
         if not rows:
             continue
+        # null = no turn_duration lines, which is not the same as 0 ms; a
+        # record cached before the key existed reads as none
+        dur = None
+        if rec.get("dur"):
+            dur = 0
+            for u, ms in rec["dur"]:
+                if u not in claimed:
+                    claimed.add(u)
+                    dur += ms
+            dur = int(round(dur))
         segs = rec["segs"]
         agent_first = {}
         for r in rows:
@@ -925,13 +1465,14 @@ def aggregate(sessions, tz_offset, rl_log):
                 agent_first[r[4]] = r[1]
         peak_ctx = 0
         t0 = t1 = rows[0][1]
-        be = out = 0.0
+        be = out = bg = 0.0
         for r in rows:
             ts, unit = r[1], r[4]
-            cmd = seg_at(segs, agent_first.get(unit, ts) if unit else ts)
+            cmd = r[15] or seg_at(segs, agent_first.get(unit, ts) if unit else ts)
             all_rows.append((ts, proj, cmd, r[2], r[3], "a" if unit else "m", r))
             be += be_of(r)
             out += r[9]
+            bg += r[14]
             t0, t1 = min(t0, ts), max(t1, ts)
             if not unit:
                 peak_ctx = max(peak_ctx, r[5] + r[6] + r[8])
@@ -939,14 +1480,19 @@ def aggregate(sessions, tz_offset, rl_log):
         sess_rows.append([ent["sid"][:8], proj,
                           rec.get("title") or rec.get("slug") or "",
                           t0, t1, round(be), round(out), len(rows), peak_ctx,
-                          rec["comp"], len(rec["agents"]), rec["intr"]])
+                          rec["comp"], len(rec["agents"]), rec["intr"], int(bg),
+                          dur])
 
     projects = [p for p, _ in proj_be.most_common()]
     pidx = {p: i for i, p in enumerate(projects)}
 
-    daily = defaultdict(lambda: [0.0] * 8)   # be,in,cc,cc1h,cr,out,msgs
+    # be,in,cc,cc1h,cr,out,msgs,thinking,web_search,web_fetch. The grain also
+    # holds agent, plugin, mcp server, mcp tool, background flag and requested
+    # cache ttl: strings are "" when absent, never None, so keys always sort.
+    daily = defaultdict(lambda: [0.0] * 10)
     for ts, proj, cmd, model, effort, kind, r in all_rows:
-        k = (day_of(ts), pidx[proj], cmd, model, effort, kind)
+        k = (day_of(ts), pidx[proj], cmd, model, effort, kind,
+             r[16], r[17], r[18], r[19], r[14], r[13])
         a = daily[k]
         a[0] += be_of(r)
         a[1] += r[5]
@@ -955,40 +1501,26 @@ def aggregate(sessions, tz_offset, rl_log):
         a[4] += r[8]
         a[5] += r[9]
         a[6] += 1
+        a[7] += r[10]
+        a[8] += r[11]
+        a[9] += r[12]
     daily_rows = [[d, p, c, m, e, k, round(a[0]), round(a[1]), round(a[2]),
-                   round(a[3]), round(a[4]), round(a[5]), int(a[6])]
-                  for (d, p, c, m, e, k), a in sorted(daily.items())]
-
-    # 5h blocks, account-wide: window opens at the top of the hour of the first
-    # activity after the previous window ends, lasts 5h
-    blocks = []
-    cur = None
-    for ts, proj, *_rest, r in sorted(all_rows, key=lambda x: x[0]):
-        if cur is None or ts >= cur["t0"] + BLOCK_H:
-            cur = {"t0": (ts // 3600) * 3600, "first": ts, "last": ts,
-                   "be": 0.0, "out": 0.0, "n": 0, "pp": Counter()}
-            blocks.append(cur)
-        b = be_of(r)
-        cur["be"] += b
-        cur["out"] += r[9]
-        cur["n"] += 1
-        cur["last"] = max(cur["last"], ts)
-        cur["pp"][pidx[proj]] += b
-    block_rows = [[b["t0"], b["first"], b["last"], round(b["be"]),
-                   round(b["out"]), b["n"],
-                   {str(i): round(v) for i, v in b["pp"].most_common(6)}]
-                  for b in blocks]
+                   round(a[3]), round(a[4]), round(a[5]), int(a[6]),
+                   ag, pl, ms, mt, bgf, ttl,
+                   int(a[7]), int(a[8]), int(a[9])]
+                  for (d, p, c, m, e, k, ag, pl, ms, mt, bgf, ttl), a
+                  in sorted(daily.items())]
 
     sess_rows.sort(key=lambda s: -s[5])
     return {
         "v": 1,
         "generated": gen.isoformat(timespec="seconds"),
-        # a single number by design: the viewer uses it only for block times
-        # and block-to-day placement, never for the day buckets above
+        # a single number by design: the viewer uses it for session days, rl
+        # sample days and the MAXDAY fallback, and the skill's resolve_day
+        # reads it, but it never buckets the daily rows above
         "tz_offset": offset,
         "projects": [{"id": p, "be": round(proj_be[p])} for p in projects],
         "daily": daily_rows,
-        "blocks": block_rows,
         "sessions": sess_rows[:400],
         "rl": read_rl_log(rl_log),
     }
@@ -1034,7 +1566,8 @@ def main():
                     help="extra transcript source: either a <proj>/*.jsonl "
                          "tree or a <proj>/<sid>/*.zst archive")
     ap.add_argument("--no-archive", action="store_true",
-                    help="ignore every archive source, auto-detected or not")
+                    help="ignore every archive source, auto-detected or not, "
+                         "Terminus included")
     ap.add_argument("--rebuild", action="store_true",
                     help="ignore the cache and reparse everything")
     ap.add_argument("--json", action="store_true",
@@ -1049,7 +1582,19 @@ def main():
     cpath = cache_path(src["sources"])
     if not a.quiet:
         print(f"scanning transcripts... (cache {cpath})", file=sys.stderr)
-    sessions = collect(cpath, src["sources"], a.rebuild, a.quiet)
+    try:
+        sessions = collect(cpath, src["sources"], a.rebuild, a.quiet,
+                           src["terminus"])
+    except TerminusError as e:
+        # D-10: the run restarts as one without terminus, on that run's own
+        # cache file. collect saves nothing before its export finishes, so the
+        # terminus cache file stays as it was for the next healthy run.
+        terminus_warn(e)
+        src = dict(src, terminus=None, **src["plain"])
+        cpath = cache_path(src["sources"])
+        if not a.quiet:
+            print(f"scanning transcripts... (cache {cpath})", file=sys.stderr)
+        sessions = collect(cpath, src["sources"], a.rebuild, a.quiet, None)
     data = aggregate(sessions, a.tz_offset, src["rl_log"])
     data["archive_used"] = src["archive_used"]
     data["archive_label"] = src["archive_label"]
@@ -1081,7 +1626,6 @@ def main():
     print(f"range   : {days[0]} -> {days[-1]} ({len(days)} active days)"
           if days else "range   : no data")
     print(f"billed  : {tot:,.0f} billed-equiv tokens, "
-          f"{len(data['blocks'])} five-hour blocks, "
           f"{len(data['projects'])} projects")
     # floored like the report's tile, so one miss never prints as 100%
     prompt = sum(r[7] + r[8] + r[10] for r in data["daily"])
@@ -1243,12 +1787,6 @@ footer{color:var(--muted);font-size:11.5px;margin:18px 0 8px}
     <div id="dailyChart"></div>
   </div>
 
-  <div class="card">
-    <h2>Five-hour blocks</h2>
-    <div class="note" id="blocksNote"></div>
-    <div id="blocksChart"></div>
-  </div>
-
   <div class="grid3" style="margin-bottom:14px">
     <div class="card" style="margin:0">
       <h2>Rolling 7-day burn</h2>
@@ -1273,10 +1811,20 @@ footer{color:var(--muted);font-size:11.5px;margin:18px 0 8px}
     <div class="card" style="margin:0"><h2>By model</h2><div class="hb" id="byModel"></div></div>
     <div class="card" style="margin:0"><h2>By effort</h2><div class="hb" id="byEffort"></div></div>
     <div class="card" style="margin:0"><h2>Main vs subagents</h2><div class="hb" id="byKind"></div></div>
+    <div class="card" style="margin:0"><h2>By agent</h2>
+      <div class="note">Stamped messages only</div><div class="hb" id="byAgent"></div></div>
+    <div class="card" style="margin:0"><h2>By plugin</h2>
+      <div class="note">Stamped messages only</div><div class="hb" id="byPlugin"></div></div>
+    <div class="card" style="margin:0"><h2>By MCP tool</h2>
+      <div class="note">Stamped messages only</div><div class="hb" id="byMcp"></div></div>
+    <div class="card" id="webCard" style="margin:0;display:none"><h2>Web search and fetch</h2>
+      <div class="note">Request counts, not tokens</div><div class="hb" id="byWeb"></div></div>
+    <div class="card" id="bgCard" style="margin:0;display:none"><h2>Foreground vs background</h2>
+      <div class="hb" id="byBg"></div></div>
   </div>
 
   <div class="card" id="rlCard" style="display:none">
-    <h2>Rate-limit windows</h2>
+    <h2>7-day rate-limit window</h2>
     <div class="note">Logged used-percentage from the statusline payload</div>
     <div class="legend" id="rlLegend"></div>
     <div id="rlChart"></div>
@@ -1309,17 +1857,24 @@ const epochDay = e => new Date((e + TZ*3600) * 1000).toISOString().slice(0,10);
 const addDays  = (d, n) => new Date((dayEpoch(d) + n*DAY)*1000).toISOString().slice(0,10);
 const fmtDay   = d => { const t = new Date(dayEpoch(d)*1000);
   return t.toLocaleDateString('en-US',{month:'short',day:'numeric',timeZone:'UTC'}); };
-const fmtTime  = e => new Date((e + TZ*3600)*1000).toISOString().slice(11,16);
 const fmt = n => n >= 1e9 ? (n/1e9).toFixed(2)+'B' : n >= 1e6 ? (n/1e6).toFixed(1)+'M'
   : n >= 1e3 ? (n/1e3).toFixed(n<1e4?1:0)+'k' : Math.round(n).toString();
 const fmtFull = n => Math.round(n).toLocaleString('en-US');
+const fmtActive = ms => ms == null ? '—'
+  : Math.floor(ms/3600000) + 'h ' + Math.floor(ms%3600000/60000) + 'm';
 // cache read over every prompt token, floored so one miss never shows as 100%.
 // cc is the whole cache write and already holds the 1h half.
 const hitPct = (inp, cc, cr) => inp + cc + cr > 0
   ? Math.floor(cr / (inp + cc + cr) * 1000) / 10 : null;
 
-// column indexes: daily row = [day,p,cmd,model,effort,kind,be,in,cc,cc1h,cr,out,n]
-const D = {day:0,p:1,cmd:2,model:3,effort:4,kind:5,be:6,inp:7,cc:8,cc1h:9,cr:10,out:11,n:12};
+// column indexes: daily row = [day,p,cmd,model,effort,kind,be,in,cc,cc1h,cr,out,n,
+//   agent,plugin,mcpS,mcpT,bg,ttl,think,wsearch,wfetch]; bg is 1 or 0, ttl the
+//   requested cache TTL ("" when unrecorded); think is part of out, not extra.
+// sessions row = [id,p,title,t0,t1,be,out,n,peak,comp,agents,intr,bgN,activeMs]
+//   (bgN is the count of its background messages; activeMs is null when the
+//   session has no turn_duration lines, which is not the same as 0)
+const D = {day:0,p:1,cmd:2,model:3,effort:4,kind:5,be:6,inp:7,cc:8,cc1h:9,cr:10,out:11,n:12,
+  agent:13,plugin:14,mcpS:15,mcpT:16,bg:17,ttl:18,think:19,wsearch:20,wfetch:21};
 
 const allDays = [...new Set(DATA.daily.map(r => r[D.day]))].sort();
 // both bounds fall back: an empty tree is a supported flow (a warned-about
@@ -1563,51 +2118,8 @@ function lineChart(elId, days, seriesArr, unit, lo){
   svg.addEventListener('pointerleave', () => { xh.setAttribute('opacity',0); ttHide(); });
 }
 
-// ---- blocks chart ----
-function blocksChart(blocks, d0, d1){
-  const W = 960, H = 210, padT = 12, padB = 22, padL = 46;
-  const plotH = H - padT - padB;
-  const el = $('#blocksChart');
-  if (!blocks.length){ el.innerHTML = '<div class="empty">No blocks in range</div>'; return; }
-  const t0 = dayEpoch(d0) - TZ*3600, t1 = dayEpoch(d1) + DAY - TZ*3600;
-  const span = t1 - t0;
-  const max = niceMax(Math.max(...blocks.map(b => b[3])));
-  const xOf = t => padL + (t - t0)/span * (W - padL);
-  let marks = '', labels = '';
-  blocks.forEach((b, bi) => {
-    const x = xOf(b[0]), w = Math.max(2, 5*3600/span*(W-padL) - 1);
-    const h = plotH * b[3]/max, y = padT + plotH - h;
-    marks += `<path d="${barPath(x, y, w, h, 3)}" fill="var(--s1)" data-b="${bi}"></path>`;
-  });
-  const nd = Math.max(1, Math.round(span/DAY));
-  const step = Math.max(1, Math.ceil(nd/9));
-  for (let i = 0; i < nd; i += step){
-    const d = addDays(d0, i);
-    labels += `<text x="${xOf(dayEpoch(d) - TZ*3600 + DAY/2)}" y="${H-6}" text-anchor="middle">${fmtDay(d)}</text>`;
-  }
-  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="aspect-ratio:${W}/${H}">
-    ${axisTicks(max, plotH, padT, padL, W)}
-    <line x1="${padL}" x2="${W}" y1="${padT+plotH}" y2="${padT+plotH}" stroke="var(--axis)"></line>
-    ${marks}${labels}</svg>`;
-  el.firstElementChild.addEventListener('pointermove', e => {
-    const p = e.target.closest('[data-b]');
-    if (!p){ ttHide(); return; }
-    const b = blocks[+p.dataset.b];
-    const rows = [['transparent','burned', fmtFull(b[3])],
-                  ['transparent','output', fmtFull(b[4])],
-                  ['transparent','rate', fmt(b[3]/5) + '/h'],
-                  ['transparent','active', fmtTime(b[1]) + '–' + fmtTime(b[2])]];
-    for (const [pi, v] of Object.entries(b[6]))
-      rows.push([cssVar(colorOf(+pi)), DATA.projects[+pi].id, fmtFull(v)]);
-    ttShow(e.clientX, e.clientY,
-      fmtDay(epochDay(b[0])) + ' · ' + fmtTime(b[0]) + ' + 5h', rows);
-  });
-  el.firstElementChild.addEventListener('pointerleave', ttHide);
-}
-
 // project color: fixed by all-time rank, never repainted by filters
 let topSlots = new Map();
-function colorOf(pi){ return topSlots.has(pi) ? topSlots.get(pi) : '--other'; }
 
 // ---- horizontal bar lists ----
 function hbars(elId, items){
@@ -1640,7 +2152,7 @@ function render(){
   const perProj = new Map();
   const perDayTotal = new Array(nDays).fill(0);
   const perDayCache = days.map(() => [0, 0, 0]);   // fresh in, cache write, cache read
-  let total = 0, totalOut = 0, totalMsgs = 0;
+  let total = 0, totalOut = 0, totalMsgs = 0, totalThink = 0;
   for (const r of rows){
     const i = dIdx.get(r[D.day]);
     if (i == null) continue;
@@ -1648,6 +2160,7 @@ function render(){
     perProj.get(r[D.p])[i] += r[D.be];
     perDayTotal[i] += r[D.be];
     total += r[D.be]; totalOut += r[D.out]; totalMsgs += r[D.n];
+    totalThink += r[D.think];
     const c = perDayCache[i];
     c[0] += r[D.inp]; c[1] += r[D.cc]; c[2] += r[D.cr];
   }
@@ -1686,12 +2199,6 @@ function render(){
   const dHit = hit != null && prevHit != null ? hit - prevHit : null;
   const active = perDayTotal.filter(v => v > 0).length;
   const pk = perDayTotal.indexOf(Math.max(...perDayTotal));
-  const blocks = DATA.blocks.filter(b => {
-    const d = epochDay(b[0]);
-    return d >= state.d0 && d <= state.d1;
-  });
-  const bVals = blocks.map(b => b[3]).sort((a,b) => a-b);
-  const med = bVals.length ? bVals[bVals.length >> 1] : 0;
   const sess = DATA.sessions.filter(s =>
     inRange(epochDay(s[3])) && (!state.projs ||
       [...state.projs].some(i => DATA.projects[i].id === s[1])));
@@ -1708,21 +2215,15 @@ function render(){
     <div class="tile"><div class="l">Peak day</div><div class="v">${fmt(perDayTotal[pk]||0)}</div>
       <div class="d">${perDayTotal[pk] ? fmtDay(days[pk]) : '—'}</div></div>
     <div class="tile"><div class="l">Output tokens</div><div class="v">${fmt(totalOut)}</div>
-      <div class="d">${fmtFull(totalMsgs)} messages</div></div>
+      <div class="d">${fmtFull(totalMsgs)} messages${totalThink > 0 ?
+        ` · ${(100*totalThink/totalOut).toFixed(totalThink < totalOut/10 ? 1 : 0)}% thinking` : ''}</div></div>
     <div class="tile"><div class="l">Cache hit rate</div>
       <div class="v">${hit == null ? '—' : hit.toFixed(1) + '%'}</div>
       <div class="d">${hit == null ? 'no prompt tokens' : (100 - hit).toFixed(1) + '% missed'}${dHit == null ? '' :
         ` · <span class="${dHit >= 0 ? 'good' : 'bad'}">${dHit >= 0 ? '+' : ''}${dHit.toFixed(1)} pts</span> vs prior`
       }</div></div>
-    <div class="tile"><div class="l">5h blocks</div><div class="v">${blocks.length}</div>
-      <div class="d">median ${fmt(med)}</div></div>
     <div class="tile"><div class="l">Peak context</div><div class="v">${fmt(peakCtx)}</div>
       <div class="d">${sess.length} sessions</div></div>`;
-
-  // blocks
-  $('#blocksNote').textContent = 'Account-wide (all projects), regardless of the project filter. '
-    + 'A block opens on the hour of first activity and lasts five hours; height is billed-equivalent burn.';
-  blocksChart(blocks, state.d0, state.d1);
 
   // rolling 7d (from project-filtered rows, all days incl. before range start)
   const byDayAll = new Map();
@@ -1762,12 +2263,15 @@ function render(){
     '%', 100 - span);
 
   // breakdowns: a = [billed-equiv, fresh in, cache write, cache read]
-  const agg = (key, labelFn) => {
+  // key is a column index, or a function of the row; src defaults to every row
+  const agg = (key, labelFn, src = rows) => {
+    const kf = typeof key === 'function' ? key : r => r[key];
     const m = new Map();
-    for (const r of rows){
-      const a = m.get(r[key]) || [0, 0, 0, 0];
+    for (const r of src){
+      const k = kf(r);
+      const a = m.get(k) || [0, 0, 0, 0];
       a[0] += r[D.be]; a[1] += r[D.inp]; a[2] += r[D.cc]; a[3] += r[D.cr];
-      m.set(r[key], a);
+      m.set(k, a);
     }
     return [...m.entries()].map(([k,a]) => ({label: labelFn(k), v: a[0], a}))
       .sort((a,b) => b.v - a.v);
@@ -1789,34 +2293,49 @@ function render(){
   hbars('#byEffort', withHit(agg(D.effort, e => e === '-' ? '(unspecified)' : e).sort((a,b) =>
     EORD.indexOf(a.label) - EORD.indexOf(b.label))));
   hbars('#byKind', withHit(agg(D.kind, k => k === 'm' ? 'main session' : 'subagents')));
+  // the stamps as written; an unstamped bar would hold nearly all the burn
+  hbars('#byAgent', withHit(agg(D.agent, a => a, rows.filter(r => r[D.agent]))));
+  hbars('#byPlugin', withHit(agg(D.plugin, a => a, rows.filter(r => r[D.plugin]))));
+  hbars('#byMcp', withHit(agg(r => JSON.stringify([r[D.mcpS], r[D.mcpT]]),
+    k => JSON.parse(k).filter(Boolean).join(' / '),
+    rows.filter(r => r[D.mcpS] || r[D.mcpT]))));
+
+  // conditional cards: shown only when the range has something, hidden on every
+  // other call. Web values are request counts, so no cache-hit tooltip.
+  const ws = rows.reduce((s, r) => s + r[D.wsearch], 0);
+  const wf = rows.reduce((s, r) => s + r[D.wfetch], 0);
+  if (ws || wf){
+    $('#webCard').style.display = '';
+    hbars('#byWeb', [{label:'searches', v: ws}, {label:'fetches', v: wf}]);
+  } else $('#webCard').style.display = 'none';
+  if (rows.some(r => r[D.bg])){
+    $('#bgCard').style.display = '';
+    hbars('#byBg', withHit(agg(D.bg, b => b ? 'background' : 'foreground')));
+  } else $('#bgCard').style.display = 'none';
 
   // rate-limit card
   const rl = DATA.rl.filter(s => { const d = epochDay(s[0]); return inRange(d); });
   if (rl.length > 1){
     $('#rlCard').style.display = '';
     const rdays = [...new Set(rl.map(s => epochDay(s[0])))].sort();
-    const lastOf = (day, idx) => {
-      const v = rl.filter(s => epochDay(s[0]) === day && s[idx] != null).pop();
-      return v ? v[idx] : null;
-    };
+    const lastOf = day => rl.filter(s => epochDay(s[0]) === day).pop()[1];
     lineChart('#rlChart', rdays, [
-      {name:'5-hour window', color:'--s1', values: rdays.map(d => lastOf(d,1))},
-      {name:'7-day window',  color:'--s2', values: rdays.map(d => lastOf(d,2))}], '%');
+      {name:'7-day window', color:'--s2', values: rdays.map(lastOf)}], '%');
     $('#rlLegend').innerHTML =
-      `<span class="it"><span class="ln" style="background:var(--s1)"></span>5-hour window</span>
-       <span class="it"><span class="ln" style="background:var(--s2)"></span>7-day window</span>`;
+      `<span class="it"><span class="ln" style="background:var(--s2)"></span>7-day window</span>`;
   } else $('#rlCard').style.display = 'none';
 
   // sessions table
   const top = sess.slice(0, 15);
   const st = document.createElement('table');
   st.innerHTML = `<thead><tr><th>Session</th><th>Project</th><th>Day</th>
-    <th class="num">Billed-equiv</th><th class="num">Output</th><th class="num">Msgs</th>
+    <th class="num">Active</th><th class="num">Billed-equiv</th><th class="num">Output</th><th class="num">Msgs</th>
     <th class="num">Peak ctx</th><th class="num">Compact</th><th class="num">Agents</th></tr></thead>`;
   const tb = document.createElement('tbody');
   for (const s of top){
     const tr = document.createElement('tr');
-    const cells = [[s[2] || s[0], 't'], [s[1]], [fmtDay(epochDay(s[3]))],
+    const cells = [[(s[2] || s[0]) + (s[12] ? ' · background' : ''), 't'], [s[1]],
+      [fmtDay(epochDay(s[3]))], [fmtActive(s[13]),'num'],
       [fmtFull(s[5]),'num'], [fmt(s[6]),'num'], [fmtFull(s[7]),'num'],
       [fmt(s[8]),'num'], [s[9] || '','num'], [s[10] || '','num']];
     for (const [txt, cls] of cells){
@@ -1859,8 +2378,8 @@ $('#gen').textContent = `Generated ${DATA.generated} · ` +
   `data ${MINDAY} → ${MAXDAY}`;
 $('#foot').textContent = 'Billed-equivalent weights every token to a common unit; it is not a bill. ' +
   (DATA.rl_installed ? '' :
-   'Rate-limit logger not installed: cap percentages (5h/7d windows) are not ' +
-   'being recorded; they need the opt-in extras/usage_logger.sh.');
+   'Rate-limit logger not installed: the 7-day cap percentage is not ' +
+   'being recorded; it needs the opt-in extras/usage_logger.sh.');
 buildFilters();
 render();
 </script>

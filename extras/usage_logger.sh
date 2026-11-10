@@ -4,19 +4,18 @@
 #
 # Claude Code passes a JSON blob on stdin to whatever statusline command is
 # configured. For Pro/Max subscribers that blob carries the only ground-truth
-# signal available for subscription burn:
+# signal available for subscription burn. This wrapper records its 7-day window:
 #
 #   "rate_limits": {
-#     "five_hour": { "used_percentage": 23.5, "resets_at": 1738425600 },
 #     "seven_day": { "used_percentage": 41.2, "resets_at": 1738857600 }
 #   }
 #
 # (code.claude.com/docs/en/statusline -- the field appears only for Claude.ai
-# subscribers, only after the first API response in a session, and each window
-# may be independently absent.)
+# subscribers, only after the first API response in a session, and the 7-day
+# window may be absent.)
 #
 # This wrapper is deliberately dumb: it reads stdin once, appends one compact
-# record when the percentages CHANGE, and replays stdin verbatim into the
+# record when the percentage CHANGES, and replays stdin verbatim into the
 # original command. It never edits, reorders, or reformats the payload, so the
 # wrapped statusline behaves exactly as it did before.
 #
@@ -28,7 +27,7 @@
 #
 #   <config>/usage-logger/inner-command    the original statusline command
 #   <config>/usage-logger/usage-log.jsonl  the append-only sample log
-#   <config>/usage-logger/.last            dedupe memo (last seen pair)
+#   <config>/usage-logger/.last            dedupe memo (last seen percentage)
 #
 # $CLAUDE_USAGE_LOGGER_DIR overrides that directory outright. Use it when
 # burnrate reads the log from somewhere else: burnrate looks for the log beside
@@ -61,25 +60,19 @@ log_sample() {
         *) return 0 ;;
     esac
 
-    local five seven r5 r7 pair now
-    five=$(printf '%s' "$input" | grep -o '"five_hour":[[:space:]]*{[^}]*}' |
-           grep -o '"used_percentage":[[:space:]]*[0-9.]*' | head -1 |
-           grep -o '[0-9.]*$')
+    local seven r7 now
     seven=$(printf '%s' "$input" | grep -o '"seven_day":[[:space:]]*{[^}]*}' |
             grep -o '"used_percentage":[[:space:]]*[0-9.]*' | head -1 |
             grep -o '[0-9.]*$')
-    [ -z "$five" ] && [ -z "$seven" ] && return 0
+    [ -z "$seven" ] && return 0
 
     # One row per actual change. A statusline can fire many times a second; the
     # regression only learns from intervals where the number actually moved.
-    pair="${five:-_}:${seven:-_}"
-    if [ -r "$LAST" ] && [ "$(cat "$LAST" 2>/dev/null)" = "$pair" ]; then
+    if [ -r "$LAST" ] && [ "$(cat "$LAST" 2>/dev/null)" = "$seven" ]; then
         return 0
     fi
-    printf '%s' "$pair" > "$LAST" 2>/dev/null
+    printf '%s' "$seven" > "$LAST" 2>/dev/null
 
-    r5=$(printf '%s' "$input" | grep -o '"five_hour":[[:space:]]*{[^}]*}' |
-         grep -o '"resets_at":[[:space:]]*[0-9]*' | head -1 | grep -o '[0-9]*$')
     r7=$(printf '%s' "$input" | grep -o '"seven_day":[[:space:]]*{[^}]*}' |
          grep -o '"resets_at":[[:space:]]*[0-9]*' | head -1 | grep -o '[0-9]*$')
 
@@ -94,9 +87,8 @@ log_sample() {
         sz=$(wc -c < "$LOG" 2>/dev/null || echo 0)
         [ "$sz" -gt "$MAX_BYTES" ] && mv -f "$LOG" "$LOG.1" 2>/dev/null
     fi
-    printf '{"ts":"%s","five_hour":%s,"seven_day":%s,"resets5":%s,"resets7":%s,"session_id":"%s","model":"%s"}\n' \
-        "$now" "${five:-null}" "${seven:-null}" "${r5:-null}" "${r7:-null}" \
-        "${sid:-}" "${mdl:-}" >> "$LOG" 2>/dev/null
+    printf '{"ts":"%s","seven_day":%s,"resets7":%s,"session_id":"%s","model":"%s"}\n' \
+        "$now" "$seven" "${r7:-null}" "${sid:-}" "${mdl:-}" >> "$LOG" 2>/dev/null
 }
 
 log_sample 2>/dev/null || true

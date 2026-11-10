@@ -6,8 +6,8 @@
 A single-file, on-demand dashboard of your own Claude Code token usage.
 
 Run it and one self-contained `dashboard.html` opens in your browser: daily burn
-by project, per-model and per-command breakdowns, 5-hour rate-limit blocks, and
-per-session summaries. Date-range and project filters run client-side, so the
+by project, per-model and per-command breakdowns, and per-session
+summaries. Date-range and project filters run client-side, so the
 report works offline and can be reopened without re-running anything.
 
 It reads local files and writes local files. No network calls, no telemetry, no
@@ -25,7 +25,7 @@ account required.
 - [Flags](#flags)
 - [Cache](#cache)
 - [Updating, disabling and removing](#updating-disabling-and-removing)
-- [The 5h/7d cap card](#the-5h7d-cap-card)
+- [The 7-day cap card](#the-7-day-cap-card)
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
 
@@ -65,7 +65,6 @@ transcripts and says so in the report subtitle instead of failing.
 /burnrate how much did I burn yesterday   answered in chat, no browser
 /burnrate which project burned most this week
 /burnrate what was my cache hit rate this week
-/burnrate how much is left in this block
 ```
 
 The words `7d`, `14d`, `30d`, `90d`, `all`, `rebuild` and `no-archive` select
@@ -92,6 +91,15 @@ Code convention that burnrate honors.
 Inside that tree it parses `<project-dir>/<session>.jsonl`, including subagent
 transcripts, and optionally any archive you point `--archive` at.
 
+If a `terminus` 2.0.0 or later is on your `PATH`, burnrate reads that archive
+too. It runs three read-only commands, `terminus --version`,
+`terminus sessions --project '*' --json` and `terminus export --stdout`, and
+never runs `ingest` or any other command that writes. For each transcript file
+the live copy wins, and Terminus supplies only the files the live tree no longer
+has. A file Terminus has evicted is never exported, and it keeps the usage the
+cache already holds for it. A session is exported again when the watermarks of
+its Terminus files changed or when its live or archive files did.
+
 ## What it computes
 
 Per assistant message, deduped globally by `message.id`:
@@ -103,8 +111,8 @@ Per assistant message, deduped globally by `message.id`:
 - context footprint = `input + cache_creation + cache_read`, the live window size
 
 From those it reconstructs daily burn at day x project x command x model x
-effort x main/agent grain, account-wide 5-hour rate-limit blocks, and
-per-session summaries (peak context, compactions, interrupts, subagents).
+effort x main/agent grain, and per-session
+summaries (peak context, compactions, interrupts, subagents).
 
 The hit rate is floored to one decimal, so a range with any miss at all never
 shows 100%. `cache_creation` already holds the 1h writes, so they are not added
@@ -153,7 +161,7 @@ never converts it to currency.
 
 Across the top: a date-range picker and a project filter. Both run client-side,
 so narrowing the range or picking projects re-renders every panel below without
-re-running the tool. Seven summary tiles follow the filters:
+re-running the tool. Six summary tiles follow the filters:
 
 | Tile | Reads |
 |---|---|
@@ -162,15 +170,11 @@ re-running the tool. Seven summary tiles follow the filters:
 | Peak day | Heaviest single day and its date |
 | Output tokens | Output total and the message count behind it |
 | Cache hit rate | Share of prompt tokens read from cache, the share missed, and the change in percentage points against the prior window |
-| 5h blocks | How many rate-limit blocks the range covers, and their median burn |
 | Peak context | Largest live window reached, and the session count |
 
 Then the panels:
 
 - **Daily burn by project**, stacked per day. The main chart.
-- **Five-hour blocks**, the rate-limit windows. A block opens on the hour of
-  first activity and runs five hours. Account-wide by design, so the project
-  filter does not apply to it.
 - **Rolling 7-day burn**, the trailing weekly total, which is the pacing signal
   against a weekly window.
 - **Token composition**, the same billed-equivalent total as the daily chart,
@@ -185,8 +189,8 @@ Then the panels:
   breakdown bars over the filtered range. Hovering a bar shows its cache hit
   rate. See [Which command burned it](#which-command-burned-it) for what a
   command owns.
-- **Rate-limit windows**, logged used-percentage from the statusline payload.
-  Renders only when the [cap card](#the-5h7d-cap-card) logger has been running.
+- **7-day rate-limit window**, logged used-percentage from the statusline payload.
+  Renders only when the [cap card](#the-7-day-cap-card) logger has been running.
 - **Top sessions**, the heaviest sessions in range. Its `Billed-equiv` column
   is the same [comparison unit](#billed-equiv-is-a-comparison-unit) as the tile
   at the top, scoped to one session, not a currency amount. Alongside it: output
@@ -219,7 +223,12 @@ To recover history that is already gone you need your own backup. Point
 `<project>/<session>/*.zst`) and burnrate merges it with the live tree.
 
 If a hindsight archive is configured on the machine, burnrate detects it
-automatically and labels that run "hindsight archive" in the report. `--no-archive` ignores every archive source, auto-detected or not.
+automatically and labels that run "hindsight archive" in the report.
+
+Terminus extends history the same way. It is detected on the `PATH`, and it runs
+alongside `--archive` and the hindsight auto-detect rather than instead of them.
+`--no-archive` ignores every archive source, Terminus included, auto-detected or
+not. `--root` does not turn it off.
 
 ## What a generated report embeds
 
@@ -233,6 +242,9 @@ your transcripts and contains:
 - model ids and effort levels
 - per-message timestamps
 - the basename of any `--archive` directory
+
+Sessions read from Terminus put the same fields in the report as live ones. The
+subtitle names Terminus, without a path.
 
 It does **not** contain message content, code, or prompts. But project names and
 session titles alone routinely describe what you were working on and for whom.
@@ -254,7 +266,7 @@ they are listed so the words have a precise meaning.
 | `--root DIR` | Transcript tree to read. See resolution order above. |
 | `--out DIR` | Where to write the report. `/burnrate` always points this at the cache directory. |
 | `--archive DIR` | Extra transcript source: a `<project>/*.jsonl` tree or a `<project>/<session>/*.zst` archive. |
-| `--no-archive` | Ignore every archive source, auto-detected or not. |
+| `--no-archive` | Ignore every archive source, auto-detected or not, Terminus included. |
 | `--rebuild` | Ignore the cache and reparse everything. |
 | `--json` | Also write `dashboard_data.json` beside the report. |
 | `--no-open` | Write the report without launching a browser. |
@@ -288,7 +300,7 @@ Each of these has a `/plugin` equivalent inside a session.
 The skill is a wrapper, never a fork. It runs the `burnrate.py` the plugin
 shipped, so an update moves both at once and there is no second copy to drift.
 
-## The 5h/7d cap card
+## The 7-day cap card
 
 The report can show rate-limit cap percentages, but only if a statusline logger
 has been recording them, because Claude Code does not write them to the
@@ -333,9 +345,25 @@ for in plain words counts as conversation. See
 package. Without it the tool runs on your live transcripts and says so in the
 report subtitle. Plain `<project>/*.jsonl` archive trees need nothing extra.
 
+**Terminus is not being read, or the run is slow.** burnrate ignores a
+`terminus` older than 2.0.0 without saying so. A Terminus that fails prints one
+warning, such as `warning: terminus failed (sessions exited 1) -- continuing
+without it`, and the run continues on your live transcripts and any other
+archive. The first run with Terminus is slow: it exports every session the live
+tree lacks and starts its own cache file. Later runs export only sessions whose
+Terminus watermarks, live files or archive files changed.
+
+**Usage from an evicted Terminus file is gone.** That usage lives only in the
+cache file, and the cache file is keyed by the whole source set. When the source
+set changes, such as installing `zstandard` or a hindsight archive turning up,
+burnrate starts a fresh cache file and the evicted usage is not in it.
+
 **Stale numbers after a session you know happened.** The cache keys on files
 that changed. Force a full reparse with `/burnrate rebuild`, or delete the cache
-directory listed under [Cache](#cache).
+directory listed under [Cache](#cache). A rebuild re-exports every Terminus
+file the live tree lacks. It also drops the usage of each file Terminus has
+evicted, because that usage existed only in the cache. The rest of the session
+stays.
 
 **No browser opened.** The run still reports the path it wrote. Open that file
 yourself; the report is self-contained and works offline.
@@ -345,8 +373,8 @@ or start a new session, then confirm it is installed and enabled with
 `claude plugin list`. A plugin skill can register under a qualified id, so check
 that `/burnrate` works rather than looking for a literal `/burnrate` row.
 
-**The 5h/7d cap card does not render.** Its logger is opt-in and installed
-separately. See [The 5h/7d cap card](#the-5h7d-cap-card). Every other panel works
+**The 7-day cap card does not render.** Its logger is opt-in and installed
+separately. See [The 7-day cap card](#the-7-day-cap-card). Every other panel works
 without it.
 
 ## License
