@@ -591,6 +591,72 @@ class TestCommandAttribution(unittest.TestCase):
         self.assertEqual(got, {"": 100, "cadence:cad-plan": 20})
 
 
+def msg_line(mid, inp=10, cr=0, out=1, details=None, server=None, **top):
+    """One assistant line for message `mid`. Streaming writes several of these
+    per message; `top` are top-level fields (stamps, sessionKind, ...)."""
+    u = {"input_tokens": inp, "cache_read_input_tokens": cr,
+         "output_tokens": out}
+    if details is not None:
+        u["output_tokens_details"] = details
+    if server is not None:
+        u["server_tool_use"] = server
+    d = {"type": "assistant", "uuid": f"u-{mid}-{inp}-{cr}-{out}",
+         "message": {"id": mid, "role": "assistant",
+                     "model": "claude-opus-4-6", "usage": u}}
+    d.update(top)
+    return d
+
+
+class TreeCase(unittest.TestCase):
+    T0 = 1772366400  # 2026-03-01T12:00:00Z
+
+    def tree(self, *sessions, subs=None):
+        """The payload of a real run over these sessions. `subs` maps
+        (session index, agent key) to that subagent file's lines. A line
+        without a timestamp gets one a minute after the previous line's."""
+        root = os.path.join(tempfile.mkdtemp(dir=TMP), "projects")
+        pdir = os.path.join(root, "-home-alice-work-api")
+        files = {os.path.join(pdir, f"sess-{n}.jsonl"): lines
+                 for n, lines in enumerate(sessions)}
+        for (n, key), lines in (subs or {}).items():
+            files[os.path.join(pdir, f"sess-{n}", "subagents",
+                               key + ".jsonl")] = lines
+        for path, lines in files.items():
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                for i, d in enumerate(lines):
+                    d.setdefault("timestamp", time.strftime(
+                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.T0 + 60 * i)))
+                    fh.write(json.dumps(d) + "\n")
+        proc, out = run(["--root", root])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return payload(out)
+
+
+class TestUsageLine(TreeCase):
+    """A message streams as several lines. The early ones are partials, so the
+    row takes its usage from the line with the largest output_tokens."""
+
+    def test_the_fullest_line_supplies_every_column(self):
+        got = self.tree([msg_line("m1", inp=10, cr=0, out=5),
+                         msg_line("m1", inp=10, cr=2000, out=300)])
+        self.assertEqual(len(got["daily"]), 1)
+        row = got["daily"][0]
+        self.assertEqual(row[11], 300)   # output
+        self.assertEqual(row[6], 210)    # 10 + 0.10 x 2000
+        self.assertEqual(row[12], 1)
+
+    def test_a_smaller_later_line_does_not_replace_the_row(self):
+        got = self.tree([msg_line("m1", inp=10, cr=2000, out=300),
+                         msg_line("m1", inp=10, cr=0, out=5)])
+        self.assertEqual((got["daily"][0][11], got["daily"][0][6]), (300, 210))
+
+    def test_a_tie_keeps_the_first_line(self):
+        got = self.tree([msg_line("m2", inp=100, out=7),
+                         msg_line("m2", inp=999, out=7)])
+        self.assertEqual(got["daily"][0][6], 100)
+
+
 class TestZstandardAbsent(unittest.TestCase):
     """The optional dependency is missing on most machines, so every branch
     that drops an arch source has to hold there -- which is precisely where the

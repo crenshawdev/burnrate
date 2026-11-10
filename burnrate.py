@@ -621,8 +621,11 @@ def typed_by_user(d):
 def scan_unit(iters, unit, rec, want_meta):
     """Stream one logical file (live + archive generations). Appends usage rows
     and, for the main transcript, segments and session metadata. Dedupe within
-    the session: message rows by message.id, marker lines by uuid/value."""
-    rows, mids = rec["rows"], rec["_mids"]
+    the session: message rows by message.id, marker lines by uuid/value. A
+    message streams as several lines and the early ones are partials, so the
+    line with the largest output_tokens supplies the row's usage; on a tie the
+    first line stands."""
+    rows, byid = rec["rows"], rec["_byid"]
     marks = rec["_marks"]
     for it in iters:
         for line in it:
@@ -688,22 +691,27 @@ def scan_unit(iters, unit, rec, want_meta):
                 continue
             mid = msg.get("id")
             u = msg.get("usage") or {}
-            if not mid or mid in mids or not u:
+            if not mid or not u:
                 continue
-            mids.add(mid)
             cc = u.get("cache_creation_input_tokens") or 0
             cc1h = (u.get("cache_creation") or {}).get("ephemeral_1h_input_tokens") or 0
-            rows.append([mid, int(ts), msg.get("model") or "?",
-                         d.get("effort") or "-", unit,
-                         u.get("input_tokens") or 0, cc, min(cc1h, cc),
-                         u.get("cache_read_input_tokens") or 0,
-                         u.get("output_tokens") or 0])
+            cols = [u.get("input_tokens") or 0, cc, min(cc1h, cc),
+                    u.get("cache_read_input_tokens") or 0,
+                    u.get("output_tokens") or 0]
+            held = byid.get(mid)
+            if held is None:
+                row = [mid, int(ts), msg.get("model") or "?",
+                       d.get("effort") or "-", unit] + cols
+                byid[mid] = row
+                rows.append(row)
+            elif cols[4] > held[9]:
+                held[5:10] = cols
 
 
 def parse_session(s):
     rec = {"rows": [], "segs": [], "slug": None, "title": None,
            "comp": 0, "intr": 0, "err": 0, "agents": {},
-           "_mids": set(), "_marks": set(), "_branch": Counter(),
+           "_byid": {}, "_marks": set(), "_branch": Counter(),
            "_cwd": Counter(), "_local": set()}
     scan_unit(iters_for(s["main"]), "", rec, want_meta=True)
     for key, specs in sorted(s["subs"].items()):
@@ -716,7 +724,7 @@ def parse_session(s):
     rec["branch"] = (rec["_branch"].most_common(1) or [(None, 0)])[0][0]
     rec["cwd"] = (min(rec["_cwd"].items(), key=lambda kv: (-kv[1], kv[0]))[0]
                   if rec["_cwd"] else None)
-    for k in ("_mids", "_marks", "_branch", "_cwd", "_local"):
+    for k in ("_byid", "_marks", "_branch", "_cwd", "_local"):
         del rec[k]
     return rec
 
