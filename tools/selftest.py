@@ -650,6 +650,7 @@ class TreeCase(unittest.TestCase):
                     fh.write(json.dumps(d) + "\n")
         proc, out = run(["--root", root])
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.out = out
         return payload(out)
 
 
@@ -1897,6 +1898,86 @@ console.log(JSON.stringify({
         self.assertEqual(got["rl"], 1)
         self.assertEqual(got["display"], "none")
         self.assertEqual(got["calls"], [])
+
+
+PAGE_STUBS = """
+// DOM stand-ins, enough for render(): elements record what is set on them.
+class El {
+  constructor(tag){ this.tag = tag; this.children = []; this.style = {};
+    this.dataset = {}; this.textContent = ''; this.innerHTML = '';
+    this.className = ''; this.classList = {add(){}, remove(){}, toggle(){}}; }
+  appendChild(c){ this.children.push(c); return c; }
+  append(...cs){ cs.forEach(c => this.appendChild(c)); }
+  setAttribute(){} addEventListener(){} contains(){ return false; }
+  querySelector(){ return new El('x'); } querySelectorAll(){ return []; }
+}
+const ELS = {};
+globalThis.document = {
+  querySelector: s => (ELS[s] = ELS[s] || new El(s)),
+  createElement: t => new El(t), addEventListener(){}, body: {} };
+globalThis.getComputedStyle = () => ({getPropertyValue: () => ''});
+"""
+
+
+def rendered(html):
+    """Run the report's own script, render() included, under node against DOM
+    stubs, with the chart drawers and hbars replaced by recorders. Returns the
+    KPI markup, the sessions table's header and cells, and each hbars call."""
+    body = html[html.index("<script>") + len("<script>"):]
+    script = body[body.index("const DATA ="):body.index("// ---- boot ----")]
+    js = PAGE_STUBS + script + """
+const CALLS = [];
+hbars = (elId, items) => CALLS.push({elId, items});
+lineChart = stackedChart = () => {};
+buildFilters = () => {};
+render();
+const tbl = ELS['#sessTable'].children[0];
+console.log(JSON.stringify({
+  kpis: ELS['#kpis'].innerHTML,
+  head: tbl ? tbl.innerHTML : null,
+  rows: tbl ? tbl.children[0].children.map(tr => tr.children.map(td => td.textContent)) : [],
+  empty: ELS['#sessTable'].innerHTML,
+  hbars: CALLS}));
+"""
+    path = os.path.join(tempfile.mkdtemp(dir=TMP), "render.js")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(js)
+    r = subprocess.run([NODE, path], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return json.loads(r.stdout)
+
+
+@unittest.skipIf(not NODE, "needs a JS engine")
+class TestSessionsTable(TreeCase):
+    """D-17: Top sessions gains an Active column and marks background
+    sessions; an unknown time never reads as zero."""
+
+    def table(self, *sessions):
+        self.tree(*sessions)
+        return rendered(report(self.out))
+
+    def test_active_time_and_the_background_marker(self):
+        got = self.table(
+            [msg_line("m1", inp=300), turn_line("u1", 3723000)],
+            [msg_line("m2", inp=200)],
+            [msg_line("m3", inp=100, sessionKind="bg")])
+        self.assertIn("Active", got["head"])
+        self.assertIn("Billed-equiv", got["head"])
+        self.assertEqual([(r[0], r[3]) for r in got["rows"]],
+                         [("sess-0", "1h 2m"), ("sess-1", "—"),
+                          ("sess-2 · background", "—")])
+
+    def test_a_zero_duration_is_not_a_dash(self):
+        got = self.table([msg_line("m1"), turn_line("u1", 0)])
+        self.assertEqual(got["rows"][0][3], "0h 0m")
+
+    def test_the_existing_fixture_has_no_times_and_no_marker(self):
+        _, out = run(["--root", P["primary"]])
+        got = rendered(report(out))
+        self.assertTrue(got["rows"])
+        for r in got["rows"]:
+            self.assertEqual(r[3], "—")
+            self.assertFalse(r[0].endswith(" · background"), r)
 
 
 FIVE_HOUR_WORDING = re.compile(

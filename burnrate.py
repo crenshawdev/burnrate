@@ -1348,6 +1348,8 @@ const fmtDay   = d => { const t = new Date(dayEpoch(d)*1000);
 const fmt = n => n >= 1e9 ? (n/1e9).toFixed(2)+'B' : n >= 1e6 ? (n/1e6).toFixed(1)+'M'
   : n >= 1e3 ? (n/1e3).toFixed(n<1e4?1:0)+'k' : Math.round(n).toString();
 const fmtFull = n => Math.round(n).toLocaleString('en-US');
+const fmtActive = ms => ms == null ? '—'
+  : Math.floor(ms/3600000) + 'h ' + Math.floor(ms%3600000/60000) + 'm';
 // cache read over every prompt token, floored so one miss never shows as 100%.
 // cc is the whole cache write and already holds the 1h half.
 const hitPct = (inp, cc, cr) => inp + cc + cr > 0
@@ -1356,8 +1358,9 @@ const hitPct = (inp, cc, cr) => inp + cc + cr > 0
 // column indexes: daily row = [day,p,cmd,model,effort,kind,be,in,cc,cc1h,cr,out,n,
 //   agent,plugin,mcpS,mcpT,bg,ttl,think,wsearch,wfetch]; bg is 1 or 0, ttl the
 //   requested cache TTL ("" when unrecorded); think is part of out, not extra.
-// sessions row = [id,p,title,t0,t1,be,out,n,peak,comp,agents,intr,bgN] (bgN is
-//   the count of its background messages)
+// sessions row = [id,p,title,t0,t1,be,out,n,peak,comp,agents,intr,bgN,activeMs]
+//   (bgN is the count of its background messages; activeMs is null when the
+//   session has no turn_duration lines, which is not the same as 0)
 const D = {day:0,p:1,cmd:2,model:3,effort:4,kind:5,be:6,inp:7,cc:8,cc1h:9,cr:10,out:11,n:12,
   agent:13,plugin:14,mcpS:15,mcpT:16,bg:17,ttl:18,think:19,wsearch:20,wfetch:21};
 
@@ -1790,12 +1793,13 @@ function render(){
   const top = sess.slice(0, 15);
   const st = document.createElement('table');
   st.innerHTML = `<thead><tr><th>Session</th><th>Project</th><th>Day</th>
-    <th class="num">Billed-equiv</th><th class="num">Output</th><th class="num">Msgs</th>
+    <th class="num">Active</th><th class="num">Billed-equiv</th><th class="num">Output</th><th class="num">Msgs</th>
     <th class="num">Peak ctx</th><th class="num">Compact</th><th class="num">Agents</th></tr></thead>`;
   const tb = document.createElement('tbody');
   for (const s of top){
     const tr = document.createElement('tr');
-    const cells = [[s[2] || s[0], 't'], [s[1]], [fmtDay(epochDay(s[3]))],
+    const cells = [[(s[2] || s[0]) + (s[12] ? ' · background' : ''), 't'], [s[1]],
+      [fmtDay(epochDay(s[3]))], [fmtActive(s[13]),'num'],
       [fmtFull(s[5]),'num'], [fmt(s[6]),'num'], [fmtFull(s[7]),'num'],
       [fmt(s[8]),'num'], [s[9] || '','num'], [s[10] || '','num']];
     for (const [txt, cls] of cells){
