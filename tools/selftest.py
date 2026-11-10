@@ -570,6 +570,25 @@ class TestCommandAttribution(unittest.TestCase):
              answer, notice, sdk, billed_reply("m2", 20)])
         self.assertEqual(got, {"plan": 120})
 
+    def turn_origin(self, origin, **extra):
+        """/plan, a billed message, a user line carrying only turnOrigin, then
+        another billed message."""
+        mid = {"type": "user", "uuid": "p1", "turnOrigin": origin,
+               "message": {"role": "user", "content": "now the audit"}}
+        mid.update(extra)
+        return self.by_command(
+            [typed_command("c1", "plan"), billed_reply("m1", 100), mid,
+             billed_reply("m2", 20)])
+
+    def test_a_human_turn_origin_alone_ends_the_command(self):
+        self.assertEqual(self.turn_origin("human"), {"plan": 100, "": 20})
+
+    def test_a_task_notification_turn_origin_leaves_the_command_open(self):
+        self.assertEqual(self.turn_origin("task_notification"), {"plan": 120})
+
+    def test_a_meta_line_leaves_the_command_open_whatever_its_turn_origin(self):
+        self.assertEqual(self.turn_origin("human", isMeta=True), {"plan": 120})
+
     def test_a_tool_result_quoting_a_command_opens_no_segment(self):
         quoted = {"type": "user", "uuid": "r1", "parentUuid": "u-m1",
                   "message": {"role": "user", "content": [

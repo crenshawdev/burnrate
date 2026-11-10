@@ -621,12 +621,13 @@ def count_of(v):
 
 def typed_by_user(d):
     """A prompt the user typed, pasted or accepted. Claude Code marks those
-    origin.kind == "human"; task notifications, hook feedback, SDK prompts and
-    ! shell input carry no such origin. Transcripts that predate the field
-    never end a segment early."""
+    turnOrigin == "human" or origin.kind == "human"; task notifications, hook
+    feedback, SDK prompts and ! shell input carry neither, and isMeta lines
+    never count. Lines carrying neither marker never end a segment early."""
     o = d.get("origin")
     return (d.get("type") == "user" and not d.get("isMeta")
-            and isinstance(o, dict) and o.get("kind") == "human")
+            and (d.get("turnOrigin") == "human"
+                 or (isinstance(o, dict) and o.get("kind") == "human")))
 
 
 def scan_unit(iters, unit, rec, want_meta):
