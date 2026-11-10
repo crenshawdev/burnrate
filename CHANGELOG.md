@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.0.0 (Unreleased)
+## [2.0.0] - 2026-11-10
 
 The 5-hour blocks are gone. burnrate now describes the 7-day rate-limit window
 alone. It also reads the fields Claude Code now records in its transcripts, and
@@ -85,3 +85,5 @@ transcripts written before those fields existed still parse.
   every session.
 - Transcripts without the new fields parse as before. An unstamped message
   falls back to the segment rule and reads as foreground.
+
+[2.0.0]: https://github.com/crenshawdev/burnrate/releases/tag/v2.0.0
