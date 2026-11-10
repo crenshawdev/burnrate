@@ -132,6 +132,19 @@ TERMINUS_SOURCE = "terminus"
 TERMINUS_WAIT = 120   # seconds a short terminus call gets before it is dropped
 
 
+class TerminusError(Exception):
+    """terminus failed: a call that can't run or exits non-zero, a list that is
+    not ok, or an export stream that did not frame. The message is burnrate's
+    own short account; terminus's stderr never goes into it."""
+
+
+def terminus_warn(why):
+    """The one line a failed terminus costs the run (D-10), printed even under
+    --quiet the way the zstandard warnings are. Never terminus's own stderr."""
+    print(f"warning: terminus failed ({why}) -- continuing without it",
+          file=sys.stderr)
+
+
 def env_get(env, name, platform):
     """env[name], matched case-insensitively on win32 where PATH may be Path."""
     if name in env:
@@ -172,29 +185,30 @@ def find_terminus(env, platform=None):
 
 
 def terminus_out(exe, argv, env):
-    """stdout of one read-only terminus call, or None when it can't start, runs
-    past TERMINUS_WAIT or exits non-zero. Every terminus call is an argv list
-    with no shell, under the caller's env. Its stderr is captured and dropped
-    (it carries a transcript-privacy notice and a line per miss) and its output
-    is decoded as UTF-8, never by locale."""
+    """stdout of one read-only terminus call; TerminusError when it can't start,
+    runs past TERMINUS_WAIT or exits non-zero. Every terminus call is an argv
+    list with no shell, under the caller's env. Its stderr is captured and
+    dropped (it carries a transcript-privacy notice and a line per miss) and its
+    output is decoded as UTF-8, never by locale."""
     try:
         p = subprocess.run([exe, *argv], env=env, stdin=subprocess.DEVNULL,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                            timeout=TERMINUS_WAIT)
-    except (OSError, subprocess.SubprocessError):
-        return None
+    except (OSError, subprocess.SubprocessError) as e:
+        raise TerminusError(f"{argv[0]} can't run: {e.__class__.__name__}")
     if p.returncode != 0:
-        return None
+        raise TerminusError(f"{argv[0]} exited {p.returncode}")
     return p.stdout.decode("utf-8", "replace")
 
 
 def terminus_usable(exe, env):
     """True when `exe --version` prints MAJOR.MINOR.PATCH and it is 2.0.0 or
-    later. An older build might read `export --stdout` as `export <dir>` and
-    write its whole archive to disk; anything that isn't a bare version is some
-    other program called terminus."""
+    later. A binary that can't answer is a TerminusError, an answer that isn't
+    a version is just False. An older build might read `export --stdout` as
+    `export <dir>` and write its whole archive to disk; anything that isn't a
+    bare version is some other program called terminus."""
     out = terminus_out(exe, ["--version"], env)
-    m = re.fullmatch(r"([0-9]+)\.([0-9]+)\.([0-9]+)", (out or "").strip())
+    m = re.fullmatch(r"([0-9]+)\.([0-9]+)\.([0-9]+)", out.strip())
     return bool(m) and tuple(int(g) for g in m.groups()) >= (2, 0, 0)
 
 
@@ -283,18 +297,28 @@ def open_terminus(env):
 
     The list is asked for once, here, so a terminus that can't answer drops out
     before the cache file is chosen. It is always `--project '*'`: without it
-    terminus scopes the list to the cwd's project."""
+    terminus scopes the list to the cwd's project. A version that is old or
+    isn't one is the silent not-installed case; any failure past that is one
+    warning and the run goes on without terminus (D-10)."""
     exe = find_terminus(env)
-    if not exe or not terminus_usable(exe, env):
+    if not exe:
         return None
-    out = terminus_out(exe, ["sessions", "--project", "*", "--json"], env)
     try:
-        d = json.loads(out)
-        entries = d["data"]["sessions"]
-        ok = d["ok"] is True
-    except (TypeError, ValueError, KeyError):
-        return None
-    if not ok or not isinstance(entries, list):
+        if not terminus_usable(exe, env):
+            return None
+        out = terminus_out(exe, ["sessions", "--project", "*", "--json"], env)
+        try:
+            d = json.loads(out)
+            entries = d["data"]["sessions"]
+            ok = d["ok"] is True
+        except (TypeError, ValueError, KeyError):
+            raise TerminusError("the session list didn't parse")
+        if not ok:
+            raise TerminusError("the session list says ok: false")
+        if not isinstance(entries, list):
+            raise TerminusError("the session list isn't a list")
+    except TerminusError as e:
+        terminus_warn(e)
         return None
     return {"exe": exe, "env": env, "sessions": terminus_sessions(entries)}
 
@@ -510,6 +534,8 @@ def resolve_sources(args, env=None):
     used = any(p != root for _k, p in sources)
     if not used:
         label = None
+    # what the run is without terminus: what a failed terminus falls back to
+    plain = {"sources": sources, "archive_label": label, "archive_used": used}
     # alongside whatever archive was chosen above, never instead of it, and
     # named without a path: a report must not embed the user's directory tree
     terminus = None if no_archive else open_terminus(env)
@@ -521,7 +547,7 @@ def resolve_sources(args, env=None):
             "rl_log": os.path.join(config_dir, "usage-logger",
                                    "usage-log.jsonl"),
             "sources": sources, "archive_label": label, "archive_used": used,
-            "terminus": terminus}
+            "terminus": terminus, "plain": plain}
 
 
 def path_segments(p):
@@ -665,10 +691,6 @@ def arch_lines(unit_dir):
                         yield buf.decode("utf-8", "replace")
         except Exception:
             continue
-
-
-class TerminusError(Exception):
-    """terminus's export stream did not frame."""
 
 
 class TerminusExport:
@@ -1483,8 +1505,15 @@ def main():
         sessions = collect(cpath, src["sources"], a.rebuild, a.quiet,
                            src["terminus"])
     except TerminusError as e:
-        print(f"error: terminus export didn't frame: {e}", file=sys.stderr)
-        sys.exit(1)
+        # D-10: the run restarts as one without terminus, on that run's own
+        # cache file. collect saves nothing before its export finishes, so the
+        # terminus cache file stays as it was for the next healthy run.
+        terminus_warn(e)
+        src = dict(src, terminus=None, **src["plain"])
+        cpath = cache_path(src["sources"])
+        if not a.quiet:
+            print(f"scanning transcripts... (cache {cpath})", file=sys.stderr)
+        sessions = collect(cpath, src["sources"], a.rebuild, a.quiet, None)
     data = aggregate(sessions, a.tz_offset, src["rl_log"])
     data["archive_used"] = src["archive_used"]
     data["archive_label"] = src["archive_label"]

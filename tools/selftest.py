@@ -277,7 +277,7 @@ elif argv == ["export", "--stdout"]:
             body = body_of(e)
             hdr = {"project": e["project"], "session_key": k,
                    "watermark": len(body) + e.get("short_by", 0)}
-            if e.get("evicted"):
+            if e.get("evicted") or e.get("frame_evicted"):
                 hdr["evicted"] = True
                 body = b""
             out.write(json.dumps({"terminus": hdr}).encode("utf-8") + b"\n")
@@ -296,7 +296,8 @@ class StubTerminus:
     session_key, lines); a line is a str or a dict that gets json-dumped. Top
     level switches (`version`, `fail` = a command name, `not_ok`, `bad_json`)
     go in `top`; per-key ones (`watermark`, `evicted`, `project_pre_worktree`,
-    `no_frame`, `short_by`) go in `per`, keyed by session_key."""
+    `no_frame`, `short_by`, `frame_evicted` = only the export's header says
+    so) go in `per`, keyed by session_key."""
 
     def __init__(self, triples=(), per=None, **top):
         self.dir = tempfile.mkdtemp(dir=TMP, prefix="terminus-stub-")
@@ -3873,55 +3874,62 @@ class TestTerminusExport(unittest.TestCase):
         for call in stub.calls():
             self.assertIn(call["argv"], STUB_SHAPES)
 
-    def fails(self, stub, why):
+    def falls_back(self, stub, why):
+        """Any export that doesn't frame is one warning and a run without
+        terminus (D-10), not the error exit Plan 1 stopped on."""
         c = tempfile.mkdtemp(dir=TMP)
         out = tempfile.mkdtemp(dir=TMP)
         proc = subprocess.run(
             [sys.executable, BR, "--out", out, "--json", "--no-open",
              "--quiet"], env=stub.env(XDG_CACHE_HOME=c), timeout=60,
             capture_output=True, text=True)
-        self.assertEqual(proc.returncode, 1, proc.stderr)
-        self.assertIn("error: terminus export didn't frame", proc.stderr)
-        self.assertIn(why, proc.stderr)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        warns = [x for x in proc.stderr.splitlines()
+                 if x.startswith("warning:")]
+        self.assertEqual(len(warns), 1, proc.stderr)
+        self.assertIn("terminus", warns[0])
+        self.assertIn(why, warns[0])
         self.assertNotIn("Traceback", proc.stderr)
         self.assertNotIn(STUB_MARKER, proc.stdout + proc.stderr)
-        self.assertEqual(os.listdir(out), [])
-        self.assertFalse(os.path.exists(os.path.join(c, "burnrate")))
+        data = payload(out)
+        self.assertFalse(data["archive_used"])
+        self.assertIsNone(data["archive_label"])
+        self.assertEqual(total_be(data), EXP["total_be"])
         for call in stub.calls():
             if call["argv"][0] == "export":
                 with self.assertRaises(ProcessLookupError):
                     os.kill(call["pid"], 0)
 
-    def test_a_key_with_no_frame_ends_the_run_and_leaves_no_process(self):
+    def test_a_key_with_no_frame_falls_back_and_leaves_no_process(self):
         big = [tm_msg(f"tm-big-{i}", 1) for i in range(2000)]
         stub = StubTerminus([
             (TM_SOLO, "aa-gone.jsonl", ["{}"]),
             (TM_SOLO, "zz-big.jsonl", big)],
             per={"aa-gone.jsonl": {"no_frame": True}})
         self.assertGreater(len(json.dumps(big)), 128 * 1024)
-        self.fails(stub, "where 'aa-gone.jsonl' was next")
+        self.falls_back(stub, "where 'aa-gone.jsonl' was next")
 
-    def test_an_evicted_header_ends_the_run(self):
+    def test_an_evicted_header_the_list_did_not_mention_falls_back(self):
         stub = tm_store()
-        stub.entry(TM_KEYS[1])["evicted"] = True
+        stub.entry(TM_KEYS[1])["frame_evicted"] = True
         stub.save()
-        self.fails(stub, "came back evicted")
+        self.falls_back(stub, "came back evicted")
 
-    def test_a_cut_short_body_ends_the_run(self):
+    def test_a_cut_short_body_falls_back(self):
         stub = tm_store()
         stub.entry(TM_KEYS[2])["short_by"] = 5
         stub.save()
-        self.fails(stub, "cut short")
+        self.falls_back(stub, "cut short")
 
-    def test_bytes_after_the_last_frame_end_the_run(self):
+    def test_bytes_after_the_last_frame_fall_back(self):
         stub = tm_store()
         stub.entry(TM_KEYS[2])["short_by"] = -3
         stub.save()
-        self.fails(stub, "bytes after the last frame")
+        self.falls_back(stub, "bytes after the last frame")
 
-    def test_a_non_zero_export_ends_the_run(self):
+    def test_a_non_zero_export_falls_back(self):
         stub = tm_store(fail="export")
-        self.fails(stub, "no frame header")
+        self.falls_back(stub, "no frame header")
 
 
 class TestTerminusReport(unittest.TestCase):
@@ -3964,6 +3972,116 @@ class TestTerminusReport(unittest.TestCase):
                 self.env_for(stub, XDG_CONFIG_HOME=P["config_home"]))
         self.assertIn("zstandard not installed -- archive skipped", err)
         self.assertEqual(src["archive_label"], "Terminus")
+
+    def test_a_terminus_that_failed_is_not_named(self):
+        src, err = resolve_in(self.env_for(tm_store(fail="sessions")),
+                              archive=P["backup"])
+        self.assertEqual(src["archive_label"], "archive: backup")
+        self.assertEqual(src["plain"]["archive_label"], "archive: backup")
+        self.assertEqual(len([x for x in err.splitlines()
+                              if x.startswith("warning:")]), 1)
+
+
+def payload_sans_generated(out):
+    d = payload(out)
+    d.pop("generated")
+    return d
+
+
+class TestTerminusFailure(unittest.TestCase):
+    """D-10/D-11, AC4: any Terminus failure is one burnrate warning and a run
+    exactly like one without Terminus, and none of the stub's stderr shows."""
+
+    def go(self, stub, args=()):
+        c = tempfile.mkdtemp(dir=TMP)
+        proc, out = run(args, env=stub.env(XDG_CACHE_HOME=c))
+        return proc, out, c
+
+    def warnings(self, proc):
+        return [x for x in proc.stderr.splitlines() if x.startswith("warning:")]
+
+    def test_the_payload_equals_a_run_without_terminus_in_every_case(self):
+        proc, out = run(env=base_env(XDG_CACHE_HOME=tempfile.mkdtemp(dir=TMP)))
+        self.assertEqual(self.warnings(proc), [])
+        want = payload_sans_generated(out)
+        self.assertFalse(want["archive_used"])
+
+        def short():
+            st = tm_store()
+            st.entry(TM_KEYS[2])["short_by"] = 5
+            st.save()
+            return st
+
+        def gone():
+            st = tm_store()
+            st.entry(TM_KEYS[1])["no_frame"] = True
+            st.save()
+            return st
+
+        silent = [("--no-archive", tm_store(), ["--no-archive"]),
+                  ("1.9.0", tm_store(version="1.9.0"), []),
+                  ("unparsed version", tm_store(version="Terminus 3.1"), [])]
+        loud = [("version exit", tm_store(fail="version"), []),
+                ("sessions exit", tm_store(fail="sessions"), []),
+                ("export exit", tm_store(fail="export"), []),
+                ("ok false", tm_store(not_ok=True), []),
+                ("bad json", tm_store(bad_json=True), []),
+                ("short frame", short(), []),
+                ("no frame", gone(), [])]
+        for name, stub, args in silent + loud:
+            with self.subTest(name):
+                proc, out, _ = self.go(stub, args)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                warns = self.warnings(proc)
+                if (name, stub, args) in silent:
+                    self.assertEqual(warns, [])
+                else:
+                    self.assertEqual(len(warns), 1, proc.stderr)
+                    self.assertIn("terminus", warns[0].lower())
+                self.assertNotIn(STUB_MARKER, proc.stdout + proc.stderr)
+                self.assertEqual(payload_sans_generated(out), want)
+
+    def test_a_failed_run_leaves_the_terminus_cache_for_the_next_one(self):
+        stub = tm_store()
+        stub.add(TM_SOLO, "tm-two.jsonl", [tm_msg("tm-two-0", 3000)])
+        stub.save()
+        c = tempfile.mkdtemp(dir=TMP)
+        cdir = os.path.join(c, "burnrate")
+        two = ["tm-two.jsonl"]
+
+        def go(**top):
+            stub.data.update(top)
+            stub.save()
+            return run(env=stub.env(XDG_CACHE_HOME=c))
+
+        def cached():
+            out = {}
+            for f in os.listdir(cdir):
+                with open(os.path.join(cdir, f), "rb") as fh:
+                    out[f] = fh.read()
+            return out
+
+        proc, _ = go()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(stub.exports(), [TM_KEYS + two])
+        before = cached()
+        self.assertEqual(len(before), 1)
+        stub.entry("tm-two.jsonl")["lines"].append(tm_msg("tm-two-1", 111))
+        proc, out = go(fail="export")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.warnings(proc)), 1, proc.stderr)
+        self.assertEqual(total_be(payload(out)), EXP["total_be"])
+        after = cached()
+        for f, body in before.items():
+            self.assertEqual(after[f], body)
+        stub.data.pop("fail")
+        proc, out = go()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.warnings(proc), [])
+        self.assertEqual(stub.exports()[-1], two)
+        self.assertEqual(len(stub.exports()), 3)
+        self.assertEqual(total_be(payload(out)),
+                         EXP["total_be"] + TM_BE + 3000 + 111)
 
 
 if __name__ == "__main__":
