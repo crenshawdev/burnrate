@@ -30,6 +30,18 @@ describe('the switch', () => {
     expect(drawn).toEqual([undefined])
   })
 
+  test('off, a session start alone takes the line away', { options: { showStatusLine: false } }, async ($, on) => {
+    const drawn = world(on, { [SESSION]: { input: 1, output: 1, read: 9, write: 0 } })
+    await $.session.start(START)
+    expect(drawn).toEqual([undefined])
+  })
+
+  test('on, a session start alone draws the line', async ($, on) => {
+    const drawn = world(on, { [SESSION]: { input: 1, output: 1, read: 9, write: 0 } })
+    await $.session.start(START)
+    expect(last(drawn)).toBe('session cache hit 90.0%')
+  })
+
   test('unset, the line shows', async ($, on) => {
     const drawn = world(on)
     await $.session.measure(MEASURE)

@@ -89,7 +89,13 @@ async function draw($: EngineInterface) {
 export const register: Register = (on, options) => {
   show = options.showStatusLine !== false
   // a reload may hand this module over with the old tick gone, so start clean
-  tick?.cancel(); tick = undefined; seen = false; sums.clear()
+  tick?.cancel(); tick = undefined; seen = false; cleared = false; sums.clear()
+
+  // a plugin reload fires neither of the hooks below, so this is what clears or draws the line at once
+  on('session.start', async ($, e, next) => {
+    await draw($).catch(() => {})
+    return next(e)
+  })
 
   on('session.measure', async ($, e, next) => {
     seen = true
