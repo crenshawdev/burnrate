@@ -50,7 +50,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
 CW5, CW1H, CR = 1.25, 2.00, 0.10
-CACHE_VER = 3
+CACHE_VER = 4
 
 CMD_RE = re.compile(r"<command-name>/?([A-Za-z0-9:_.-]+)</command-name>")
 NAME_RE = re.compile(r"[A-Za-z0-9:_.-]+")
@@ -608,6 +608,16 @@ def seg_name(d):
     return None
 
 
+def text_of(v):
+    """A stamp as written when it is a non-empty string, else ''. Transcript
+    fields are untrusted: a number or object where a name belongs is no name."""
+    return v if isinstance(v, str) and v else ""
+
+
+def count_of(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+
+
 def typed_by_user(d):
     """A prompt the user typed, pasted or accepted. Claude Code marks those
     origin.kind == "human"; task notifications, hook feedback, SDK prompts and
@@ -695,17 +705,32 @@ def scan_unit(iters, unit, rec, want_meta):
                 continue
             cc = u.get("cache_creation_input_tokens") or 0
             cc1h = (u.get("cache_creation") or {}).get("ephemeral_1h_input_tokens") or 0
+            out = u.get("output_tokens") or 0
+            det, srv = u.get("output_tokens_details"), u.get("server_tool_use")
+            det = det if isinstance(det, dict) else {}
+            srv = srv if isinstance(srv, dict) else {}
+            # one line supplies the whole row: usage, then thinking (part of
+            # output, so capped at it), web counts and the per-line stamps
             cols = [u.get("input_tokens") or 0, cc, min(cc1h, cc),
-                    u.get("cache_read_input_tokens") or 0,
-                    u.get("output_tokens") or 0]
+                    u.get("cache_read_input_tokens") or 0, out,
+                    min(count_of(det.get("thinking_tokens")), out),
+                    count_of(srv.get("web_search_requests")),
+                    count_of(srv.get("web_fetch_requests")),
+                    text_of(d.get("promptCacheRequested")),
+                    1 if d.get("sessionKind") == "bg" else 0,
+                    text_of(d.get("attributionSkill")),
+                    text_of(d.get("attributionAgent")),
+                    text_of(d.get("attributionPlugin")),
+                    text_of(d.get("attributionMcpServer")),
+                    text_of(d.get("attributionMcpTool"))]
             held = byid.get(mid)
             if held is None:
                 row = [mid, int(ts), msg.get("model") or "?",
                        d.get("effort") or "-", unit] + cols
                 byid[mid] = row
                 rows.append(row)
-            elif cols[4] > held[9]:
-                held[5:10] = cols
+            elif out > held[9]:
+                held[5:] = cols
 
 
 def parse_session(s):
@@ -843,7 +868,7 @@ def be_of(r):
     of cache_creation cannot share a weight. Transcripts that predate the
     cache_creation breakdown report cc1h = 0, which weights their writes as 5m
     -- an undercount, but the only reading their data supports."""
-    _, _, _, _, _, inp, cc, cc1h, cr, _ = r
+    inp, cc, cc1h, cr = r[5], r[6], r[7], r[8]
     return inp + CW5 * (cc - cc1h) + CW1H * cc1h + CR * cr
 
 
@@ -925,13 +950,14 @@ def aggregate(sessions, tz_offset, rl_log):
                 agent_first[r[4]] = r[1]
         peak_ctx = 0
         t0 = t1 = rows[0][1]
-        be = out = 0.0
+        be = out = bg = 0.0
         for r in rows:
             ts, unit = r[1], r[4]
             cmd = seg_at(segs, agent_first.get(unit, ts) if unit else ts)
             all_rows.append((ts, proj, cmd, r[2], r[3], "a" if unit else "m", r))
             be += be_of(r)
             out += r[9]
+            bg += r[14]
             t0, t1 = min(t0, ts), max(t1, ts)
             if not unit:
                 peak_ctx = max(peak_ctx, r[5] + r[6] + r[8])
@@ -939,14 +965,18 @@ def aggregate(sessions, tz_offset, rl_log):
         sess_rows.append([ent["sid"][:8], proj,
                           rec.get("title") or rec.get("slug") or "",
                           t0, t1, round(be), round(out), len(rows), peak_ctx,
-                          rec["comp"], len(rec["agents"]), rec["intr"]])
+                          rec["comp"], len(rec["agents"]), rec["intr"], int(bg)])
 
     projects = [p for p, _ in proj_be.most_common()]
     pidx = {p: i for i, p in enumerate(projects)}
 
-    daily = defaultdict(lambda: [0.0] * 8)   # be,in,cc,cc1h,cr,out,msgs
+    # be,in,cc,cc1h,cr,out,msgs,thinking,web_search,web_fetch. The grain also
+    # holds agent, plugin, mcp server, mcp tool, background flag and requested
+    # cache ttl: strings are "" when absent, never None, so keys always sort.
+    daily = defaultdict(lambda: [0.0] * 10)
     for ts, proj, cmd, model, effort, kind, r in all_rows:
-        k = (day_of(ts), pidx[proj], cmd, model, effort, kind)
+        k = (day_of(ts), pidx[proj], cmd, model, effort, kind,
+             r[16], r[17], r[18], r[19], r[14], r[13])
         a = daily[k]
         a[0] += be_of(r)
         a[1] += r[5]
@@ -955,9 +985,15 @@ def aggregate(sessions, tz_offset, rl_log):
         a[4] += r[8]
         a[5] += r[9]
         a[6] += 1
+        a[7] += r[10]
+        a[8] += r[11]
+        a[9] += r[12]
     daily_rows = [[d, p, c, m, e, k, round(a[0]), round(a[1]), round(a[2]),
-                   round(a[3]), round(a[4]), round(a[5]), int(a[6])]
-                  for (d, p, c, m, e, k), a in sorted(daily.items())]
+                   round(a[3]), round(a[4]), round(a[5]), int(a[6]),
+                   ag, pl, ms, mt, bgf, ttl,
+                   int(a[7]), int(a[8]), int(a[9])]
+                  for (d, p, c, m, e, k, ag, pl, ms, mt, bgf, ttl), a
+                  in sorted(daily.items())]
 
     sess_rows.sort(key=lambda s: -s[5])
     return {
@@ -1290,8 +1326,13 @@ const fmtFull = n => Math.round(n).toLocaleString('en-US');
 const hitPct = (inp, cc, cr) => inp + cc + cr > 0
   ? Math.floor(cr / (inp + cc + cr) * 1000) / 10 : null;
 
-// column indexes: daily row = [day,p,cmd,model,effort,kind,be,in,cc,cc1h,cr,out,n]
-const D = {day:0,p:1,cmd:2,model:3,effort:4,kind:5,be:6,inp:7,cc:8,cc1h:9,cr:10,out:11,n:12};
+// column indexes: daily row = [day,p,cmd,model,effort,kind,be,in,cc,cc1h,cr,out,n,
+//   agent,plugin,mcpS,mcpT,bg,ttl,think,wsearch,wfetch]; bg is 1 or 0, ttl the
+//   requested cache TTL ("" when unrecorded); think is part of out, not extra.
+// sessions row = [id,p,title,t0,t1,be,out,n,peak,comp,agents,intr,bgN] (bgN is
+//   the count of its background messages)
+const D = {day:0,p:1,cmd:2,model:3,effort:4,kind:5,be:6,inp:7,cc:8,cc1h:9,cr:10,out:11,n:12,
+  agent:13,plugin:14,mcpS:15,mcpT:16,bg:17,ttl:18,think:19,wsearch:20,wfetch:21};
 
 const allDays = [...new Set(DATA.daily.map(r => r[D.day]))].sort();
 // both bounds fall back: an empty tree is a supported flow (a warned-about

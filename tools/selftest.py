@@ -13,6 +13,7 @@ import ast
 import atexit
 import contextlib
 import getpass
+import gzip
 import importlib.util
 import io
 import json
@@ -655,6 +656,109 @@ class TestUsageLine(TreeCase):
         got = self.tree([msg_line("m2", inp=100, out=7),
                          msg_line("m2", inp=999, out=7)])
         self.assertEqual(got["daily"][0][6], 100)
+
+
+class TestMessageFields(TreeCase):
+    """The fields Claude Code now records on each message reach the payload's
+    daily rows: 13 agent, 14 plugin, 15 mcp server, 16 mcp tool, 17 background
+    flag, 18 requested cache ttl, then 19 thinking, 20 web search, 21 web fetch."""
+
+    def total(self, got, col):
+        return sum(r[col] for r in got["daily"])
+
+    def test_thinking_comes_from_the_fullest_line(self):
+        got = self.tree([
+            msg_line("m1", out=5, details={"thinking_tokens": 2}),
+            msg_line("m1", out=300, details={"thinking_tokens": 120})])
+        self.assertEqual((self.total(got, 11), self.total(got, 19)), (300, 120))
+
+    def test_thinking_never_exceeds_output(self):
+        got = self.tree([msg_line("m1", out=300,
+                                  details={"thinking_tokens": 500})])
+        self.assertEqual(self.total(got, 19), 300)
+
+    def test_thinking_is_not_billed_on_top_of_output(self):
+        plain = self.tree([msg_line("m1", inp=10, cr=2000, out=300)])
+        think = self.tree([msg_line("m1", inp=10, cr=2000, out=300,
+                                    details={"thinking_tokens": 120})])
+        self.assertEqual(self.total(plain, 19), 0)
+        self.assertEqual((self.total(think, 6), self.total(think, 11)),
+                         (self.total(plain, 6), self.total(plain, 11)))
+
+    def test_web_counts_are_summed(self):
+        got = self.tree([
+            msg_line("m1", server={"web_search_requests": 2,
+                                   "web_fetch_requests": 0}),
+            msg_line("m2", server={"web_search_requests": 1,
+                                   "web_fetch_requests": 3}),
+            msg_line("m3")])
+        self.assertEqual((self.total(got, 20), self.total(got, 21)), (3, 3))
+
+    def test_background_rows_are_flagged_and_kind_is_unchanged(self):
+        got = self.tree(
+            [msg_line("m1", sessionKind="bg"), msg_line("m2"),
+             msg_line("m3", sessionKind="interactive")],
+            subs={(0, "agent-1"): [msg_line("m4", sessionKind="bg"),
+                                   msg_line("m5")]})
+        flags = {}
+        for r in got["daily"]:
+            flags[(r[5], r[17])] = flags.get((r[5], r[17]), 0) + r[12]
+        self.assertEqual(flags, {("m", 1): 1, ("m", 0): 2,
+                                 ("a", 1): 1, ("a", 0): 1})
+        self.assertEqual([s[12] for s in got["sessions"]], [2])
+
+    def test_requested_cache_ttl_is_carried_as_written(self):
+        got = self.tree([msg_line("m1", promptCacheRequested="1h"),
+                         msg_line("m2", promptCacheRequested="5m"),
+                         msg_line("m3")])
+        self.assertEqual(sorted(r[18] for r in got["daily"]), ["", "1h", "5m"])
+
+    def test_stamps_are_carried_as_written(self):
+        got = self.tree([
+            msg_line("m1", attributionAgent="acme-auditor",
+                     attributionPlugin="acme",
+                     attributionMcpServer="srv", attributionMcpTool="lookup"),
+            msg_line("m2", attributionAgent=7, attributionPlugin="")])
+        rows = {r[13:17] == ["acme-auditor", "acme", "srv", "lookup"]
+                for r in got["daily"]}
+        self.assertEqual(rows, {True, False})
+        bare = [r for r in got["daily"] if r[13:17] == ["", "", "", ""]]
+        self.assertEqual(len(bare), 1)
+
+    def test_a_warm_v3_cache_is_discarded(self):
+        root = os.path.join(tempfile.mkdtemp(dir=TMP), "projects")
+        os.makedirs(os.path.join(root, "-home-alice-work-api"))
+        with open(os.path.join(root, "-home-alice-work-api", "s.jsonl"), "w",
+                  encoding="utf-8") as fh:
+            fh.write(json.dumps(dict(msg_line("m1"), timestamp="2026-03-01T12:00:00Z")) + "\n")
+        cdir = tempfile.mkdtemp(dir=TMP)
+        env = base_env(XDG_CACHE_HOME=cdir)
+        flags = ("--json", "--no-open")
+        proc, _ = run(["--root", root], env=env, flags=flags)
+        self.assertIn("1 parsed", proc.stderr)
+        (cache,) = [os.path.join(cdir, "burnrate", f)
+                    for f in os.listdir(os.path.join(cdir, "burnrate"))]
+        with gzip.open(cache, "rt", encoding="utf-8") as fh:
+            blob = json.load(fh)
+        self.assertEqual(blob["ver"], 4)
+        blob["ver"] = 3
+        with gzip.open(cache, "wt", encoding="utf-8") as fh:
+            json.dump(blob, fh)
+        proc, _ = run(["--root", root], env=env, flags=flags)
+        self.assertNotIn("0 parsed", proc.stderr)
+        self.assertIn("1 parsed", proc.stderr)
+        with gzip.open(cache, "rt", encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["ver"], 4)
+
+    def test_the_existing_fixture_rows_carry_no_new_values(self):
+        proc, out = run(["--root", P["primary"]])
+        got = payload(out)
+        self.assertTrue(got["daily"])
+        for r in got["daily"]:
+            self.assertEqual(len(r), 22)
+            self.assertEqual(r[13:19], ["", "", "", "", 0, ""])
+            self.assertEqual(r[19:22], [0, 0, 0])
+        self.assertEqual(sum(r[6] for r in got["daily"]), EXP["total_be"])
 
 
 class TestZstandardAbsent(unittest.TestCase):
