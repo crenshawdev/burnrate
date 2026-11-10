@@ -53,7 +53,22 @@ async function load($: EngineInterface, id: string): Promise<Counts> {
   const c = zero()
   const v = await $.store.get(id)
   if (v && typeof v === 'object') for (const k of KEYS) c[k] = num((v as Record<string, unknown>)[k])
+  // held usage lands with the first read that works, a draw's included, so the line is never a turn behind
+  const owed = pending.get(id)
+  if (owed) {
+    pending.delete(id)
+    for (const k of KEYS) c[k] += owed[k]
+    save($, id, c).catch(() => {})
+  }
   return c
+}
+
+// each write waits for the one before it and snapshots when its turn comes, so the last to land holds every add
+function save($: EngineInterface, id: string, c: Counts) {
+  const prev = writes.get(id) ?? Promise.resolve()
+  const next = prev.catch(() => {}).then(() => $.store.set(id, { ...c }))
+  writes.set(id, next)
+  return next
 }
 
 const sumsFor = ($: EngineInterface, id: string) => {
@@ -70,24 +85,17 @@ const sumsFor = ($: EngineInterface, id: string) => {
 // no await between the add and its write being queued, so parallel subagents ending together lose nothing
 async function count($: EngineInterface, usage: Record<string, unknown>) {
   const id = await $.session.id()
-  // held first, so a failed read below leaves this turn waiting instead of losing it
-  const held = pending.get(id) ?? zero()
-  pending.set(id, held)
-  held.input += num(usage.input_tokens)
-  held.output += num(usage.output_tokens)
-  held.read += num(usage.cache_read_input_tokens)
-  held.write += num(usage.cache_creation_input_tokens)
-  const c = await sumsFor($, id)
-  const owed = pending.get(id)
-  if (owed) {
-    pending.delete(id)
-    for (const k of KEYS) c[k] += owed[k]
+  // a failed read parks the turn in pending, and the next read that works adds it
+  let c = await sumsFor($, id).catch(() => undefined)
+  if (!c) {
+    c = pending.get(id) ?? zero()
+    pending.set(id, c)
   }
-  // the snapshot is taken when the write's turn comes, so the last write to land holds every add
-  const prev = writes.get(id) ?? Promise.resolve()
-  const next = prev.catch(() => {}).then(() => $.store.set(id, { ...c }))
-  writes.set(id, next)
-  await next
+  c.input += num(usage.input_tokens)
+  c.output += num(usage.output_tokens)
+  c.read += num(usage.cache_read_input_tokens)
+  c.write += num(usage.cache_creation_input_tokens)
+  if (pending.get(id) !== c) await save($, id, c)
 }
 
 // same formula as the copies in burnrate.py (CLI `cache   :` line, viewer hitPct), floored in integers
@@ -124,7 +132,7 @@ async function draw($: EngineInterface) {
 export const register: Register = (on, options) => {
   show = options.showStatusLine !== false
   // a reload may hand this module over with the old tick gone, so start clean
-  tick?.cancel(); tick = undefined; seen = false; cleared = false; sums.clear(); writes.clear(); pending.clear()
+  tick?.cancel(); tick = undefined; seen = false; cleared = false; sums.clear(); writes.clear()
 
   // a plugin reload fires neither of the hooks below, so this is what clears or draws the line at once
   on('session.start', async ($, e, next) => {

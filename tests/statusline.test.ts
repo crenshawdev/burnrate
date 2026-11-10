@@ -191,13 +191,17 @@ describe('overlapping work and stale readings', () => {
   test('a failed store read does not stand for an empty record', async ($, on) => {
     let stored: unknown = { input: 100, output: 9, read: 700, write: 100 }
     let reads = 0
-    world(on, null)
+    const drawn = world(on, null)
     on('store.get', () => {
       if (reads++ === 0) throw new Error('store down')
       return { value: stored } as never
     })
     on('store.set', (_$, e) => { stored = (e as unknown as { value: unknown }).value; return { value: undefined } as never })
     await $.turn.complete(turn(0, 0, 99))
+    await drawn.clock.settle()
+    // the draw's read works, so the held turn shows and is stored right away, not a turn later
+    expect(last(drawn)).toBe('session cache hit 79.9%')
+    expect(stored).toEqual({ input: 100, output: 14, read: 799, write: 100 })
     await $.turn.complete(turn(0, 0, 99))
     // the turn whose read failed is held and added once a read works, so no usage is lost
     expect(stored).toEqual({ input: 100, output: 19, read: 898, write: 100 })
