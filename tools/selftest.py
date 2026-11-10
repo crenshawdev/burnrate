@@ -1919,10 +1919,11 @@ globalThis.getComputedStyle = () => ({getPropertyValue: () => ''});
 """
 
 
-def rendered(html):
+def rendered(html, setup=""):
     """Run the report's own script, render() included, under node against DOM
     stubs, with the chart drawers and hbars replaced by recorders. Returns the
-    KPI markup, the sessions table's header and cells, and each hbars call."""
+    KPI markup, the sessions table's header and cells, each hbars call and each
+    element's display. `setup` is JS run just before render() (a range move)."""
     body = html[html.index("<script>") + len("<script>"):]
     script = body[body.index("const DATA ="):body.index("// ---- boot ----")]
     js = PAGE_STUBS + script + """
@@ -1930,6 +1931,7 @@ const CALLS = [];
 hbars = (elId, items) => CALLS.push({elId, items});
 lineChart = stackedChart = () => {};
 buildFilters = () => {};
+""" + setup + """
 render();
 const tbl = ELS['#sessTable'].children[0];
 console.log(JSON.stringify({
@@ -1937,6 +1939,7 @@ console.log(JSON.stringify({
   head: tbl ? tbl.innerHTML : null,
   rows: tbl ? tbl.children[0].children.map(tr => tr.children.map(td => td.textContent)) : [],
   empty: ELS['#sessTable'].innerHTML,
+  display: Object.fromEntries(Object.entries(ELS).map(([k, e]) => [k, e.style.display])),
   hbars: CALLS}));
 """
     path = os.path.join(tempfile.mkdtemp(dir=TMP), "render.js")
@@ -2060,6 +2063,54 @@ class TestStampCards(TreeCase):
             self.assertRegex(
                 html, rf'<h2>{title}</h2>\s*<div class="note">Stamped messages '
                       rf'only</div><div class="hb" id="{el}">')
+
+
+def at_day(day, *lines):
+    """These lines stamped on `day` (YYYY-MM-DD) at noon, a minute apart."""
+    for i, d in enumerate(lines):
+        d["timestamp"] = f"{day}T12:{i:02d}:00Z"
+    return list(lines)
+
+
+@unittest.skipIf(not NODE, "needs a JS engine")
+class TestConditionalCards(TreeCase):
+    """D-18: the web card shows only when the selected range has something for
+    it, and hides again on every render."""
+
+    def view(self, *sessions, setup=""):
+        self.tree(*sessions)
+        got = rendered(report(self.out), setup)
+        return got["display"], {c["elId"]: [(i["label"], i["v"]) for i in c["items"]]
+                                for c in got["hbars"]}
+
+    def web_tree(self):
+        return [at_day("2026-03-01", msg_line(
+                    "m1", inp=10, server={"web_search_requests": 2,
+                                          "web_fetch_requests": 0})),
+                at_day("2026-03-02", msg_line("m2", inp=5))]
+
+    def test_the_existing_fixture_hides_both_cards(self):
+        _, out = run(["--root", P["primary"]])
+        got = rendered(report(out))
+        self.assertEqual(got["display"]["#webCard"], "none")
+        called = {c["elId"] for c in got["hbars"]}
+        self.assertFalse(called & {"#byWeb"})
+
+    def test_the_web_card_shows_the_range_counts(self):
+        disp, calls = self.view(*self.web_tree())
+        self.assertEqual(disp["#webCard"], "")
+        self.assertEqual(calls["#byWeb"], [("searches", 2), ("fetches", 0)])
+
+    def test_the_web_card_hides_when_the_range_holds_no_request(self):
+        disp, calls = self.view(
+            *self.web_tree(), setup="state.d0 = state.d1 = '2026-03-02';")
+        self.assertEqual(disp["#webCard"], "none")
+        self.assertNotIn("#byWeb", calls)
+
+    def test_the_card_starts_hidden_in_the_markup(self):
+        html = report(run()[1])
+        self.assertRegex(html, r'id="webCard"[^>]*style="[^"]*display:none')
+        self.assertIn("<h2>Web search and fetch</h2>", html)
 
 
 FIVE_HOUR_WORDING = re.compile(

@@ -1315,6 +1315,8 @@ footer{color:var(--muted);font-size:11.5px;margin:18px 0 8px}
       <div class="note">Stamped messages only</div><div class="hb" id="byPlugin"></div></div>
     <div class="card" style="margin:0"><h2>By MCP tool</h2>
       <div class="note">Stamped messages only</div><div class="hb" id="byMcp"></div></div>
+    <div class="card" id="webCard" style="margin:0;display:none"><h2>Web search and fetch</h2>
+      <div class="note">Request counts, not tokens</div><div class="hb" id="byWeb"></div></div>
   </div>
 
   <div class="card" id="rlCard" style="display:none">
@@ -1793,6 +1795,15 @@ function render(){
   hbars('#byMcp', withHit(agg(r => JSON.stringify([r[D.mcpS], r[D.mcpT]]),
     k => JSON.parse(k).filter(Boolean).join(' / '),
     rows.filter(r => r[D.mcpS] || r[D.mcpT]))));
+
+  // conditional card: shown only when the range has something, hidden on every
+  // other call. Web values are request counts, so no cache-hit tooltip.
+  const ws = rows.reduce((s, r) => s + r[D.wsearch], 0);
+  const wf = rows.reduce((s, r) => s + r[D.wfetch], 0);
+  if (ws || wf){
+    $('#webCard').style.display = '';
+    hbars('#byWeb', [{label:'searches', v: ws}, {label:'fetches', v: wf}]);
+  } else $('#webCard').style.display = 'none';
 
   // rate-limit card
   const rl = DATA.rl.filter(s => { const d = epochDay(s[0]); return inRange(d); });
