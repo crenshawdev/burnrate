@@ -39,6 +39,11 @@ transcripts written before those fields existed still parse.
 - A `sessions` row gains two positions: 12 is the count of its background
   messages, and 13 is its active time in milliseconds, summed over unique
   `turn_duration` uuids and null when the session has none.
+- A status line mod in the plugin, drawn under the prompt in Claude Code. It
+  shows the week's burndown, meaning 7-day usage against the time since the
+  window opened, and this session's cache hit rate. It is on by default, and
+  the `showStatusLine` switch in `/config` turns it off. The hit rate counts
+  only turns since the plugin was on.
 
 ### Removed
 
