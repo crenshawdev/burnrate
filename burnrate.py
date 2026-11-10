@@ -197,12 +197,105 @@ def terminus_usable(exe, env):
     return bool(m) and tuple(int(g) for g in m.groups()) >= (2, 0, 0)
 
 
-def open_terminus(env):
-    """{"exe", "env"} for a usable terminus on env's PATH, else None."""
-    exe = find_terminus(env)
-    if exe and terminus_usable(exe, env):
-        return {"exe": exe, "env": env}
+KEY_BAD_RE = re.compile(r"[\\\x00-\x1f\x7f]")
+
+
+def terminus_key_parts(key):
+    """(sid, unit) for a session_key of one of the three shapes terminus files
+    a transcript under, else None. `unit` is None for a main:
+
+        <sid>.jsonl
+        <sid>/subagents/agent-<id>.jsonl
+        <sid>/subagents/workflows/wf_<id>/agent-<id>.jsonl
+
+    Anything else (a journal.jsonl, a sidecar) is no transcript. The key goes
+    on to a stdin line and into a path, so a backslash, a control character, an
+    empty segment or a "." or ".." segment rules it out; so does text that
+    can't be written as UTF-8. Real sids are uuids but nothing here needs that."""
+    if not isinstance(key, str):
+        return None
+    try:
+        key.encode("utf-8")
+    except UnicodeError:
+        return None
+    parts = key.split("/")
+    if any(p in ("", ".", "..") or KEY_BAD_RE.search(p) for p in parts):
+        return None
+
+    def agent(name):
+        return (name[:-6] if name.startswith("agent-")
+                and name.endswith(".jsonl") else None)
+
+    n = len(parts)
+    if n == 1 and parts[0].endswith(".jsonl"):
+        sid = parts[0][:-6]
+        return (sid, None) if sid not in ("", ".", "..") else None
+    if n == 3 and parts[1] == "subagents" and agent(parts[2]):
+        return parts[0], agent(parts[2])
+    if (n == 5 and parts[1] == "subagents" and parts[2] == "workflows"
+            and parts[3].startswith("wf_") and agent(parts[4])):
+        return parts[0], agent(parts[4])
     return None
+
+
+def terminus_sessions(entries):
+    """{(proj, sid): {"main": (key, watermark), "subs": [(unit, key,
+    watermark)]}} from the list's entries, keyed the way the live tree is.
+
+    `proj` is Claude Code's folder-name encoding (every character outside
+    ASCII letters and digits becomes "-") of the main's launch directory. That
+    is project_pre_worktree when the main has one: terminus files a session
+    started in a worktree under its parent project, the live tree files it under
+    the worktree, and encoding `project` would read the same session twice. A
+    subagent attaches to its main by sid, never by its own `project`. A main
+    with no project is dropped with whatever hangs off it, and so is a subagent
+    with no main."""
+    mains, subs = {}, defaultdict(dict)
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        key, wm = e.get("session_key"), e.get("watermark")
+        parts = terminus_key_parts(key)
+        if (parts is None or not isinstance(wm, int) or isinstance(wm, bool)
+                or wm < 0):
+            continue
+        sid, unit = parts
+        if unit is None:
+            mains[sid] = (e, key, wm)
+        else:
+            subs[sid][key] = (unit, key, wm)
+    out = {}
+    for sid, (e, key, wm) in mains.items():
+        project = e.get("project")
+        if not isinstance(project, str) or not project:
+            continue
+        launch = e.get("project_pre_worktree")
+        if not isinstance(launch, str) or not launch:
+            launch = project
+        out[(re.sub(r"[^A-Za-z0-9]", "-", launch), sid)] = {
+            "main": (key, wm), "subs": sorted(subs.get(sid, {}).values())}
+    return out
+
+
+def open_terminus(env):
+    """{"exe", "env", "sessions"} for a usable terminus on env's PATH, else None.
+
+    The list is asked for once, here, so a terminus that can't answer drops out
+    before the cache file is chosen. It is always `--project '*'`: without it
+    terminus scopes the list to the cwd's project."""
+    exe = find_terminus(env)
+    if not exe or not terminus_usable(exe, env):
+        return None
+    out = terminus_out(exe, ["sessions", "--project", "*", "--json"], env)
+    try:
+        d = json.loads(out)
+        entries = d["data"]["sessions"]
+        ok = d["ok"] is True
+    except (TypeError, ValueError, KeyError):
+        return None
+    if not ok or not isinstance(entries, list):
+        return None
+    return {"exe": exe, "env": env, "sessions": terminus_sessions(entries)}
 
 
 def file_uri(path, flavour=None):
@@ -570,12 +663,28 @@ def arch_lines(unit_dir):
 
 
 def iters_for(specs):
-    return [live_lines(p) if k == "live" else arch_lines(p) for k, p in specs]
+    return [live_lines(p) if k == "live" else
+            iter(()) if k == "terminus" else arch_lines(p) for k, p in specs]
 
 
 # ---------------------------------------------------------------- discovery
 
-def _discover_live(live_root, sessions):
+def _read_meta(meta_p, s, key):
+    """The agentType in a live agent-*.meta.json, filed under `key`."""
+    if os.path.exists(meta_p):
+        try:
+            with open(meta_p, "r", encoding="utf-8") as mf:
+                at = (json.load(mf) or {}).get("agentType")
+            if at:
+                s["meta"][key] = at
+        except Exception:
+            pass
+
+
+def _discover_live(live_root, sessions, seen=None):
+    """`seen`, when given, collects (proj, session_key) for every file found: the
+    key terminus names the same file by, so discover can tell what the live
+    tree already has without building a path from terminus's data."""
     for proj_dir in sorted(dglob(live_root, "*")):
         if not os.path.isdir(proj_dir):
             continue
@@ -585,6 +694,8 @@ def _discover_live(live_root, sessions):
             s = sessions[proj][sid]
             if ("live", main_path) not in s["main"]:
                 s["main"].append(("live", main_path))
+            if seen is not None:
+                seen.add((proj, sid + ".jsonl"))
             sub_root = os.path.join(proj_dir, sid, "subagents")
             for ap in (dglob(sub_root, "agent-*.jsonl")
                        + dglob(sub_root, "workflows", "wf_*",
@@ -592,15 +703,10 @@ def _discover_live(live_root, sessions):
                 key = os.path.basename(ap)[:-6]
                 if ("live", ap) not in s["subs"][key]:
                     s["subs"][key].append(("live", ap))
-                meta_p = ap[:-6] + ".meta.json"
-                if os.path.exists(meta_p):
-                    try:
-                        with open(meta_p, "r", encoding="utf-8") as mf:
-                            at = (json.load(mf) or {}).get("agentType")
-                        if at:
-                            s["meta"][key] = at
-                    except Exception:
-                        pass
+                if seen is not None:
+                    rel = os.path.relpath(ap, sub_root).replace(os.sep, "/")
+                    seen.add((proj, f"{sid}/subagents/{rel}"))
+                _read_meta(ap[:-6] + ".meta.json", s, key)
 
 
 def _discover_arch(arch_root, sessions):
@@ -634,16 +740,46 @@ def _discover_arch(arch_root, sessions):
                     s["subs"][key].append(spec)
 
 
-def discover(sources):
+def _discover_terminus(tsessions, root, seen, sessions):
+    """Add the files terminus has and the root's live tree doesn't. Live wins per
+    file: a file joins a session only when the live walk found nothing at its
+    proj and key. A subagent read from terminus has no agentType of its own; a
+    live .meta.json where its file would sit under the root still names it."""
+    for (proj, sid), t in sorted(tsessions.items()):
+        s = None
+        for unit, key, wm in [(None, *t["main"])] + t["subs"]:
+            if (proj, key) in seen:
+                continue
+            if s is None:
+                s = sessions[proj][sid]
+            spec = ("terminus", (key, wm))
+            if unit is None:
+                s["main"].append(spec)
+                continue
+            s["subs"][unit].append(spec)
+            if root and unit not in s["meta"]:
+                _read_meta(os.path.join(root, proj, *key[:-6].split("/"))
+                           + ".meta.json", s, unit)
+
+
+def discover(sources, terminus=None):
     """{proj_dir: {sid: {'main': [(kind,path)], 'subs': {key: [(kind,path)]},
                          'meta': {key: agentType}}}} merged across every
-    resolved source, primary first."""
+    resolved source, primary first. A terminus handle adds its sessions' files
+    as ('terminus', (session_key, watermark)) entries."""
     sessions = defaultdict(lambda: defaultdict(
         lambda: {"main": [], "subs": defaultdict(list), "meta": {}}))
+    root = sources[0][1] if sources else None
+    seen = set()
     for layout, path in sources:
         if layout == "terminus" or not os.path.isdir(path):
             continue
-        (_discover_live if layout == "live" else _discover_arch)(path, sessions)
+        if layout == "live":
+            _discover_live(path, sessions, seen if path == root else None)
+        else:
+            _discover_arch(path, sessions)
+    if terminus:
+        _discover_terminus(terminus["sessions"], root, seen, sessions)
     return sessions
 
 
@@ -656,12 +792,18 @@ def session_sig(s):
     separator from shell completion -- otherwise shares ONE cache file whose
     every entry each run rewrites under the other name's paths, so alternating
     roots reparses the whole tree forever."""
-    files = []
+    files, tfiles = [], []
     for kind, path in s["main"]:
+        if kind == "terminus":
+            tfiles.append(path)
+            continue
         files.extend([path] if kind == "live"
                      else sorted(dglob(path, "*.zst")))
     for specs in s["subs"].values():
         for kind, path in specs:
+            if kind == "terminus":
+                tfiles.append(path)
+                continue
             files.extend([path] if kind == "live"
                          else sorted(dglob(path, "*.zst")))
     sig = []
@@ -671,6 +813,9 @@ def session_sig(s):
             sig.append([f, int(st.st_mtime), st.st_size])
         except OSError:
             continue
+    # a terminus file is its (session_key, watermark); lists, not tuples, so the
+    # signature equals itself after the cache's JSON round trip
+    sig.extend(["terminus", key, wm] for key, wm in sorted(tfiles))
     return sig
 
 
@@ -939,8 +1084,8 @@ def save_cache(path, sessions):
         return False
 
 
-def collect(cache_path, sources, rebuild, quiet):
-    found = discover(sources)
+def collect(cache_path, sources, rebuild, quiet, terminus=None):
+    found = discover(sources, terminus)
     cache = {} if rebuild else load_cache(cache_path)
     out, parsed, total = {}, 0, sum(len(v) for v in found.values())
     done = 0
@@ -1182,7 +1327,8 @@ def main():
     cpath = cache_path(src["sources"])
     if not a.quiet:
         print(f"scanning transcripts... (cache {cpath})", file=sys.stderr)
-    sessions = collect(cpath, src["sources"], a.rebuild, a.quiet)
+    sessions = collect(cpath, src["sources"], a.rebuild, a.quiet,
+                       src["terminus"])
     data = aggregate(sessions, a.tz_offset, src["rl_log"])
     data["archive_used"] = src["archive_used"]
     data["archive_label"] = src["archive_label"]

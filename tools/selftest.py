@@ -3649,5 +3649,145 @@ class TestTerminusSource(unittest.TestCase):
             self.assertEqual(len(br.discover([TERMINUS_ENTRY])), 0)
 
 
+TM_PROJ = "-home-zed-solo-proj"
+TM_SOLO = "/home/zed/solo/proj"
+TM_BE = 5000 + 5001 + 5100 + 5200   # what the Terminus-only session's rows sum to
+API = "/home/alice/work/api"
+WORKTREE = API + "/.claude/worktrees/agent-abc"
+
+
+def tm_msg(mid, inp, cwd=TM_SOLO):
+    return msg_line(mid, inp=inp, cwd=cwd, timestamp="2026-03-05T12:00:00Z")
+
+
+def tm_store(**kw):
+    """One stub store for the Terminus cases: a session only Terminus has (its
+    subagent filed under a different project than its main), copies of two
+    sessions the fixture's live tree already holds, and the keys burnrate must
+    refuse."""
+    solo = TM_SOLO
+    triples = [
+        (solo, "tm-sess-0.jsonl", [tm_msg("tm-main-0", 5000),
+                                    tm_msg("tm-main-1", 5001)]),
+        ("/home/zed/solo/other", "tm-sess-0/subagents/agent-a1.jsonl",
+         [tm_msg("tm-sub-0", 5100)]),
+        (solo, "tm-sess-0/subagents/workflows/wf_9/agent-w1.jsonl",
+         [tm_msg("tm-wf-0", 5200)]),
+        # not transcripts: a journal, a path trick, a doubled slash, a
+        # subagent whose main Terminus doesn't have
+        (solo, "tm-sess-0/subagents/workflows/wf_9/journal.jsonl", ["{}"]),
+        (solo, "../evil.jsonl", [tm_msg("tm-evil", 1)]),
+        (solo, "a//b.jsonl", [tm_msg("tm-dbl", 1)]),
+        (solo, "orphan/subagents/agent-o.jsonl", [tm_msg("tm-orphan", 1)]),
+        # sessions the live tree has: the live copy wins
+        (API, "p0-sess-0.jsonl", [tm_msg("tm-extra-p0", 9999, API)]),
+        (API, "p0-sess-0/subagents/agent-1.jsonl",
+         [tm_msg("tm-extra-p0a", 9997, API)]),
+        (API, "p3-sess-0.jsonl", [tm_msg("tm-extra-p3", 9998, API)]),
+        (None, "nul-sess.jsonl", []),
+    ]
+    stub = StubTerminus(triples, **kw)
+    stub.entry("p3-sess-0.jsonl")["project_pre_worktree"] = WORKTREE
+    stub.save()
+    return stub
+
+
+class TestTerminusSessions(unittest.TestCase):
+    """D-01/D-02/D-13/D-14/D-15: Terminus files join the session map under the
+    live tree's own keys, and only for the files the live tree lacks."""
+
+    def found(self, stub, **kw):
+        env = {"HOME": P["home"], "XDG_CONFIG_HOME": EMPTY_CONF,
+               "PATH": stub.dir}
+        src, _ = resolve_in(env, **kw)
+        return src, br.discover(src["sources"], src["terminus"])
+
+    def test_a_terminus_only_session_files_under_its_mains_project(self):
+        _, found = self.found(tm_store())
+        s = found[TM_PROJ]["tm-sess-0"]
+        self.assertEqual([(k, v[0]) for k, v in s["main"]],
+                         [("terminus", "tm-sess-0.jsonl")])
+        self.assertEqual(
+            {u: [(k, v[0]) for k, v in specs]
+             for u, specs in s["subs"].items()},
+            {"agent-a1": [("terminus",
+                           "tm-sess-0/subagents/agent-a1.jsonl")],
+             "agent-w1": [("terminus", "tm-sess-0/subagents/workflows/wf_9/"
+                                       "agent-w1.jsonl")]})
+        self.assertEqual(s["meta"], {})
+
+    def test_a_session_the_live_tree_has_keeps_only_its_live_sources(self):
+        _, found = self.found(tm_store())
+        s = found["-home-alice-work-api"]["p0-sess-0"]
+        self.assertEqual({k for k, _ in s["main"]}, {"live"})
+        self.assertEqual({k for specs in s["subs"].values()
+                          for k, _ in specs}, {"live"})
+        self.assertIn("agent-1", s["subs"])
+
+    def test_a_worktree_session_is_found_once_under_the_worktrees_dir(self):
+        _, found = self.found(tm_store())
+        wt = "-home-alice-work-api--claude-worktrees-agent-abc"
+        s = found[wt]["p3-sess-0"]
+        self.assertEqual({k for k, _ in s["main"]}, {"live"})
+        self.assertNotIn("p3-sess-0", found["-home-alice-work-api"])
+        self.assertEqual(sum("p3-sess-0" in sids for sids in found.values()), 1)
+
+    def test_what_is_not_a_transcript_never_becomes_a_session(self):
+        _, found = self.found(tm_store())
+        sids = {sid for sids in found.values() for sid in sids}
+        self.assertTrue({"nul-sess", "orphan", "evil", "b"}.isdisjoint(sids))
+        for sids in found.values():
+            for sess in sids.values():
+                for _k, v in sess["main"]:
+                    self.assertNotIn("journal", str(v))
+                for specs in sess["subs"].values():
+                    for _k, v in specs:
+                        self.assertNotIn("journal", str(v))
+
+    def test_a_live_meta_json_names_a_terminus_only_subagent(self):
+        root = os.path.join(tempfile.mkdtemp(dir=TMP), "projects")
+        _write(os.path.join(root, "-home-other", "z.jsonl"))
+        _write(os.path.join(root, TM_PROJ, "tm-sess-0", "subagents",
+                            "agent-a1.meta.json"),
+               b'{"agentType": "cad-planner"}')
+        _, found = self.found(tm_store(), root=root)
+        self.assertEqual(found[TM_PROJ]["tm-sess-0"]["meta"],
+                         {"agent-a1": "cad-planner"})
+
+    def test_the_signature_moves_with_a_listed_watermark(self):
+        stub = tm_store()
+        sig = [br.session_sig(self.found(stub)[1][TM_PROJ]["tm-sess-0"])
+               for _ in range(2)]
+        self.assertEqual(sig[0], sig[1])
+        self.assertEqual(json.loads(json.dumps(sig[0])), sig[0])
+        self.assertEqual(
+            [e[:2] for e in sig[0]],
+            [["terminus", k] for k in (
+                "tm-sess-0.jsonl", "tm-sess-0/subagents/agent-a1.jsonl",
+                "tm-sess-0/subagents/workflows/wf_9/agent-w1.jsonl")])
+        stub.entry("tm-sess-0/subagents/agent-a1.jsonl")["watermark"] = 12345
+        stub.save()
+        moved = br.session_sig(self.found(stub)[1][TM_PROJ]["tm-sess-0"])
+        self.assertNotEqual(moved, sig[0])
+        self.assertIn(["terminus", "tm-sess-0/subagents/agent-a1.jsonl",
+                       12345], moved)
+
+    def test_one_sessions_call_per_run_and_it_asks_for_every_project(self):
+        c = tempfile.mkdtemp(dir=TMP)
+        stub = tm_store()
+        proc, _ = run(env=stub.env(XDG_CACHE_HOME=c))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lists = [x["argv"] for x in stub.calls() if x["argv"][0] == "sessions"]
+        self.assertEqual(lists, [["sessions", "--project", "*", "--json"]])
+
+    def test_a_list_that_is_not_ok_leaves_terminus_out(self):
+        for kw in ({"not_ok": True}, {"bad_json": True}, {"fail": "sessions"}):
+            src, _ = resolve_in({"HOME": P["home"],
+                                 "XDG_CONFIG_HOME": EMPTY_CONF,
+                                 "PATH": tm_store(**kw).dir})
+            self.assertNotIn(TERMINUS_ENTRY, src["sources"], kw)
+            self.assertIsNone(src["terminus"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
