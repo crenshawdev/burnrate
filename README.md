@@ -91,6 +91,13 @@ Code convention that burnrate honors.
 Inside that tree it parses `<project-dir>/<session>.jsonl`, including subagent
 transcripts, and optionally any archive you point `--archive` at.
 
+If a `terminus` 2.0.0 or later is on your `PATH`, burnrate reads that archive
+too. It runs two read-only commands, `terminus sessions --project '*' --json`
+and `terminus export --stdout`, and never runs `ingest` or any other command
+that writes. For each transcript file the live copy wins, and Terminus supplies
+only the files the live tree no longer has. Only sessions whose watermarks
+changed since the last run are exported.
+
 ## What it computes
 
 Per assistant message, deduped globally by `message.id`:
@@ -214,7 +221,12 @@ To recover history that is already gone you need your own backup. Point
 `<project>/<session>/*.zst`) and burnrate merges it with the live tree.
 
 If a hindsight archive is configured on the machine, burnrate detects it
-automatically and labels that run "hindsight archive" in the report. `--no-archive` ignores every archive source, auto-detected or not.
+automatically and labels that run "hindsight archive" in the report.
+
+Terminus extends history the same way. It is detected on the `PATH`, and it runs
+alongside `--archive` and the hindsight auto-detect rather than instead of them.
+`--no-archive` ignores every archive source, Terminus included, auto-detected or
+not. `--root` does not turn it off.
 
 ## What a generated report embeds
 
@@ -228,6 +240,9 @@ your transcripts and contains:
 - model ids and effort levels
 - per-message timestamps
 - the basename of any `--archive` directory
+
+Sessions read from Terminus put the same fields in the report as live ones. The
+subtitle names Terminus, without a path.
 
 It does **not** contain message content, code, or prompts. But project names and
 session titles alone routinely describe what you were working on and for whom.
@@ -249,7 +264,7 @@ they are listed so the words have a precise meaning.
 | `--root DIR` | Transcript tree to read. See resolution order above. |
 | `--out DIR` | Where to write the report. `/burnrate` always points this at the cache directory. |
 | `--archive DIR` | Extra transcript source: a `<project>/*.jsonl` tree or a `<project>/<session>/*.zst` archive. |
-| `--no-archive` | Ignore every archive source, auto-detected or not. |
+| `--no-archive` | Ignore every archive source, auto-detected or not, Terminus included. |
 | `--rebuild` | Ignore the cache and reparse everything. |
 | `--json` | Also write `dashboard_data.json` beside the report. |
 | `--no-open` | Write the report without launching a browser. |
@@ -328,9 +343,19 @@ for in plain words counts as conversation. See
 package. Without it the tool runs on your live transcripts and says so in the
 report subtitle. Plain `<project>/*.jsonl` archive trees need nothing extra.
 
+**Terminus is not being read, or the run is slow.** burnrate ignores a
+`terminus` older than 2.0.0 without saying so. A Terminus that fails prints one
+warning, such as `warning: terminus failed (sessions exited 1) -- continuing
+without it`, and the run continues on your live transcripts and any other
+archive. The first run with Terminus is slow: it exports every session the live
+tree lacks and starts its own cache file. Later runs export only sessions whose
+watermarks changed.
+
 **Stale numbers after a session you know happened.** The cache keys on files
 that changed. Force a full reparse with `/burnrate rebuild`, or delete the cache
-directory listed under [Cache](#cache).
+directory listed under [Cache](#cache). A rebuild re-exports every Terminus
+session. It also drops a session Terminus has evicted, because that session's
+usage existed only in the cache.
 
 **No browser opened.** The run still reports the path it wrote. Open that file
 yourself; the report is self-contained and works offline.
