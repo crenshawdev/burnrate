@@ -46,6 +46,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 import webbrowser
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
@@ -662,9 +663,124 @@ def arch_lines(unit_dir):
             continue
 
 
-def iters_for(specs):
+class TerminusError(Exception):
+    """terminus's export stream did not frame."""
+
+
+class TerminusExport:
+    """One `terminus export --stdout` run, read as frames: a header line
+    {"terminus": {"project", "session_key", "watermark"}} and then exactly
+    `watermark` bytes of transcript JSONL, nothing between frames.
+
+    Keys go in on stdin from a temp file, never a pipe burnrate itself writes:
+    a cold run sends thousands, which is past the OS pipe buffer, and writing
+    them all before reading any output deadlocks against an export that streams
+    while it reads. Frames come back in stdin order, and a key terminus doesn't
+    hold gets no frame and still exits 0, so the header's session_key is checked
+    against the key expected next. lines(key) is the generator parse_session
+    hands scan_unit; it reads the body in chunks as the pipe streams and never
+    holds more than one line past a chunk.
+
+    The stream didn't frame -- TerminusError, with the process killed first --
+    on a header for another key, an evicted header (no body follows it, so
+    reading `watermark` bytes would swallow the next frame), a cut-short body,
+    bytes after the last frame, or a non-zero exit. A killed process matters: one
+    with output left blocks writing into a full stdout pipe and a bare wait never
+    returns. Its stderr is discarded, so it can't fill a pipe nobody reads and
+    none of it reaches the run's output."""
+
+    def __init__(self, handle, keys):
+        self.keys, self.at, self.left, self.marks = keys, 0, 0, {}
+        self.feed = tempfile.TemporaryFile()
+        try:
+            self.feed.write("".join(k + "\n" for k in keys).encode("utf-8"))
+            self.feed.flush()
+            self.feed.seek(0)
+            self.proc = subprocess.Popen(
+                [handle["exe"], "export", "--stdout"], env=handle["env"],
+                stdin=self.feed, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL)
+        except OSError as e:
+            self.feed.close()
+            raise TerminusError(f"can't start terminus ({e.__class__.__name__})")
+
+    def close(self):
+        if self.proc.poll() is None:
+            self.proc.kill()
+        try:
+            self.proc.stdout.close()
+        except OSError:
+            pass
+        self.proc.wait()
+        self.feed.close()
+
+    def fail(self, why):
+        self.close()
+        raise TerminusError(why)
+
+    def _drain(self):
+        while self.left:
+            block = self.proc.stdout.read(min(self.left, 1 << 20))
+            if not block:
+                self.fail("a frame body was cut short")
+            self.left -= len(block)
+
+    def _open(self, key):
+        self._drain()
+        if self.at >= len(self.keys) or self.keys[self.at] != key:
+            self.fail("frames asked for out of the order they were requested")
+        line = self.proc.stdout.readline(1 << 16)
+        if not line.endswith(b"\n"):
+            self.fail(f"no frame header for {key!r}")
+        try:
+            top = json.loads(line)
+            hdr = top["terminus"]
+            got, wm = hdr["session_key"], hdr["watermark"]
+        except (ValueError, TypeError, KeyError):
+            self.fail(f"unreadable frame header for {key!r}")
+        if got != key:
+            self.fail(f"frame for {str(got)[:80]!r} where {key!r} was next")
+        if hdr.get("evicted") or top.get("evicted"):
+            self.fail(f"{key!r} came back evicted")
+        if not isinstance(wm, int) or isinstance(wm, bool) or wm < 0:
+            self.fail(f"bad watermark in the frame header for {key!r}")
+        self.at += 1
+        self.left = wm
+        self.marks[key] = wm
+
+    def lines(self, key):
+        self._open(key)
+        buf = b""
+        while self.left:
+            block = self.proc.stdout.read(min(self.left, 1 << 20))
+            if not block:
+                self.fail("a frame body was cut short")
+            self.left -= len(block)
+            buf += block
+            *whole, buf = buf.split(b"\n")
+            for line in whole:
+                if line:
+                    yield line.decode("utf-8", "replace")
+        if buf:
+            yield buf.decode("utf-8", "replace")
+
+    def finish(self):
+        """After the last frame was read: nothing more may follow it, and the
+        export has to have exited 0."""
+        self._drain()
+        if self.at != len(self.keys):
+            self.fail("fewer frames than keys")
+        if self.proc.stdout.read(1):
+            self.fail("bytes after the last frame")
+        if self.proc.wait() != 0:
+            self.fail("the export exited non-zero")
+        self.close()
+
+
+def iters_for(specs, export=None):
     return [live_lines(p) if k == "live" else
-            iter(()) if k == "terminus" else arch_lines(p) for k, p in specs]
+            export.lines(p[0]) if k == "terminus" else arch_lines(p)
+            for k, p in specs]
 
 
 # ---------------------------------------------------------------- discovery
@@ -783,7 +899,7 @@ def discover(sources, terminus=None):
     return sessions
 
 
-def session_sig(s):
+def session_sig(s, marks=None):
     """Fingerprint of every file feeding this session; cache hit = unchanged.
 
     Paths are realpath'd, the same normalization cache_path applies to the
@@ -815,7 +931,12 @@ def session_sig(s):
             continue
     # a terminus file is its (session_key, watermark); lists, not tuples, so the
     # signature equals itself after the cache's JSON round trip
-    sig.extend(["terminus", key, wm] for key, wm in sorted(tfiles))
+    # `marks` carries the watermarks the export's frames reported: when an ingest
+    # lands between the list and the export the frame holds the newer bytes, and
+    # recording the list's number would export the session again next run
+    marks = marks or {}
+    sig.extend(["terminus", key, marks.get(key, wm)]
+               for key, wm in sorted(tfiles))
     return sig
 
 
@@ -981,15 +1102,24 @@ def scan_unit(iters, unit, rec, want_meta):
                 held[5:] = cols
 
 
-def parse_session(s):
+def terminus_keys(s):
+    """The keys parse_session will read from terminus for this session, in the
+    order it reads them: the main's, then each subagent unit's by sorted name."""
+    keys = [p[0] for k, p in s["main"] if k == "terminus"]
+    for _unit, specs in sorted(s["subs"].items()):
+        keys.extend(p[0] for k, p in specs if k == "terminus")
+    return keys
+
+
+def parse_session(s, export=None):
     rec = {"rows": [], "segs": [], "slug": None, "title": None,
            "comp": 0, "intr": 0, "err": 0, "agents": {},
            "_byid": {}, "_marks": set(), "_branch": Counter(),
            "_cwd": Counter(), "_local": set(), "_dur": {}}
-    scan_unit(iters_for(s["main"]), "", rec, want_meta=True)
+    scan_unit(iters_for(s["main"], export), "", rec, want_meta=True)
     for key, specs in sorted(s["subs"].items()):
         rec["agents"][key] = s["meta"].get(key) or "unresolved"
-        scan_unit(iters_for(specs), key, rec, want_meta=False)
+        scan_unit(iters_for(specs, export), key, rec, want_meta=False)
     # a command that got a <local-command-stdout> reply was a built-in
     rec["segs"] = sorted(([ts, name] for ts, name, uid in rec["segs"]
                           if uid is None or uid not in rec["_local"]),
@@ -1088,7 +1218,7 @@ def collect(cache_path, sources, rebuild, quiet, terminus=None):
     found = discover(sources, terminus)
     cache = {} if rebuild else load_cache(cache_path)
     out, parsed, total = {}, 0, sum(len(v) for v in found.values())
-    done = 0
+    done, plan, keys = 0, [], []
     for proj, sids in sorted(found.items()):
         for sid, s in sorted(sids.items()):
             done += 1
@@ -1096,14 +1226,32 @@ def collect(cache_path, sources, rebuild, quiet, terminus=None):
             sig = session_sig(s)
             hit = cache.get(key)
             if hit and hit["sig"] == sig:
+                plan.append((key, proj, sid, s, done, hit, []))
+                continue
+            tkeys = terminus_keys(s)
+            keys.extend(tkeys)
+            plan.append((key, proj, sid, s, done, None, tkeys))
+    # one export for every session that changed and holds a terminus file, in
+    # the order parse_session reads them; none at all when nothing changed,
+    # since an empty stdin streams the whole archive
+    export = TerminusExport(terminus, keys) if keys else None
+    try:
+        for key, proj, sid, s, done, hit, tkeys in plan:
+            if hit:
                 out[key] = hit
                 continue
             parsed += 1
             if not quiet and parsed % 50 == 0:
                 print(f"  parsing {done}/{total} sessions "
                       f"({parsed} changed)...", file=sys.stderr)
-            out[key] = {"sig": sig, "proj": proj, "sid": sid,
-                        "rec": parse_session(s)}
+            rec = parse_session(s, export)
+            out[key] = {"sig": session_sig(s, export.marks if tkeys else None),
+                        "proj": proj, "sid": sid, "rec": rec}
+        if export:
+            export.finish()
+    finally:
+        if export:
+            export.close()
     save_cache(cache_path, out)
     if not quiet:
         print(f"  {total} sessions, {parsed} parsed, "
@@ -1327,8 +1475,12 @@ def main():
     cpath = cache_path(src["sources"])
     if not a.quiet:
         print(f"scanning transcripts... (cache {cpath})", file=sys.stderr)
-    sessions = collect(cpath, src["sources"], a.rebuild, a.quiet,
-                       src["terminus"])
+    try:
+        sessions = collect(cpath, src["sources"], a.rebuild, a.quiet,
+                           src["terminus"])
+    except TerminusError as e:
+        print(f"error: terminus export didn't frame: {e}", file=sys.stderr)
+        sys.exit(1)
     data = aggregate(sessions, a.tz_offset, src["rl_log"])
     data["archive_used"] = src["archive_used"]
     data["archive_label"] = src["archive_label"]

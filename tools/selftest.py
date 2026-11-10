@@ -225,7 +225,7 @@ sys.stderr.flush()
 
 def log(**extra):
     with open(os.path.join(HERE, "calls.log"), "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(dict(argv=argv, **extra)) + "\n")
+        fh.write(json.dumps(dict(argv=argv, pid=os.getpid(), **extra)) + "\n")
 
 
 def body_of(e):
@@ -1580,7 +1580,8 @@ class TestPlatform(unittest.TestCase):
 
     PERMITTED = {"__future__", "argparse", "collections", "datetime", "glob",
                  "gzip", "hashlib", "json", "os", "pathlib", "re",
-                 "subprocess", "sys", "webbrowser", "zstandard"}
+                 "subprocess", "sys", "tempfile", "webbrowser",
+                 "zstandard"}
 
     def test_cache_dir_darwin(self):
         self.assertEqual(
@@ -3787,6 +3788,140 @@ class TestTerminusSessions(unittest.TestCase):
                                  "PATH": tm_store(**kw).dir})
             self.assertNotIn(TERMINUS_ENTRY, src["sources"], kw)
             self.assertIsNone(src["terminus"])
+
+
+TM_KEYS = ["tm-sess-0.jsonl", "tm-sess-0/subagents/agent-a1.jsonl",
+           "tm-sess-0/subagents/workflows/wf_9/agent-w1.jsonl"]
+STUB_SHAPES = [["--version"], ["sessions", "--project", "*", "--json"],
+               ["export", "--stdout"]]
+
+
+class TestTerminusExport(unittest.TestCase):
+    """D-05/D-06/D-11/D-12/D-13/D-15: only the sessions whose watermarks
+    changed are exported, one call per run, read as frames."""
+
+    def go(self, stub, cache, args=(), flags=("--json", "--no-open", "--quiet")):
+        return run(args, env=stub.env(XDG_CACHE_HOME=cache), flags=flags)
+
+    def be(self, data, label):
+        return next(p["be"] for p in data["projects"] if p["id"] == label)
+
+    def test_the_terminus_only_project_is_in_the_payload(self):
+        stub = tm_store()
+        proc, out = self.go(stub, tempfile.mkdtemp(dir=TMP),
+                            flags=("--json", "--no-open"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = payload(out)
+        self.assertEqual(self.be(data, "proj"), TM_BE)
+        self.assertEqual(total_be(data), EXP["total_be"] + TM_BE)
+        self.assertTrue(data["archive_used"])
+        self.assertEqual([c["argv"] for c in stub.calls()], STUB_SHAPES)
+        self.assertEqual(stub.exports(), [TM_KEYS])
+        # D-11: nothing terminus said to stderr reaches this run's output
+        self.assertNotIn(STUB_MARKER, proc.stdout + proc.stderr)
+
+    def test_a_session_the_live_tree_has_is_counted_once_from_live(self):
+        stub = tm_store()
+        proc, out = self.go(stub, tempfile.mkdtemp(dir=TMP))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.be(payload(out), "home/alice/work/api"),
+                         EXP["label_be"]["home/alice/work/api"])
+        for keys in stub.exports():
+            self.assertEqual([k for k in keys
+                              if k.startswith(("p0-sess-0", "p3-sess-0"))], [])
+
+    def test_a_warm_run_calls_no_export_and_one_raised_watermark_exports_one(self):
+        stub, c = tm_store(), tempfile.mkdtemp(dir=TMP)
+        _, out1 = self.go(stub, c)
+        _, out2 = self.go(stub, c)
+        self.assertEqual(stub.exports(), [TM_KEYS])
+        a, b = payload(out1), payload(out2)
+        a.pop("generated")
+        b.pop("generated")
+        self.assertEqual(a, b)
+        stub.entry(TM_KEYS[1])["lines"].append(tm_msg("tm-sub-1", 777))
+        stub.save()
+        proc, out3 = self.go(stub, c)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(stub.exports(), [TM_KEYS, TM_KEYS])
+        self.assertEqual(total_be(payload(out3)),
+                         EXP["total_be"] + TM_BE + 777)
+
+    def test_rebuild_exports_every_terminus_file_again(self):
+        stub, c = tm_store(), tempfile.mkdtemp(dir=TMP)
+        self.go(stub, c)
+        self.go(stub, c, ["--rebuild"])
+        self.assertEqual(stub.exports(), [TM_KEYS, TM_KEYS])
+
+    def test_the_frames_watermark_is_what_the_cache_records(self):
+        # an ingest landing between the list and the export: the list still
+        # reports the smaller number, the frame carries the newer bytes
+        stub, c = tm_store(), tempfile.mkdtemp(dir=TMP)
+        stub.entry(TM_KEYS[0])["watermark"] = 1
+        stub.save()
+        self.go(stub, c)
+        del stub.entry(TM_KEYS[0])["watermark"]
+        stub.save()
+        proc, _ = self.go(stub, c)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(stub.exports(), [TM_KEYS])
+
+    def test_burnrate_only_ever_makes_the_three_read_calls(self):
+        stub, c = tm_store(), tempfile.mkdtemp(dir=TMP)
+        self.go(stub, c)
+        self.go(stub, c, ["--rebuild"])
+        for call in stub.calls():
+            self.assertIn(call["argv"], STUB_SHAPES)
+
+    def fails(self, stub, why):
+        c = tempfile.mkdtemp(dir=TMP)
+        out = tempfile.mkdtemp(dir=TMP)
+        proc = subprocess.run(
+            [sys.executable, BR, "--out", out, "--json", "--no-open",
+             "--quiet"], env=stub.env(XDG_CACHE_HOME=c), timeout=60,
+            capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("error: terminus export didn't frame", proc.stderr)
+        self.assertIn(why, proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertNotIn(STUB_MARKER, proc.stdout + proc.stderr)
+        self.assertEqual(os.listdir(out), [])
+        self.assertFalse(os.path.exists(os.path.join(c, "burnrate")))
+        for call in stub.calls():
+            if call["argv"][0] == "export":
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(call["pid"], 0)
+
+    def test_a_key_with_no_frame_ends_the_run_and_leaves_no_process(self):
+        big = [tm_msg(f"tm-big-{i}", 1) for i in range(2000)]
+        stub = StubTerminus([
+            (TM_SOLO, "aa-gone.jsonl", ["{}"]),
+            (TM_SOLO, "zz-big.jsonl", big)],
+            per={"aa-gone.jsonl": {"no_frame": True}})
+        self.assertGreater(len(json.dumps(big)), 128 * 1024)
+        self.fails(stub, "where 'aa-gone.jsonl' was next")
+
+    def test_an_evicted_header_ends_the_run(self):
+        stub = tm_store()
+        stub.entry(TM_KEYS[1])["evicted"] = True
+        stub.save()
+        self.fails(stub, "came back evicted")
+
+    def test_a_cut_short_body_ends_the_run(self):
+        stub = tm_store()
+        stub.entry(TM_KEYS[2])["short_by"] = 5
+        stub.save()
+        self.fails(stub, "cut short")
+
+    def test_bytes_after_the_last_frame_end_the_run(self):
+        stub = tm_store()
+        stub.entry(TM_KEYS[2])["short_by"] = -3
+        stub.save()
+        self.fails(stub, "bytes after the last frame")
+
+    def test_a_non_zero_export_ends_the_run(self):
+        stub = tm_store(fail="export")
+        self.fails(stub, "no frame header")
 
 
 if __name__ == "__main__":
