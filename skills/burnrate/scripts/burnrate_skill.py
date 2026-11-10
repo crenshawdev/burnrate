@@ -5,7 +5,6 @@ burnrate skill helper -- the /burnrate skill's only entry point into the tool.
 Subcommands:
     run [words...]   build the dashboard and (unless --no-open) open it
     ask              summarize the last run's daily rows as JSON  (task 4)
-    blocks           summarize the last run's 5h blocks as JSON   (task 5)
 
 The helper never copies, edits or vendors burnrate.py: it walks up from its own
 location until it finds the single tracked copy, so `python3 burnrate.py` keeps
@@ -29,7 +28,6 @@ from datetime import datetime, timedelta, timezone
 
 TOOL_NAME = "burnrate.py"
 PAYLOAD = "dashboard_data.json"
-BLOCK_SECONDS = 5 * 3600        # a rate-limit window, same constant as the tool
 
 # The daily row's twelve unlabeled positions, mirroring burnrate.py's own
 # legend (`const D = {...}` beside the viewer's payload). Every read of a daily
@@ -235,8 +233,8 @@ def label_of(labels, idx):
 
 def positive_int(v):
     """A --last of 0 or below is a usage error, not an empty slice: rows[-0:]
-    is the WHOLE list and rows[1:] silently drops the current window, which is
-    the one a 'how much is left' question is about."""
+    is the WHOLE list and a negative N silently drops the oldest days instead
+    of failing."""
     try:
         n = int(v)
     except ValueError:
@@ -335,39 +333,6 @@ def cmd_ask(a):
     return 0
 
 
-def cmd_blocks(a):
-    data, reused = ensure_payload(a.max_age)
-    labels = project_labels(data)
-    off = float(data.get("tz_offset") or 0.0)
-    tz = timezone(timedelta(hours=off))
-
-    def iso(ts):
-        return datetime.fromtimestamp(ts, tz).isoformat(timespec="seconds")
-
-    now = datetime.now(timezone.utc).timestamp()
-    rows = data.get("blocks", [])
-    if a.last is not None:
-        rows = rows[-a.last:]
-    out = []
-    for t0, first, last, be, output, msgs, pp in rows:
-        end = t0 + BLOCK_SECONDS
-        out.append({
-            "start": iso(t0), "start_epoch": t0,
-            "first_activity": iso(first), "first_activity_epoch": first,
-            "last_activity": iso(last), "last_activity_epoch": last,
-            "window_end": iso(end), "window_end_epoch": end,
-            "billed_equiv": be, "output": output, "messages": msgs,
-            "active": now < end,
-            # the per-project map is keyed by the STRING form of the project's
-            # index into `projects`, never by its label
-            "top_projects": {label_of(labels, int(i)): v
-                             for i, v in pp.items()},
-        })
-    emit({"generated": data.get("generated"), "reused": reused,
-          "tz_offset": data.get("tz_offset"), "blocks": out})
-    return 0
-
-
 def cmd_run(a):
     tool = find_tool()
     argv = [sys.executable, tool, "--json", "--out",
@@ -426,20 +391,6 @@ def build_parser():
                    help="reuse an existing payload younger than this many "
                         "minutes (default: 15)")
     k.set_defaults(func=cmd_ask)
-
-    b = sub.add_parser(
-        "blocks", help="summarize the recent 5h rate-limit windows",
-        description="The most recent 5h rate-limit windows, oldest first, as "
-                    "one JSON object on stdout. Blocks are ACCOUNT-WIDE: they "
-                    "cover every project at once, so no project filter applies "
-                    "to them and this command takes none. Same freshness rule "
-                    "as ask; never opens a browser.")
-    b.add_argument("--last", type=positive_int, default=3, metavar="N",
-                   help="how many of the most recent windows (default: 3)")
-    b.add_argument("--max-age", type=float, default=15.0, metavar="MIN",
-                   help="reuse an existing payload younger than this many "
-                        "minutes (default: 15)")
-    b.set_defaults(func=cmd_blocks)
     return ap
 
 

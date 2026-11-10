@@ -1692,15 +1692,10 @@ class TestSkillAnswers(unittest.TestCase):
         proc = self.skill("run", "--dry-run", "bogus", expect=2)
         self.assertIn("bogus", proc.stderr)
 
-    def test_blocks_join_projects_and_close_five_hours_later(self):
-        got = self.answer("blocks", "--last", "1")
-        data = self.written_payload()
-        self.assertEqual(len(got["blocks"]), 1)
-        b = got["blocks"][0]
-        self.assertEqual(b["billed_equiv"], data["blocks"][-1][3])
-        self.assertEqual(b["window_end_epoch"] - b["start_epoch"], 5 * 3600)
-        ids = {p["id"] for p in data["projects"]}
-        self.assertLessEqual(set(b["top_projects"]), ids)
+    def test_the_blocks_subcommand_is_gone(self):
+        """No deprecated stub: argparse itself must refuse the word."""
+        proc = self.skill("blocks", expect=2)
+        self.assertIn("invalid choice", proc.stderr)
 
     def test_an_exact_project_label_beats_the_one_it_prefixes(self):
         """The fixture's 'home/alice/work/api' is a prefix of
@@ -1729,12 +1724,11 @@ class TestSkillAnswers(unittest.TestCase):
             self.assertIn(flag, proc.stderr)
 
     def test_a_last_below_one_is_refused(self):
-        """rows[-0:] is the WHOLE list and rows[1:] drops the current window --
-        the one a 'how much is left' question is about."""
+        """rows[-0:] is the WHOLE list and a negative N silently drops the
+        oldest days instead of failing."""
         for n in ("0", "-1"):
-            for cmd in ("blocks", "ask"):
-                proc = self.skill(cmd, "--last", n, expect=2)
-                self.assertIn("N >= 1", proc.stderr)
+            proc = self.skill("ask", "--last", n, expect=2)
+            self.assertIn("N >= 1", proc.stderr)
 
     def test_a_bad_day_word_fails_before_the_payload_is_built(self):
         """Validation after ensure_payload pays for a full transcript reparse

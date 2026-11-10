@@ -49,7 +49,7 @@ Look at the words the user passed:
 ## Reporting a run
 
 `run` streams the tool's own output. Report back the `wrote:` path, the
-one-line totals (range, billed-equiv, blocks, projects) and the `cache:` hit
+one-line totals (range, billed-equiv, projects) and the `cache:` hit
 rate. Do not paste the whole output.
 
 That `wrote:` path is under the user's own platform cache directory, not inside
@@ -79,9 +79,10 @@ percentage with one decimal. Never derive it from the token columns yourself;
 `cache_write` already includes `cache_write_1h`, so adding the two undercounts
 the rate.
 
-For a question about 5h rate-limit windows ("how much is left in this block",
-"when does it reset"), use `blocks` instead: `python3 <helper> blocks --last 1`.
-Blocks are account-wide, so no project filter applies to them.
+For a rate-limit or reset question ("how much is left in this block", "when does
+it reset"), say that burnrate does not answer rate-limit or reset questions, and
+call neither `ask` nor `run`. Any other question goes to `ask` and comes back as
+a billed-equivalent total.
 
 Then answer in one or two sentences: the figure with thousands separators, the
 unit ("billed-equivalent tokens"), and which day or range it covers. Say
