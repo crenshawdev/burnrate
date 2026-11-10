@@ -2074,8 +2074,8 @@ def at_day(day, *lines):
 
 @unittest.skipIf(not NODE, "needs a JS engine")
 class TestConditionalCards(TreeCase):
-    """D-18: the web card shows only when the selected range has something for
-    it, and hides again on every render."""
+    """D-18: the web card and the foreground/background split show only when
+    the selected range has something for them, and hide again on every render."""
 
     def view(self, *sessions, setup=""):
         self.tree(*sessions)
@@ -2093,8 +2093,9 @@ class TestConditionalCards(TreeCase):
         _, out = run(["--root", P["primary"]])
         got = rendered(report(out))
         self.assertEqual(got["display"]["#webCard"], "none")
+        self.assertEqual(got["display"]["#bgCard"], "none")
         called = {c["elId"] for c in got["hbars"]}
-        self.assertFalse(called & {"#byWeb"})
+        self.assertFalse(called & {"#byWeb", "#byBg"})
 
     def test_the_web_card_shows_the_range_counts(self):
         disp, calls = self.view(*self.web_tree())
@@ -2107,10 +2108,30 @@ class TestConditionalCards(TreeCase):
         self.assertEqual(disp["#webCard"], "none")
         self.assertNotIn("#byWeb", calls)
 
-    def test_the_card_starts_hidden_in_the_markup(self):
+    def test_the_split_shows_when_a_row_is_background(self):
+        disp, calls = self.view(
+            at_day("2026-03-01", msg_line("m1", inp=100, sessionKind="bg"),
+                   msg_line("m2", inp=20)),
+            at_day("2026-03-02", msg_line("m3", inp=7)))
+        self.assertEqual(disp["#bgCard"], "")
+        self.assertEqual(calls["#byBg"],
+                         [("background", 100), ("foreground", 27)])
+        self.assertEqual(calls["#byKind"], [("main session", 127)])
+
+    def test_the_split_hides_when_the_range_leaves_the_background_day(self):
+        disp, calls = self.view(
+            at_day("2026-03-01", msg_line("m1", inp=100, sessionKind="bg")),
+            at_day("2026-03-02", msg_line("m3", inp=7)),
+            setup="state.d0 = state.d1 = '2026-03-02';")
+        self.assertEqual(disp["#bgCard"], "none")
+        self.assertNotIn("#byBg", calls)
+
+    def test_both_cards_start_hidden_in_the_markup(self):
         html = report(run()[1])
-        self.assertRegex(html, r'id="webCard"[^>]*style="[^"]*display:none')
-        self.assertIn("<h2>Web search and fetch</h2>", html)
+        for card in ("webCard", "bgCard"):
+            self.assertRegex(html, rf'id="{card}"[^>]*style="[^"]*display:none')
+        for title in ("Web search and fetch", "Foreground vs background"):
+            self.assertIn(f"<h2>{title}</h2>", html)
 
 
 FIVE_HOUR_WORDING = re.compile(
