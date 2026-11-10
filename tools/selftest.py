@@ -1980,6 +1980,44 @@ class TestSessionsTable(TreeCase):
             self.assertFalse(r[0].endswith(" · background"), r)
 
 
+def output_tile(kpis):
+    m = re.search(r'Output tokens</div>\s*<div class="v">([^<]*)</div>\s*'
+                  r'<div class="d">([^<]*)</div>', kpis)
+    return m.group(1), m.group(2)
+
+
+@unittest.skipIf(not NODE, "needs a JS engine")
+class TestThinkingShare(TreeCase):
+    """D-15: thinking shows as a share of output on the Output tokens tile.
+    It is already inside output, so the value never grows."""
+
+    def tile(self, *sessions):
+        self.tree(*sessions)
+        return output_tile(rendered(report(self.out))["kpis"])
+
+    def test_the_share_rides_the_detail_line_and_the_value_stays_output(self):
+        value, detail = self.tile([
+            msg_line("m1", out=200, details={"thinking_tokens": 100}),
+            msg_line("m2", out=100, details={"thinking_tokens": 20})])
+        self.assertEqual(value, "300")
+        self.assertIn("2 messages", detail)
+        self.assertRegex(detail, r"\b40% thinking")
+
+    def test_a_range_without_thinking_shows_no_share(self):
+        _, detail = self.tile([msg_line("m1", out=300)])
+        self.assertEqual(detail, "1 messages")
+
+    def test_the_existing_fixture_shows_no_share(self):
+        _, out = run(["--root", P["primary"]])
+        _, detail = output_tile(rendered(report(out))["kpis"])
+        self.assertRegex(detail, r"^[\d,]+ messages$")
+
+    def test_the_composition_block_never_mentions_thinking(self):
+        _, out = run()
+        block = viewer_slice(report(out), "// composition", "stackedChart(")
+        self.assertNotIn("think", block.lower())
+
+
 FIVE_HOUR_WORDING = re.compile(
     r"5h|5-hour|five[_ -]hour|resets5|BLOCK_", re.IGNORECASE)
 

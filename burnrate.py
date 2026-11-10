@@ -1640,7 +1640,7 @@ function render(){
   const perProj = new Map();
   const perDayTotal = new Array(nDays).fill(0);
   const perDayCache = days.map(() => [0, 0, 0]);   // fresh in, cache write, cache read
-  let total = 0, totalOut = 0, totalMsgs = 0;
+  let total = 0, totalOut = 0, totalMsgs = 0, totalThink = 0;
   for (const r of rows){
     const i = dIdx.get(r[D.day]);
     if (i == null) continue;
@@ -1648,6 +1648,7 @@ function render(){
     perProj.get(r[D.p])[i] += r[D.be];
     perDayTotal[i] += r[D.be];
     total += r[D.be]; totalOut += r[D.out]; totalMsgs += r[D.n];
+    totalThink += r[D.think];
     const c = perDayCache[i];
     c[0] += r[D.inp]; c[1] += r[D.cc]; c[2] += r[D.cr];
   }
@@ -1702,7 +1703,8 @@ function render(){
     <div class="tile"><div class="l">Peak day</div><div class="v">${fmt(perDayTotal[pk]||0)}</div>
       <div class="d">${perDayTotal[pk] ? fmtDay(days[pk]) : '—'}</div></div>
     <div class="tile"><div class="l">Output tokens</div><div class="v">${fmt(totalOut)}</div>
-      <div class="d">${fmtFull(totalMsgs)} messages</div></div>
+      <div class="d">${fmtFull(totalMsgs)} messages${totalThink > 0 ?
+        ` · ${(100*totalThink/totalOut).toFixed(totalThink < totalOut/10 ? 1 : 0)}% thinking` : ''}</div></div>
     <div class="tile"><div class="l">Cache hit rate</div>
       <div class="v">${hit == null ? '—' : hit.toFixed(1) + '%'}</div>
       <div class="d">${hit == null ? 'no prompt tokens' : (100 - hit).toFixed(1) + '% missed'}${dHit == null ? '' :
