@@ -660,6 +660,9 @@ def scan_unit(iters, unit, rec, want_meta):
                 d = json.loads(line)
             except Exception:
                 continue
+            # the substring checks above pass a list just as happily as an object
+            if not isinstance(d, dict):
+                continue
             if is_turn and d.get("type") == "system" \
                     and d.get("subtype") == "turn_duration":
                 # feeds the duration only: these lines carry cwd and gitBranch

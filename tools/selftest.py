@@ -645,6 +645,9 @@ class TreeCase(unittest.TestCase):
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as fh:
                 for i, d in enumerate(lines):
+                    if isinstance(d, str):
+                        fh.write(d + "\n")
+                        continue
                     d.setdefault("timestamp", time.strftime(
                         "%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.T0 + 60 * i)))
                     fh.write(json.dumps(d) + "\n")
@@ -883,6 +886,12 @@ class TestSessionDuration(TreeCase):
             turn_line("u2", 10, cwd="/home/alice/other"),
             turn_line("u3", 10, cwd="/home/alice/other")])
         self.assertEqual([p["id"] for p in got["projects"]], ["api"])
+
+    def test_a_line_that_decodes_to_a_list_is_skipped(self):
+        got = self.tree([msg_line("m1"), turn_line("u1", 1000),
+                         '["turn_duration","timestamp"]',
+                         '["usage","timestamp"]'])
+        self.assertEqual(self.durations(got), {"sess-0": 1000})
 
     def test_the_existing_fixture_rows_are_14_wide_with_null_duration(self):
         _, out = run(["--root", P["primary"]])
