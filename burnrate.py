@@ -267,7 +267,9 @@ def terminus_sessions(entries):
     ASCII letters and digits becomes "-") of the main's launch directory. That
     is project_pre_worktree when the main has one: terminus files a session
     started in a worktree under its parent project, the live tree files it under
-    the worktree, and encoding `project` would read the same session twice. A
+    the worktree, and encoding `project` would read the same session twice. It
+    isn't always a worktree, though, so `alt` keeps `project`'s encoding and
+    discovery takes whichever one the live tree already has the session under. A
     subagent attaches to its main by sid, never by its own `project`. A main
     with no project is dropped with whatever hangs off it, and so is a subagent
     with no main."""
@@ -296,7 +298,8 @@ def terminus_sessions(entries):
             launch = project
         out[(re.sub(r"[^A-Za-z0-9]", "-", launch), sid)] = {
             "main": (key, wm, ev),
-            "subs": sorted(subs.get(sid, {}).values())}
+            "subs": sorted(subs.get(sid, {}).values()),
+            "alt": re.sub(r"[^A-Za-z0-9]", "-", project)}
     return out
 
 
@@ -907,8 +910,15 @@ def _discover_terminus(tsessions, root, seen, sessions):
     `evicted` set instead, so it is never exported or parsed and the rest of the
     session reads as usual (D-03). A file the live tree has never gets that far."""
     for (proj, sid), t in sorted(tsessions.items()):
+        files = [(None, *t["main"])] + t["subs"]
+        # project_pre_worktree isn't always where the live tree files a
+        # session; whichever folder already holds one of its files wins
+        alt = t.get("alt", proj)
+        if not any((proj, f[1]) in seen for f in files) \
+                and any((alt, f[1]) in seen for f in files):
+            proj = alt
         s = None
-        for unit, key, wm, ev in [(None, *t["main"])] + t["subs"]:
+        for unit, key, wm, ev in files:
             if (proj, key) in seen:
                 continue
             if s is None:

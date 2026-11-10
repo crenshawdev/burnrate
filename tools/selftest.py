@@ -3776,6 +3776,20 @@ class TestTerminusSessions(unittest.TestCase):
         self.assertNotIn("p3-sess-0", found["-home-alice-work-api"])
         self.assertEqual(sum("p3-sess-0" in sids for sids in found.values()), 1)
 
+    def test_a_pre_worktree_subdirectory_still_finds_the_live_copy(self):
+        # real terminus sets project_pre_worktree to a plain subdirectory for
+        # sessions the live tree files under `project`
+        stub = tm_store()
+        stub.entry("p0-sess-0.jsonl")["project_pre_worktree"] = API + "/.planning"
+        stub.save()
+        _, found = self.found(stub)
+        s = found["-home-alice-work-api"]["p0-sess-0"]
+        self.assertEqual({k for k, _ in s["main"]}, {"live"})
+        self.assertEqual({k for specs in s["subs"].values()
+                          for k, _ in specs}, {"live"})
+        self.assertEqual(sum("p0-sess-0" in sids for sids in found.values()), 1)
+        self.assertEqual(br.terminus_keys(s), [])
+
     def test_what_is_not_a_transcript_never_becomes_a_session(self):
         _, found = self.found(tm_store())
         sids = {sid for sids in found.values() for sid in sids}
