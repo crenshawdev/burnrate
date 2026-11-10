@@ -246,6 +246,11 @@ elif argv == ["sessions", "--project", "*", "--json"]:
     if S.get("bad_json"):
         print("not json {")
         sys.exit(0)
+    if S.get("no_store"):
+        print(json.dumps({"command": "sessions", "data": {"sessions": []},
+                          "ok": True,
+                          "reason": "no terminus store at /nowhere " + MARKER}))
+        sys.exit(0)
     ents = []
     for e in S["entries"]:
         ent = {"project": e["project"], "session_key": e["session_key"],
@@ -294,8 +299,8 @@ else:
 class StubTerminus:
     """A throwaway stub terminus plus its store. `triples` are (project path,
     session_key, lines); a line is a str or a dict that gets json-dumped. Top
-    level switches (`version`, `fail` = a command name, `not_ok`, `bad_json`)
-    go in `top`; per-key ones (`watermark`, `evicted`, `project_pre_worktree`,
+    level switches (`version`, `fail` = a command name, `not_ok`, `bad_json`,
+    `no_store` = ok with an empty list and a reason) go in `top`; per-key ones (`watermark`, `evicted`, `project_pre_worktree`,
     `no_frame`, `short_by`, `frame_evicted` = only the export's header says
     so) go in `per`, keyed by session_key."""
 
@@ -4119,6 +4124,41 @@ class TestTerminusFailure(unittest.TestCase):
         self.assertEqual(len(stub.exports()), 3)
         self.assertEqual(total_be(payload(out)),
                          EXP["total_be"] + TM_BE + 3000 + 111)
+
+    def test_a_terminus_with_no_store_is_taken_as_absent(self):
+        stub = tm_store()
+        c = tempfile.mkdtemp(dir=TMP)
+        cdir = os.path.join(c, "burnrate")
+
+        def cached():
+            out = {}
+            for f in os.listdir(cdir):
+                with open(os.path.join(cdir, f), "rb") as fh:
+                    out[f] = fh.read()
+            return out
+
+        proc, _ = run(env=stub.env(XDG_CACHE_HOME=c))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        before = cached()
+        _, bare = run(env=base_env(XDG_CACHE_HOME=tempfile.mkdtemp(dir=TMP)))
+        stub.data["no_store"] = True
+        stub.save()
+        proc, out = run(env=stub.env(XDG_CACHE_HOME=c))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        warns = self.warnings(proc)
+        self.assertEqual(len(warns), 1, proc.stderr)
+        self.assertIn("terminus", warns[0].lower())
+        self.assertNotIn(STUB_MARKER, proc.stdout + proc.stderr)
+        self.assertEqual(payload_sans_generated(out),
+                         payload_sans_generated(bare))
+        for f, body in before.items():
+            self.assertEqual(cached()[f], body)
+
+    def test_an_empty_list_with_no_reason_is_a_real_empty_list(self):
+        proc, out, _ = self.go(StubTerminus())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.warnings(proc), [])
+        self.assertEqual(payload(out)["archive_label"], "Terminus")
 
 
 BACKUP = "/home/erin/backup/proj"

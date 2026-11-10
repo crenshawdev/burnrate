@@ -305,8 +305,9 @@ def open_terminus(env):
     The list is asked for once, here, so a terminus that can't answer drops out
     before the cache file is chosen. It is always `--project '*'`: without it
     terminus scopes the list to the cwd's project. A version that is old or
-    isn't one is the silent not-installed case; any failure past that is one
-    warning and the run goes on without terminus (D-10)."""
+    isn't one is the silent not-installed case; any failure past that, or a
+    list that is empty because terminus holds no store, is one warning and the
+    run goes on without terminus (D-10)."""
     exe = find_terminus(env)
     if not exe:
         return None
@@ -324,6 +325,12 @@ def open_terminus(env):
             raise TerminusError("the session list says ok: false")
         if not isinstance(entries, list):
             raise TerminusError("the session list isn't a list")
+        if not entries and d.get("reason"):
+            # no store at all is ok: true, an empty list and a reason, not an
+            # error. Taken as a real empty list it would overwrite the terminus
+            # cache file with a run that has no terminus-only session. The
+            # reason text is terminus's own and is never printed.
+            raise TerminusError("terminus has no store")
     except TerminusError as e:
         terminus_warn(e)
         return None
