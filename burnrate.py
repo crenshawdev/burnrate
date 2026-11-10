@@ -9,6 +9,10 @@ emits one self-contained HTML dashboard whose date-range and project filters run
 entirely client-side. Re-runs only parse sessions whose files changed, so "on
 demand" stays fast.
 
+When a `terminus` 2.0.0 or later is on the PATH it is read too, through its
+read-only commands only. The live copy of a file wins; Terminus supplies the
+files the live tree no longer has.
+
 What it measures (per assistant message, deduped globally by .message.id):
     input / cache-write (5m and 1h split) / cache-read / output tokens
     billed-equivalent = input + 1.25*cache_write_5m + 2*cache_write_1h
@@ -1505,7 +1509,8 @@ def main():
                     help="extra transcript source: either a <proj>/*.jsonl "
                          "tree or a <proj>/<sid>/*.zst archive")
     ap.add_argument("--no-archive", action="store_true",
-                    help="ignore every archive source, auto-detected or not")
+                    help="ignore every archive source, auto-detected or not, "
+                         "Terminus included")
     ap.add_argument("--rebuild", action="store_true",
                     help="ignore the cache and reparse everything")
     ap.add_argument("--json", action="store_true",
