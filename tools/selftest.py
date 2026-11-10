@@ -3501,5 +3501,153 @@ class TestTerminusStub(unittest.TestCase):
                          ("/p/a/.claude/worktrees/w", 99))
 
 
+def resolve_in(env, **kw):
+    """resolve_sources in-process under exactly this env: (result, stderr)."""
+    kw.setdefault("archive", None)
+    kw.setdefault("no_archive", False)
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        src = br.resolve_sources(types.SimpleNamespace(**kw), env=env)
+    return src, err.getvalue()
+
+
+def in_cwd(path):
+    @contextlib.contextmanager
+    def cm():
+        old = os.getcwd()
+        os.chdir(path)
+        try:
+            yield
+        finally:
+            os.chdir(old)
+    return cm()
+
+
+TERMINUS_ENTRY = ("terminus", br.TERMINUS_SOURCE)
+
+
+class TestTerminusSource(unittest.TestCase):
+    """D-07/D-09/D-16/D-17: an installed terminus 2.0.0 or later is one more
+    source of the run, found on the env's PATH and nowhere else."""
+
+    ROW = [("/home/zed/x", "s1.jsonl", ["{}"])]
+
+    def env_for(self, stub, **over):
+        return dict({"HOME": P["home"], "XDG_CONFIG_HOME": EMPTY_CONF,
+                     "PATH": stub.dir}, **over)
+
+    def test_a_terminus_2_0_0_joins_the_sources(self):
+        stub = StubTerminus(self.ROW)
+        src, err = resolve_in(self.env_for(stub))
+        self.assertIn(TERMINUS_ENTRY, src["sources"])
+        self.assertTrue(src["archive_used"])
+        self.assertEqual(err, "")
+
+    def test_an_older_terminus_is_left_out_after_one_version_call(self):
+        stub = StubTerminus(self.ROW, version="1.9.0")
+        src, err = resolve_in(self.env_for(stub))
+        self.assertNotIn(TERMINUS_ENTRY, src["sources"])
+        self.assertFalse(src["archive_used"])
+        self.assertEqual(err, "")
+        self.assertEqual([c["argv"] for c in stub.calls()], [["--version"]])
+
+    def test_a_version_that_is_not_a_bare_version_is_left_out(self):
+        stub = StubTerminus(self.ROW, version="Terminus 3.1.0")
+        src, _ = resolve_in(self.env_for(stub))
+        self.assertNotIn(TERMINUS_ENTRY, src["sources"])
+        self.assertEqual([c["argv"] for c in stub.calls()], [["--version"]])
+
+    def test_the_process_path_is_never_consulted(self):
+        stub = StubTerminus(self.ROW)
+        old = os.environ.get("PATH", "")
+        os.environ["PATH"] = os.pathsep.join([stub.dir, old])
+        try:
+            src, _ = resolve_in({"HOME": P["home"],
+                                 "XDG_CONFIG_HOME": EMPTY_CONF})
+        finally:
+            os.environ["PATH"] = old
+        self.assertNotIn(TERMINUS_ENTRY, src["sources"])
+        self.assertEqual(stub.calls(), [])
+
+    def test_win32_tries_the_envs_pathext(self):
+        d = tempfile.mkdtemp(dir=TMP)
+        _write(os.path.join(d, "terminus.BAT"))
+        got = br.find_terminus({"PATH": d, "PATHEXT": ".COM;.BAT"},
+                               platform="win32")
+        self.assertEqual(got, os.path.join(d, "terminus.BAT"))
+        self.assertTrue(os.path.isabs(got))
+        # without a PATHEXT the default list applies, and it holds .BAT
+        self.assertEqual(br.find_terminus({"PATH": d}, platform="win32"),
+                         os.path.join(d, "terminus.BAT"))
+        # the same dir means nothing on linux: no extension is tried
+        self.assertIsNone(br.find_terminus({"PATH": d}, platform="linux"))
+
+    def test_the_cwd_is_never_searched(self):
+        d = tempfile.mkdtemp(dir=TMP)
+        _write(os.path.join(d, "terminus"), b"#!/bin/sh\n")
+        os.chmod(os.path.join(d, "terminus"), 0o755)
+        with in_cwd(d):
+            for path in (os.pathsep.join(["", "."]), ".", "", os.pathsep):
+                self.assertIsNone(br.find_terminus({"PATH": path}), path)
+            self.assertIsNone(br.find_terminus({"PATH": os.path.basename(d)}))
+
+    def test_posix_wants_the_execute_bit(self):
+        d = tempfile.mkdtemp(dir=TMP)
+        _write(os.path.join(d, "terminus"), b"#!/bin/sh\n")
+        os.chmod(os.path.join(d, "terminus"), 0o644)
+        self.assertIsNone(br.find_terminus({"PATH": d}, platform="linux"))
+        os.chmod(os.path.join(d, "terminus"), 0o755)
+        self.assertEqual(br.find_terminus({"PATH": d}, platform="linux"),
+                         os.path.join(d, "terminus"))
+
+    def test_no_archive_makes_no_call_and_root_does_not_turn_it_off(self):
+        stub = StubTerminus(self.ROW)
+        proc, _ = run(["--no-archive"], env=stub.env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(stub.calls(), [])
+        proc, _ = run(["--root", P["primary"]], env=stub.env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(["--version"], [c["argv"] for c in stub.calls()])
+
+    def test_terminus_runs_beside_an_archive(self):
+        stub = StubTerminus(self.ROW)
+        src, _ = resolve_in(self.env_for(stub), archive=P["backup"])
+        self.assertIn(("live", P["backup"]), src["sources"])
+        self.assertIn(TERMINUS_ENTRY, src["sources"])
+        self.assertEqual(src["archive_label"], "archive: backup")
+
+    def test_three_runs_leave_two_cache_files(self):
+        c = tempfile.mkdtemp(dir=TMP)
+        bd = os.path.join(c, "burnrate")
+        stub = StubTerminus(self.ROW)
+        run(env=stub.env(XDG_CACHE_HOME=c))
+        run(["--no-archive"], env=stub.env(XDG_CACHE_HOME=c))
+        run(env=base_env(XDG_CACHE_HOME=c))
+        files = [f for f in os.listdir(bd) if f.endswith(".json.gz")]
+        self.assertEqual(len(files), 2, files)
+
+    def test_the_cache_key_ignores_where_terminus_sits_and_the_cwd(self):
+        cenv = {"XDG_CACHE_HOME": os.path.join(TMP, "cache")}
+        keys = set()
+        for _ in range(2):
+            src, _ = resolve_in(self.env_for(StubTerminus(self.ROW)))
+            keys.add(br.cache_path(src["sources"], platform="linux", env=cenv))
+        for d in (tempfile.mkdtemp(dir=TMP), tempfile.mkdtemp(dir=TMP)):
+            with in_cwd(d):
+                keys.add(br.cache_path(src["sources"], platform="linux",
+                                       env=cenv))
+        self.assertEqual(len(keys), 1, keys)
+        plain, _ = resolve_in({"HOME": P["home"],
+                               "XDG_CONFIG_HOME": EMPTY_CONF})
+        self.assertNotIn(br.cache_path(plain["sources"], platform="linux",
+                                       env=cenv), keys)
+
+    def test_discover_never_walks_the_terminus_entry(self):
+        d = tempfile.mkdtemp(dir=TMP)
+        _write(os.path.join(d, br.TERMINUS_SOURCE, "-p", "s.jsonl"))
+        with in_cwd(d):
+            self.assertEqual(len(br.discover([TERMINUS_ENTRY])), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

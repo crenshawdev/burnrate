@@ -124,6 +124,87 @@ def hindsight_archive(env=None):
     return None
 
 
+# the source entry standing for terminus in a sources list. cache_path hashes it
+# as written and discover never walks it: it names no directory, and a relative
+# token realpath'd against the cwd would fork the cache per directory
+TERMINUS_SOURCE = "terminus"
+TERMINUS_WAIT = 120   # seconds a short terminus call gets before it is dropped
+
+
+def env_get(env, name, platform):
+    """env[name], matched case-insensitively on win32 where PATH may be Path."""
+    if name in env:
+        return env[name]
+    if platform == "win32":
+        for k, v in env.items():
+            if k.upper() == name:
+                return v
+    return None
+
+
+def find_terminus(env, platform=None):
+    """The absolute path of a `terminus` on env's PATH, or None.
+
+    Only env is searched, never the process's own PATH. An empty or relative
+    PATH entry is skipped and the cwd is never tried: /burnrate runs from
+    whatever project Claude Code was opened in, and a `terminus` file sitting
+    there must not execute. On win32 each PATHEXT extension is tried too; on
+    POSIX the file needs its execute bit."""
+    platform = sys.platform if platform is None else platform
+    win = platform == "win32"
+    path = env_get(env, "PATH", platform)
+    if not path:
+        return None
+    exts = [""]
+    if win:
+        pathext = env_get(env, "PATHEXT", platform) or ".COM;.EXE;.BAT;.CMD"
+        exts += [e for e in pathext.split(";") if e]
+    for d in path.split(";" if win else ":"):
+        d = d.strip('"') if win else d
+        if not d or not os.path.isabs(d):
+            continue
+        for ext in exts:
+            cand = os.path.join(d, "terminus" + ext)
+            if os.path.isfile(cand) and (win or os.access(cand, os.X_OK)):
+                return cand
+    return None
+
+
+def terminus_out(exe, argv, env):
+    """stdout of one read-only terminus call, or None when it can't start, runs
+    past TERMINUS_WAIT or exits non-zero. Every terminus call is an argv list
+    with no shell, under the caller's env. Its stderr is captured and dropped
+    (it carries a transcript-privacy notice and a line per miss) and its output
+    is decoded as UTF-8, never by locale."""
+    try:
+        p = subprocess.run([exe, *argv], env=env, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=TERMINUS_WAIT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if p.returncode != 0:
+        return None
+    return p.stdout.decode("utf-8", "replace")
+
+
+def terminus_usable(exe, env):
+    """True when `exe --version` prints MAJOR.MINOR.PATCH and it is 2.0.0 or
+    later. An older build might read `export --stdout` as `export <dir>` and
+    write its whole archive to disk; anything that isn't a bare version is some
+    other program called terminus."""
+    out = terminus_out(exe, ["--version"], env)
+    m = re.fullmatch(r"([0-9]+)\.([0-9]+)\.([0-9]+)", (out or "").strip())
+    return bool(m) and tuple(int(g) for g in m.groups()) >= (2, 0, 0)
+
+
+def open_terminus(env):
+    """{"exe", "env"} for a usable terminus on env's PATH, else None."""
+    exe = find_terminus(env)
+    if exe and terminus_usable(exe, env):
+        return {"exe": exe, "env": env}
+    return None
+
+
 def file_uri(path, flavour=None):
     """A percent-encoded file: URI. Concatenating "file://" onto a path is
     wrong for a Windows drive letter and for any path holding a space, '#' or
@@ -311,6 +392,10 @@ def resolve_sources(args, env=None):
         if layouts:
             sources.extend((k, arch) for k in layouts)
             label = "hindsight archive"
+    # alongside whatever archive was chosen above, never instead of it
+    terminus = None if no_archive else open_terminus(env)
+    if terminus:
+        sources.append(("terminus", TERMINUS_SOURCE))
     if zstd is None and any(k == "arch" for k, _ in sources):
         if any(k == "arch" and p != root for k, p in sources):
             print("warning: zstandard not installed -- archive skipped",
@@ -337,7 +422,8 @@ def resolve_sources(args, env=None):
     return {"root": root, "config_dir": config_dir,
             "rl_log": os.path.join(config_dir, "usage-logger",
                                    "usage-log.jsonl"),
-            "sources": sources, "archive_label": label, "archive_used": used}
+            "sources": sources, "archive_label": label, "archive_used": used,
+            "terminus": terminus}
 
 
 def path_segments(p):
@@ -555,7 +641,7 @@ def discover(sources):
     sessions = defaultdict(lambda: defaultdict(
         lambda: {"main": [], "subs": defaultdict(list), "meta": {}}))
     for layout, path in sources:
-        if not os.path.isdir(path):
+        if layout == "terminus" or not os.path.isdir(path):
             continue
         (_discover_live if layout == "live" else _discover_arch)(path, sessions)
     return sessions
@@ -807,7 +893,8 @@ def cache_path(sources, platform=None, env=None):
     a path forge a record boundary: one source named "/a\\narch\\t/b" and the
     two sources ("live", "/a") + ("arch", "/b") produce the same joined string,
     so two unrelated source sets share a file and evict each other."""
-    real = [(k, os.path.realpath(p)) for k, p in sources]
+    real = [(k, p if k == "terminus" else os.path.realpath(p))
+            for k, p in sources]
 
     def digest(pair):
         k, p = pair
