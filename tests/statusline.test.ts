@@ -8,12 +8,13 @@ const MEASURE = { context: {}, rateLimits: [{ kind: 'seven_day', percentUsed: 40
 const TURN = { answer: 'done', durationMs: 1, isAborted: false, turnId: 't1', reason: 'end_turn', usage: { model: 'm', input_tokens: 1, output_tokens: 2, cache_read_input_tokens: 3, cache_creation_input_tokens: 4 } } as never
 
 // answers every op the mod calls and records what ui.status was asked to draw
-const world = (on: On, entries?: Record<string, unknown> | null) => {
+// `hooks` swaps in a test's own answer for session.usage or session.id
+const world = (on: On, entries?: Record<string, unknown> | null, hooks: { usage?: () => unknown; id?: () => unknown } = {}) => {
   const drawn: (string | undefined)[] = []
   if (entries !== null) mock.store(on, entries)
   const clock = mock.clock(on, { now: NOW })
-  on('session.id', () => ({ value: SESSION }) as never)
-  on('session.usage', () => ({ value: { rateLimits: [] } }) as never)
+  on('session.id', (hooks.id ?? (() => ({ value: SESSION }))) as never)
+  on('session.usage', (hooks.usage ?? (() => ({ value: { rateLimits: [] } }))) as never)
   on('ui.status', (_$, e) => { drawn.push(e.text); return { value: undefined } as never })
   on('session.measure', (_$, e) => ({ changed: e.changed }) as never)
   on('turn.complete', (_$, e) => ({ text: e.answer }) as never)
@@ -156,5 +157,96 @@ describe('the session hit rate', () => {
     await $.turn.complete(turn(40, 50, 399, 'agent-1'))
     expect(sets.length).toBe(2)
     expect(sets[1]).toEqual([SESSION, { input: 100, output: 10, read: 799, write: 100 }])
+  })
+})
+
+// a hook that answers only once the test opens its gate
+const gate = () => {
+  let open!: () => void
+  const wait = new Promise<void>(r => { open = r })
+  return { wait, open }
+}
+
+describe('overlapping work and stale readings', () => {
+  test('a slow store write cannot land after a newer one and roll the sums back', async ($, on) => {
+    let stored: unknown = { input: 0, output: 0, read: 0, write: 0 }
+    let calls = 0
+    const slow = gate()
+    world(on, null)
+    on('store.get', () => ({ value: stored }) as never)
+    on('store.set', async (_$, e) => {
+      // the first write is held until the test lets it through
+      if (calls++ === 0) await slow.wait
+      stored = (e as unknown as { value: unknown }).value
+      return { value: undefined } as never
+    })
+    const a = $.turn.complete(turn(60, 50, 400))
+    const b = $.turn.complete(turn(40, 50, 399, 'agent-1'))
+    await new Promise(r => setTimeout(r, 20))
+    slow.open()
+    await Promise.all([a, b])
+    expect(stored).toEqual({ input: 100, output: 10, read: 799, write: 100 })
+  })
+
+  test('a failed store read does not stand for an empty record', async ($, on) => {
+    let stored: unknown = { input: 100, output: 9, read: 700, write: 100 }
+    let reads = 0
+    world(on, null)
+    on('store.get', () => {
+      if (reads++ === 0) throw new Error('store down')
+      return { value: stored } as never
+    })
+    on('store.set', (_$, e) => { stored = (e as unknown as { value: unknown }).value; return { value: undefined } as never })
+    await $.turn.complete(turn(0, 0, 99))
+    await $.turn.complete(turn(0, 0, 99))
+    expect(stored).toEqual({ input: 100, output: 14, read: 799, write: 100 })
+  })
+
+  test('a slow first usage read does not replace a newer session.measure', async ($, on) => {
+    const slow = gate()
+    const drawn = world(on, undefined, {
+      usage: async () => {
+        await slow.wait
+        return { value: { rateLimits: [{ kind: 'seven_day', percentUsed: 10, resetsAt: new Date(NOW + 2 * DAY).toISOString() }] } }
+      },
+    })
+    const start = $.session.start(START)
+    await drawn.clock.settle()
+    await $.session.measure(week(40, 2 * DAY))
+    slow.open()
+    await start
+    await drawn.clock.advance(60_000)
+    expect(last(drawn)).toContain('Week: 40% used')
+  })
+
+  test('a draw that waited does not bring back a week a newer draw removed', async ($, on) => {
+    const slow = gate()
+    let held = false
+    const drawn = world(on, undefined, {
+      id: async () => {
+        // only the first call after the flag is set is held
+        const mine = held
+        held = false
+        if (mine) await slow.wait
+        return { value: SESSION }
+      },
+    })
+    await $.session.measure(week(40, 2 * DAY))
+    expect(last(drawn)).toContain('Week: 40%')
+    held = true
+    const late = $.session.start(START)
+    await drawn.clock.settle()
+    await $.session.measure(NO_WEEK)
+    slow.open()
+    await late
+    expect(last(drawn)).toBe('')
+  })
+
+  test('a week reading past its reset draws no forecast', async ($, on) => {
+    const drawn = world(on)
+    await $.session.measure(week(40, 2 * DAY))
+    expect(last(drawn)).toContain('Week: 40%')
+    await drawn.clock.advance(3 * DAY)
+    expect(last(drawn)).toBe('')
   })
 })
