@@ -4,3 +4,4 @@ dashboard_data.json
 .dash_cache.json.gz
 .planning/
 .claude-plugin/types/
+tsconfig.json
