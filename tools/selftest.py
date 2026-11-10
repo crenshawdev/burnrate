@@ -131,10 +131,23 @@ br = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(br)
 
 
+def holds_terminus(d):
+    """Does PATH entry `d` hold an executable named terminus? An empty entry
+    means the cwd, as it does to a shell."""
+    p = os.path.join(d or ".", "terminus")
+    return os.path.isfile(p) and os.access(p, os.X_OK)
+
+
 def base_env(**over):
     env = dict(os.environ)
     for k in ("CLAUDE_PROJECTS", "CLAUDE_CONFIG_DIR", "TZ", "BROWSER"):
         env.pop(k, None)
+    # burnrate auto-detects a terminus on PATH, so a machine that has the real
+    # one (and its whole transcript archive) would feed every case below. Only
+    # the stub from StubTerminus.env() may be reachable.
+    if "PATH" in env:
+        env["PATH"] = os.pathsep.join(
+            d for d in env["PATH"].split(os.pathsep) if not holds_terminus(d))
     env["HOME"] = P["home"]
     env["XDG_CACHE_HOME"] = os.path.join(TMP, "cache")
     env["XDG_CONFIG_HOME"] = EMPTY_CONF
@@ -188,6 +201,154 @@ def payload(out):
 
 def total_be(data):
     return sum(p["be"] for p in data["projects"])
+
+
+STUB_MARKER = "TERMINUS-STUB-STDERR-MARKER"
+
+# A stand-in for the three read calls burnrate may make of terminus 2.0.0. It
+# keeps its store and its call log beside itself, so nothing about it depends on
+# the environment a case hands the run. Any other argv is logged and refused,
+# which is how a case proves burnrate never ran a command that writes.
+STUB_SRC = r'''#!@PY@
+import json, os, sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+MARKER = "@MARKER@"
+NOTICE = ("NOTICE: this export holds verbatim, unredacted transcripts. "
+          + MARKER + "\n")
+with open(os.path.join(HERE, "store.json"), encoding="utf-8") as fh:
+    S = json.load(fh)
+argv = sys.argv[1:]
+sys.stderr.write(MARKER + "\n")
+sys.stderr.flush()
+
+
+def log(**extra):
+    with open(os.path.join(HERE, "calls.log"), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(dict(argv=argv, **extra)) + "\n")
+
+
+def body_of(e):
+    return "".join((x if isinstance(x, str) else json.dumps(x)) + "\n"
+                   for x in e["lines"]).encode("utf-8")
+
+
+fail = S.get("fail")
+if argv == ["--version"]:
+    log()
+    if fail == "version":
+        sys.exit(1)
+    print(S.get("version", "2.0.0"))
+elif argv == ["sessions", "--project", "*", "--json"]:
+    log()
+    if fail == "sessions":
+        sys.exit(1)
+    if S.get("bad_json"):
+        print("not json {")
+        sys.exit(0)
+    ents = []
+    for e in S["entries"]:
+        ent = {"project": e["project"], "session_key": e["session_key"],
+               "watermark": e.get("watermark", len(body_of(e))),
+               "evicted": bool(e.get("evicted")), "turns": len(e["lines"])}
+        if "project_pre_worktree" in e:
+            ent["project_pre_worktree"] = e["project_pre_worktree"]
+        ents.append(ent)
+    bad = bool(S.get("not_ok"))
+    print(json.dumps({"command": "sessions", "data": {"sessions": ents},
+                      "ok": not bad, "reason": "stub failure" if bad else None}))
+elif argv == ["export", "--stdout"]:
+    keys = [k for k in sys.stdin.read().split("\n") if k]
+    log(keys=keys)
+    sys.stderr.write(NOTICE)
+    sys.stderr.flush()
+    if fail == "export":
+        sys.exit(1)
+    by_key = {e["session_key"]: e for e in S["entries"]}
+    # what the real binary does with nothing on stdin: everything
+    keys = keys or [e["session_key"] for e in S["entries"]]
+    out = sys.stdout.buffer
+    try:
+        for k in keys:
+            e = by_key.get(k)
+            if e is None or e.get("no_frame"):
+                sys.stderr.write(k + ": not found\n")
+                continue
+            body = body_of(e)
+            hdr = {"project": e["project"], "session_key": k,
+                   "watermark": len(body) + e.get("short_by", 0)}
+            if e.get("evicted"):
+                hdr["evicted"] = True
+                body = b""
+            out.write(json.dumps({"terminus": hdr}).encode("utf-8") + b"\n")
+            out.write(body)
+        out.flush()
+    except BrokenPipeError:
+        sys.exit(0)
+else:
+    log()
+    sys.exit(2)
+'''.replace("@PY@", sys.executable).replace("@MARKER@", STUB_MARKER)
+
+
+class StubTerminus:
+    """A throwaway stub terminus plus its store. `triples` are (project path,
+    session_key, lines); a line is a str or a dict that gets json-dumped. Top
+    level switches (`version`, `fail` = a command name, `not_ok`, `bad_json`)
+    go in `top`; per-key ones (`watermark`, `evicted`, `project_pre_worktree`,
+    `no_frame`, `short_by`) go in `per`, keyed by session_key."""
+
+    def __init__(self, triples=(), per=None, **top):
+        self.dir = tempfile.mkdtemp(dir=TMP, prefix="terminus-stub-")
+        self.exe = os.path.join(self.dir, "terminus")
+        with open(self.exe, "w", encoding="utf-8") as fh:
+            fh.write(STUB_SRC)
+        os.chmod(self.exe, 0o755)
+        self.data = dict(top, entries=[])
+        for project, key, lines in triples:
+            self.add(project, key, lines, **(per or {}).get(key, {}))
+        self.save()
+
+    def add(self, project, key, lines, **kw):
+        self.data["entries"].append(dict(kw, project=project, session_key=key,
+                                         lines=list(lines)))
+
+    def entry(self, key):
+        return next(e for e in self.data["entries"]
+                    if e["session_key"] == key)
+
+    def save(self):
+        with open(os.path.join(self.dir, "store.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump(self.data, fh)
+
+    def env(self, **over):
+        """base_env() with this stub's directory first on the filtered PATH."""
+        env = base_env(**over)
+        if "PATH" not in over:
+            env["PATH"] = os.pathsep.join(
+                [self.dir] + ([env["PATH"]] if env.get("PATH") else []))
+        return env
+
+    def run(self, *argv, stdin=b""):
+        return subprocess.run([self.exe, *argv], input=stdin,
+                              capture_output=True)
+
+    def calls(self):
+        try:
+            with open(os.path.join(self.dir, "calls.log"),
+                      encoding="utf-8") as fh:
+                return [json.loads(x) for x in fh if x.strip()]
+        except OSError:
+            return []
+
+    def exports(self):
+        """The keys each export call read, call by call."""
+        return [c["keys"] for c in self.calls() if c["argv"][0] == "export"]
+
+    def forget(self):
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(self.dir, "calls.log"))
 
 
 class TestRootResolution(unittest.TestCase):
@@ -3229,6 +3390,115 @@ class TestHindsightConfig(unittest.TestCase):
 
     def test_absent_config_is_not_an_error(self):
         self.assertIsNone(br.hindsight_archive({"XDG_CONFIG_HOME": EMPTY_CONF}))
+
+
+class TestTerminusStub(unittest.TestCase):
+    """The stub is how the suite stays off the real terminus, so the stub and
+    the filter that keeps the real one off PATH are checked on their own."""
+
+    def test_base_env_drops_a_dir_that_holds_a_terminus(self):
+        d = tempfile.mkdtemp(dir=TMP)
+        _write(os.path.join(d, "terminus"), b"#!/bin/sh\n")
+        os.chmod(os.path.join(d, "terminus"), 0o755)
+        old = os.environ.get("PATH", "")
+        os.environ["PATH"] = os.pathsep.join([d, old]) if old else d
+        try:
+            got = base_env()["PATH"].split(os.pathsep)
+            want = [x for x in os.environ["PATH"].split(os.pathsep)
+                    if x != d and not holds_terminus(x)]
+        finally:
+            os.environ["PATH"] = old
+        self.assertNotIn(d, got)
+        self.assertEqual(got, want)
+        # the filter only drops: every other entry survived, in order
+        self.assertEqual(got, [x for x in old.split(os.pathsep)
+                               if not holds_terminus(x)])
+
+    def test_no_path_entry_of_base_env_reaches_a_terminus(self):
+        for d in base_env()["PATH"].split(os.pathsep):
+            self.assertFalse(holds_terminus(d), d)
+
+    def test_version_defaults_and_follows_the_store(self):
+        self.assertEqual(StubTerminus().run("--version").stdout, b"2.0.0\n")
+        self.assertEqual(
+            StubTerminus(version="1.9.0").run("--version").stdout, b"1.9.0\n")
+
+    def test_sessions_lists_each_body_size_as_its_watermark(self):
+        stub = StubTerminus([("/p/a", "s1.jsonl", [{"x": 1}, "plain"]),
+                             ("/p/a", "s1/subagents/agent-a.jsonl", ["z"])])
+        proc = stub.run("sessions", "--project", "*", "--json")
+        self.assertEqual(proc.returncode, 0)
+        got = json.loads(proc.stdout)
+        self.assertTrue(got["ok"])
+        self.assertIsNone(got["reason"])
+        ents = got["data"]["sessions"]
+        self.assertEqual([e["session_key"] for e in ents],
+                         ["s1.jsonl", "s1/subagents/agent-a.jsonl"])
+        self.assertEqual([e["watermark"] for e in ents],
+                         [len(b'{"x": 1}\nplain\n'), 2])
+        for e in ents:
+            self.assertEqual(
+                set(e) >= {"project", "session_key", "watermark", "evicted",
+                           "turns"}, True)
+            self.assertFalse(e["evicted"])
+            self.assertNotIn("project_pre_worktree", e)
+
+    def test_export_frames_a_held_key_and_reports_an_unknown_one(self):
+        stub = StubTerminus([("/p/a", "s1.jsonl", [{"x": 1}, "plain"])])
+        proc = stub.run("export", "--stdout", stdin=b"nope.jsonl\ns1.jsonl\n")
+        self.assertEqual(proc.returncode, 0)
+        head, _, body = proc.stdout.partition(b"\n")
+        hdr = json.loads(head)["terminus"]
+        self.assertEqual((hdr["project"], hdr["session_key"]),
+                         ("/p/a", "s1.jsonl"))
+        self.assertEqual(len(body), hdr["watermark"])
+        self.assertEqual(body, b'{"x": 1}\nplain\n')
+        err = proc.stderr.decode("utf-8")
+        self.assertIn(STUB_MARKER, err)
+        self.assertIn("nope.jsonl: not found", err)
+        self.assertIn("unredacted", err)
+
+    def test_a_write_command_is_refused_and_logged(self):
+        stub = StubTerminus([("/p/a", "s1.jsonl", ["x"])])
+        self.assertNotEqual(stub.run("ingest").returncode, 0)
+        self.assertNotEqual(stub.run("sessions", "--json").returncode, 0)
+        self.assertNotEqual(stub.run("export", "/tmp/somewhere").returncode, 0)
+
+    def test_every_call_reaches_the_log(self):
+        stub = StubTerminus([("/p/a", "s1.jsonl", ["x"])])
+        stub.run("--version")
+        stub.run("sessions", "--project", "*", "--json")
+        stub.run("export", "--stdout", stdin=b"s1.jsonl\n")
+        stub.run("ingest")
+        self.assertEqual([c["argv"] for c in stub.calls()],
+                         [["--version"],
+                          ["sessions", "--project", "*", "--json"],
+                          ["export", "--stdout"], ["ingest"]])
+        self.assertEqual(stub.exports(), [["s1.jsonl"]])
+
+    def test_the_failure_switches_do_what_they_say(self):
+        row = [("/p/a", "s1.jsonl", ["abc"])]
+        self.assertEqual(StubTerminus(row, fail="sessions").run(
+            "sessions", "--project", "*", "--json").returncode, 1)
+        self.assertEqual(StubTerminus(row, fail="export").run(
+            "export", "--stdout", stdin=b"s1.jsonl\n").returncode, 1)
+        bad = StubTerminus(row, not_ok=True).run(
+            "sessions", "--project", "*", "--json")
+        self.assertFalse(json.loads(bad.stdout)["ok"])
+        with self.assertRaises(ValueError):
+            json.loads(StubTerminus(row, bad_json=True).run(
+                "sessions", "--project", "*", "--json").stdout)
+        short = StubTerminus(row, per={"s1.jsonl": {"short_by": 5}}).run(
+            "export", "--stdout", stdin=b"s1.jsonl\n")
+        head, _, body = short.stdout.partition(b"\n")
+        self.assertEqual(json.loads(head)["terminus"]["watermark"],
+                         len(body) + 5)
+        pre = StubTerminus(row, per={"s1.jsonl": {
+            "project_pre_worktree": "/p/a/.claude/worktrees/w",
+            "watermark": 99}}).run("sessions", "--project", "*", "--json")
+        ent = json.loads(pre.stdout)["data"]["sessions"][0]
+        self.assertEqual((ent["project_pre_worktree"], ent["watermark"]),
+                         ("/p/a/.claude/worktrees/w", 99))
 
 
 if __name__ == "__main__":
