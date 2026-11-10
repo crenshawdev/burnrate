@@ -894,8 +894,10 @@ def _discover_terminus(tsessions, root, seen, sessions):
     file: a file joins a session only when the live walk found nothing at its
     proj and key. A subagent read from terminus has no agentType of its own; a
     live .meta.json where its file would sit under the root still names it.
-    A file terminus supplies that it marks evicted makes the whole session
-    evicted (D-03); a file the live tree has never gets that far."""
+    A file terminus supplies that it marks evicted is not added at all: its unit
+    ("" for the main, the subagent key otherwise) goes into the session's
+    `evicted` set instead, so it is never exported or parsed and the rest of the
+    session reads as usual (D-03). A file the live tree has never gets that far."""
     for (proj, sid), t in sorted(tsessions.items()):
         s = None
         for unit, key, wm, ev in [(None, *t["main"])] + t["subs"]:
@@ -904,7 +906,8 @@ def _discover_terminus(tsessions, root, seen, sessions):
             if s is None:
                 s = sessions[proj][sid]
             if ev:
-                s["evicted"] = True
+                s["evicted"].add(unit or "")
+                continue
             spec = ("terminus", (key, wm))
             if unit is None:
                 s["main"].append(spec)
@@ -919,10 +922,11 @@ def discover(sources, terminus=None):
     """{proj_dir: {sid: {'main': [(kind,path)], 'subs': {key: [(kind,path)]},
                          'meta': {key: agentType}}}} merged across every
     resolved source, primary first. A terminus handle adds its sessions' files
-    as ('terminus', (session_key, watermark)) entries."""
+    as ('terminus', (session_key, watermark)) entries; 'evicted' is the set of
+    units ("" is the main) whose only terminus copy is evicted."""
     sessions = defaultdict(lambda: defaultdict(
         lambda: {"main": [], "subs": defaultdict(list), "meta": {},
-                 "evicted": False}))
+                 "evicted": set()}))
     root = sources[0][1] if sources else None
     seen = set()
     for layout, path in sources:
@@ -1157,11 +1161,30 @@ def terminus_keys(s):
     return keys
 
 
-def parse_session(s, export=None):
+MAIN_ONLY = ("slug", "title", "segs", "comp", "intr", "err", "branch", "cwd",
+             "dur")
+
+
+def parse_session(s, export=None, old=None):
+    """The record for one session. `old` is the cached entry for it: an evicted
+    unit is never read, so its rows (and a subagent's `agents` entry) are taken
+    from there, and so is everything only a main carries when the main is the
+    evicted one and nothing else supplies it. With no `old` an evicted unit
+    contributes nothing."""
     rec = {"rows": [], "segs": [], "slug": None, "title": None,
            "comp": 0, "intr": 0, "err": 0, "agents": {},
            "_byid": {}, "_marks": set(), "_branch": Counter(),
            "_cwd": Counter(), "_local": set(), "_dur": {}}
+    kept = (old or {}).get("rec") or {}
+    for unit in sorted(s["evicted"]):
+        # seeded first, so a message a live file replays is not counted twice
+        for r in kept.get("rows", []):
+            if r[4] == unit and r[0] not in rec["_byid"]:
+                row = list(r)
+                rec["rows"].append(row)
+                rec["_byid"][row[0]] = row
+        if unit and unit in kept.get("agents", {}):
+            rec["agents"][unit] = kept["agents"][unit]
     scan_unit(iters_for(s["main"], export), "", rec, want_meta=True)
     for key, specs in sorted(s["subs"].items()):
         rec["agents"][key] = s["meta"].get(key) or "unresolved"
@@ -1174,6 +1197,10 @@ def parse_session(s, export=None):
     rec["cwd"] = (min(rec["_cwd"].items(), key=lambda kv: (-kv[1], kv[0]))[0]
                   if rec["_cwd"] else None)
     rec["dur"] = [[u, ms] for u, ms in rec["_dur"].items()]
+    if "" in s["evicted"] and not s["main"]:
+        for k in MAIN_ONLY:
+            if k in kept:
+                rec[k] = kept[k]
     for k in ("_byid", "_marks", "_branch", "_cwd", "_local", "_dur"):
         del rec[k]
     return rec
@@ -1268,32 +1295,36 @@ def collect(cache_path, sources, rebuild, quiet, terminus=None):
     for proj, sids in sorted(found.items()):
         for sid, s in sorted(sids.items()):
             key = f"{proj}/{sid}"
-            hit = cache.get(key)
-            if s["evicted"]:
-                # D-03: never exported, and the record burnrate already holds
-                # is kept as it is, whatever the list says now. This departs
-                # from the rule that only rediscovered sessions are kept: the
-                # evicted usage exists nowhere else. No record, no session.
-                if hit:
+            old = cache.get(key)
+            if s["evicted"] and not (s["main"] or any(s["subs"].values())):
+                # D-03: every unit of it is evicted, so nothing is exported and
+                # the record burnrate already holds is kept as it is, whatever
+                # the list says now. This departs from the rule that only
+                # rediscovered sessions are kept: the evicted usage exists
+                # nowhere else. No record, no session.
+                if old:
                     done += 1
-                    plan.append((key, proj, sid, s, done, hit, [], None))
+                    plan.append((key, proj, sid, s, done, old, [], None, None))
                 else:
                     total -= 1
                 continue
             done += 1
             sig = session_sig(s)
-            if hit and hit["sig"] == sig:
-                plan.append((key, proj, sid, s, done, hit, [], sig))
+            if old and old["sig"] == sig:
+                plan.append((key, proj, sid, s, done, old, [], sig, None))
                 continue
+            # D-03 per file: an evicted unit drops out of the signature, so a
+            # newly evicted one lands here, parses the units still readable and
+            # takes the evicted one's usage from `old`
             tkeys = terminus_keys(s)
             keys.extend(tkeys)
-            plan.append((key, proj, sid, s, done, None, tkeys, sig))
+            plan.append((key, proj, sid, s, done, None, tkeys, sig, old))
     # one export for every session that changed and holds a terminus file, in
     # the order parse_session reads them; none at all when nothing changed,
     # since an empty stdin streams the whole archive
     export = TerminusExport(terminus, keys) if keys else None
     try:
-        for key, proj, sid, s, done, hit, tkeys, sig in plan:
+        for key, proj, sid, s, done, hit, tkeys, sig, old in plan:
             if hit:
                 out[key] = hit
                 continue
@@ -1301,7 +1332,7 @@ def collect(cache_path, sources, rebuild, quiet, terminus=None):
             if not quiet and parsed % 50 == 0:
                 print(f"  parsing {done}/{total} sessions "
                       f"({parsed} changed)...", file=sys.stderr)
-            rec = parse_session(s, export)
+            rec = parse_session(s, export, old)
             out[key] = {"sig": with_marks(sig, export.marks) if tkeys else sig,
                         "proj": proj, "sid": sid, "rec": rec}
         if export:

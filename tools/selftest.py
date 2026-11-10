@@ -4121,6 +4121,22 @@ class TestTerminusFailure(unittest.TestCase):
                          EXP["total_be"] + TM_BE + 3000 + 111)
 
 
+BACKUP = "/home/erin/backup/proj"
+LIVE_SUB = "p0-sess-0/subagents/agent-t1.jsonl"
+
+
+def live_stub(stub=None, evicted=False):
+    """A stub holding a main the live tree already has and one subagent of it
+    only Terminus has, evicted or not. Passed a stub, it rewrites that one."""
+    lines = [tm_msg("t1-0", 7000, API)]
+    if stub is None:
+        stub = StubTerminus([(API, "p0-sess-0.jsonl", []),
+                             (API, LIVE_SUB, lines)])
+    stub.entry(LIVE_SUB)["evicted"] = evicted
+    stub.save()
+    return stub
+
+
 class TestTerminusEvicted(unittest.TestCase):
     """D-03, AC5: an evicted session is never exported, and the record burnrate
     already cached for it stays in the payload."""
@@ -4151,13 +4167,79 @@ class TestTerminusEvicted(unittest.TestCase):
                               for k in keys], [])
 
     def test_a_session_evicted_the_first_time_it_is_seen_is_absent(self):
-        # one evicted file is enough to make the session evicted
+        # every one of its files is evicted and nothing is cached
         stub = tm_store()
-        self.evict(stub, [TM_KEYS[1]])
+        self.evict(stub, TM_KEYS)
         data = self.go(stub, tempfile.mkdtemp(dir=TMP))
         self.assertEqual(total_be(data), EXP["total_be"])
         self.assertNotIn("proj", [p["id"] for p in data["projects"]])
         self.assertEqual(stub.exports(), [])
+
+    def test_one_evicted_file_leaves_the_rest_of_its_session_in(self):
+        stub = tm_store()
+        self.evict(stub, [TM_KEYS[1]])
+        data = self.go(stub, tempfile.mkdtemp(dir=TMP))
+        self.assertEqual(total_be(data), EXP["total_be"] + 5000 + 5001 + 5200)
+        self.assertEqual(stub.exports(), [[TM_KEYS[0], TM_KEYS[2]]])
+
+    def test_an_evicted_main_keeps_its_rows_and_what_only_a_main_carries(self):
+        stub, c = tm_store(), tempfile.mkdtemp(dir=TMP)
+        stub.entry(TM_KEYS[0])["lines"][0].update(
+            slug="tm-slug", gitBranch="tm-branch")
+        stub.entry(TM_KEYS[0])["lines"].insert(
+            0, {"type": "ai-title", "uuid": "tm-title", "aiTitle": "Kept",
+                "timestamp": "2026-03-05T11:00:00Z"})
+        stub.save()
+        before = payload_sans_generated(
+            run(env=stub.env(XDG_CACHE_HOME=c))[1])
+        self.assertEqual(total_be(before), EXP["total_be"] + TM_BE)
+        self.evict(stub, [TM_KEYS[0]])
+        stub.entry(TM_KEYS[0])["lines"] = []
+        stub.save()
+        proc, out = run(env=stub.env(XDG_CACHE_HOME=c))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(payload_sans_generated(out), before)
+        self.assertEqual(stub.exports()[1:], [TM_KEYS[1:]])
+
+    def test_a_live_main_stays_when_a_terminus_only_subagent_is_evicted(self):
+        stub = live_stub(evicted=True)
+        data = self.go(stub, tempfile.mkdtemp(dir=TMP))
+        self.assertEqual(total_be(data), EXP["total_be"])
+        self.assertEqual(stub.exports(), [])
+
+    def test_a_live_main_grows_beside_its_evicted_subagents_cached_rows(self):
+        root = os.path.join(tempfile.mkdtemp(dir=TMP), "projects")
+        shutil.copytree(P["primary"], root)
+        stub, c = live_stub(), tempfile.mkdtemp(dir=TMP)
+        self.assertEqual(total_be(self.go(stub, c, ["--root", root])),
+                         EXP["total_be"] + 7000)
+        live_stub(stub, evicted=True)
+        main = os.path.join(root, "-home-alice-work-api", "p0-sess-0.jsonl")
+        with open(main, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(tm_msg("p0-grown", 300, API)) + "\n")
+        data = self.go(stub, c, ["--root", root])
+        self.assertEqual(total_be(data), EXP["total_be"] + 7000 + 300)
+        self.assertEqual(stub.exports(), [[LIVE_SUB]])
+        cdir = os.path.join(c, "burnrate")
+        (name,) = os.listdir(cdir)
+        with gzip.open(os.path.join(cdir, name), "rt", encoding="utf-8") as fh:
+            rec = json.load(fh)["sessions"][
+                "-home-alice-work-api/p0-sess-0"]["rec"]
+        self.assertEqual(rec["agents"]["agent-t1"], "unresolved")
+        self.assertEqual({(r[0], r[4]) for r in rec["rows"]
+                          if r[0] in ("t1-0", "p0-grown")},
+                         {("t1-0", "agent-t1"), ("p0-grown", "")})
+
+    def test_an_archive_main_stays_when_a_terminus_only_subagent_is_evicted(self):
+        stub = StubTerminus([
+            (BACKUP, "bk-sess-0.jsonl", []),
+            (BACKUP, "bk-sess-0/subagents/agent-t1.jsonl",
+             [tm_msg("bk-t1", 7000, BACKUP)])],
+            per={"bk-sess-0/subagents/agent-t1.jsonl": {"evicted": True}})
+        data = self.go(stub, tempfile.mkdtemp(dir=TMP),
+                       ["--archive", P["backup"]])
+        self.assertEqual(total_be(data),
+                         EXP["total_be"] + EXP["backup"]["be"])
 
     def test_a_vanished_session_that_was_not_evicted_still_drops_out(self):
         stub, c = tm_store(), tempfile.mkdtemp(dir=TMP)
