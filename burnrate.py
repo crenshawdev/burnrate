@@ -937,7 +937,7 @@ def discover(sources, terminus=None):
     return sessions
 
 
-def session_sig(s, marks=None):
+def session_sig(s):
     """Fingerprint of every file feeding this session; cache hit = unchanged.
 
     Paths are realpath'd, the same normalization cache_path applies to the
@@ -945,7 +945,10 @@ def session_sig(s, marks=None):
     ~/.claude symlinked into a dotfiles checkout, a bind mount, a trailing
     separator from shell completion -- otherwise shares ONE cache file whose
     every entry each run rewrites under the other name's paths, so alternating
-    roots reparses the whole tree forever."""
+    roots reparses the whole tree forever.
+
+    Taken BEFORE the session is parsed: a file that grows during the read then
+    differs from its recorded signature and is read again next run."""
     files, tfiles = [], []
     for kind, path in s["main"]:
         if kind == "terminus":
@@ -969,13 +972,18 @@ def session_sig(s, marks=None):
             continue
     # a terminus file is its (session_key, watermark); lists, not tuples, so the
     # signature equals itself after the cache's JSON round trip
-    # `marks` carries the watermarks the export's frames reported: when an ingest
-    # lands between the list and the export the frame holds the newer bytes, and
-    # recording the list's number would export the session again next run
-    marks = marks or {}
-    sig.extend(["terminus", key, marks.get(key, wm)]
-               for key, wm in sorted(tfiles))
+    sig.extend(["terminus", key, wm] for key, wm in sorted(tfiles))
     return sig
+
+
+def with_marks(sig, marks):
+    """`sig` with each terminus watermark swapped for the one the export's frame
+    reported. When an ingest lands between the list and the export the frame
+    holds the newer bytes, and recording the list's number would export the
+    session again next run. Only the terminus entries change: the live and
+    archive half was taken before the parse and stays what it was then."""
+    return [["terminus", e[1], marks.get(e[1], e[2])] if e[0] == "terminus"
+            else e for e in sig]
 
 
 # ---------------------------------------------------------------- parsing
@@ -1268,24 +1276,24 @@ def collect(cache_path, sources, rebuild, quiet, terminus=None):
                 # evicted usage exists nowhere else. No record, no session.
                 if hit:
                     done += 1
-                    plan.append((key, proj, sid, s, done, hit, []))
+                    plan.append((key, proj, sid, s, done, hit, [], None))
                 else:
                     total -= 1
                 continue
             done += 1
             sig = session_sig(s)
             if hit and hit["sig"] == sig:
-                plan.append((key, proj, sid, s, done, hit, []))
+                plan.append((key, proj, sid, s, done, hit, [], sig))
                 continue
             tkeys = terminus_keys(s)
             keys.extend(tkeys)
-            plan.append((key, proj, sid, s, done, None, tkeys))
+            plan.append((key, proj, sid, s, done, None, tkeys, sig))
     # one export for every session that changed and holds a terminus file, in
     # the order parse_session reads them; none at all when nothing changed,
     # since an empty stdin streams the whole archive
     export = TerminusExport(terminus, keys) if keys else None
     try:
-        for key, proj, sid, s, done, hit, tkeys in plan:
+        for key, proj, sid, s, done, hit, tkeys, sig in plan:
             if hit:
                 out[key] = hit
                 continue
@@ -1294,7 +1302,7 @@ def collect(cache_path, sources, rebuild, quiet, terminus=None):
                 print(f"  parsing {done}/{total} sessions "
                       f"({parsed} changed)...", file=sys.stderr)
             rec = parse_session(s, export)
-            out[key] = {"sig": session_sig(s, export.marks if tkeys else None),
+            out[key] = {"sig": with_marks(sig, export.marks) if tkeys else sig,
                         "proj": proj, "sid": sid, "rec": rec}
         if export:
             export.finish()

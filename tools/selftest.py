@@ -1481,6 +1481,43 @@ class TestCache(unittest.TestCase):
         self.assertIsNotNone(re.search(r"\b0 parsed\b", warm.stderr),
                              warm.stderr)
 
+    def test_a_file_that_grows_during_the_parse_is_read_again(self):
+        # the signature is the file as it was BEFORE the read: taken after, it
+        # records bytes the parse never saw and the next run serves the cache
+        root = os.path.join(tempfile.mkdtemp(dir=TMP), "projects")
+        sess = os.path.join(root, "-home-alice-work-api", "grow.jsonl")
+        ts = "2026-03-05T12:00:00Z"
+
+        def put(*lines, mode="w"):
+            os.makedirs(os.path.dirname(sess), exist_ok=True)
+            with open(sess, mode, encoding="utf-8") as fh:
+                for mid, inp in lines:
+                    fh.write(json.dumps(msg_line(mid, inp=inp,
+                                                 timestamp=ts)) + "\n")
+
+        put(("g1", 1000))
+        cpath = os.path.join(tempfile.mkdtemp(dir=TMP), "sessions.json.gz")
+        real, grown = br.parse_session, []
+
+        def growing(*a, **kw):
+            rec = real(*a, **kw)
+            if not grown:
+                grown.append(1)
+                put(("g2", 2000), mode="a")
+            return rec
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            br.parse_session = growing
+            try:
+                first = br.collect(cpath, [("live", root)], False, True)
+            finally:
+                br.parse_session = real
+            again = br.collect(cpath, [("live", root)], False, True)
+        key = "-home-alice-work-api/grow"
+        self.assertEqual([r[0] for r in first[key]["rec"]["rows"]], ["g1"])
+        self.assertEqual([r[0] for r in again[key]["rec"]["rows"]],
+                         ["g1", "g2"])
+
 
 def encodingless_opens(path):
     """Line numbers of every text-mode open()/gzip.open() with no encoding=.
