@@ -2105,22 +2105,32 @@ class TestUsageLoggerWrapper(unittest.TestCase):
         self.assertEqual(proc.stdout, "")
         self.assertEqual(proc.returncode, 0)
 
-    def test_one_line_per_change_with_scalar_percentages(self):
+    def test_one_line_per_seven_day_change_with_a_scalar_percentage(self):
         d = self.logger_dir()
         self.feed(d, rl_payload(23.5, 41.2))
         lines = self.log_lines(d)
         self.assertEqual(len(lines), 1, lines)
         rec = json.loads(lines[0])
         self.assertRegex(rec["ts"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
-        for key in ("five_hour", "seven_day"):
-            self.assertIsInstance(rec[key], (int, float), rec)
-            self.assertNotIsInstance(rec[key], bool)
-        # the statusline fires many times a second, so an unchanged pair must
-        # not become a row
+        self.assertEqual(sorted(rec), ["model", "resets7", "session_id",
+                                       "seven_day", "ts"], rec)
+        self.assertIsInstance(rec["seven_day"], (int, float), rec)
+        self.assertNotIsInstance(rec["seven_day"], bool)
+        # the statusline fires many times a second, so an unchanged percentage
+        # must not become a row, and neither may a move in the other window
         self.feed(d, rl_payload(23.5, 41.2))
         self.assertEqual(len(self.log_lines(d)), 1)
         self.feed(d, rl_payload(24.5, 41.2))
+        self.assertEqual(len(self.log_lines(d)), 1)
+        self.feed(d, rl_payload(24.5, 42.0))
         self.assertEqual(len(self.log_lines(d)), 2)
+
+    def test_a_payload_carrying_only_the_other_window_writes_nothing(self):
+        d = self.logger_dir()
+        only = json.dumps({"session_id": "s", "rate_limits": {
+            "five_hour": {"used_percentage": 23.5, "resets_at": 1772380800}}})
+        self.feed(d, only)
+        self.assertFalse(os.path.exists(os.path.join(d, "usage-log.jsonl")))
 
     def test_a_payload_past_the_pipe_buffer_keeps_the_inner_status(self):
         """Nothing obliges a statusline command to read its stdin, and the

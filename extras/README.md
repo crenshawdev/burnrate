@@ -1,23 +1,23 @@
 # The rate-limit logger
 
-An opt-in statusline logger that records your 5-hour and 7-day cap
-percentages, so burnrate's cap card has something to draw.
+An opt-in statusline logger that records your 7-day cap percentage, so
+burnrate's cap card has something to draw.
 
 Claude Code hands its statusline command a JSON payload on stdin, and for
-Claude.ai subscribers that payload carries `rate_limits.five_hour` and
-`rate_limits.seven_day` as percentages of your window. That is the only place
-those numbers appear: Claude Code never writes them to the transcripts under
-`~/.claude/projects`, so a tool that only reads transcripts, burnrate included,
-cannot reconstruct them. If nobody records a sample while a window is open, the
-number for that moment is gone.
+Claude.ai subscribers that payload carries `rate_limits.seven_day` as a
+percentage of your window. That is the only place that number appears: Claude
+Code never writes it to the transcripts under `~/.claude/projects`, so a tool
+that only reads transcripts, burnrate included, cannot reconstruct it. If
+nobody records a sample while the window is open, the number for that moment is
+gone.
 
-This logger records them. It is opt-in and does nothing until you install it
+This logger records it. It is opt-in and does nothing until you install it
 yourself: neither `burnrate.py` nor the `/burnrate` skill installs it, mentions
 the installer, or writes to `settings.json`. Every other panel in the report
 works without it.
 
 `usage_logger.sh` wraps the statusline command you already have as a
-transparent tee. It reads the payload once, appends a line when a percentage
+transparent tee. It reads the payload once, appends a line when the percentage
 actually changes, and replays the payload verbatim into your original command,
 propagating that command's exit status. Your status bar renders exactly as it
 did before, including when every part of the logging fails.
@@ -79,7 +79,7 @@ mkdir -p ~/.claude && printf '{}\n' > ~/.claude/settings.json
 ### No statusline configured
 
 Installing with no `statusLine.command` set is allowed and the installer warns
-about it: the logger will record cap percentages, but your status bar stays
+about it: the logger will record the cap percentage, but your status bar stays
 empty until you configure a statusline of your own. Nothing breaks; there is
 simply nothing to tee.
 
@@ -162,10 +162,10 @@ directory outright, for the installer and the wrapper alike.
 
 ## Known limits
 
-The wrapper extracts the two percentages with `grep`, not a JSON parser,
+The wrapper extracts the percentage with `grep`, not a JSON parser,
 because the statusline fires many times a second and a Python startup on each
 firing is not worth it. That assumes the payload stays single-line JSON with no
-nested braces inside the two window objects, which is what Claude Code emits
+nested braces inside the `seven_day` object, which is what Claude Code emits
 today. If a future payload pretty-prints or nests another field in there, the
 extraction quietly matches nothing and the log stops growing. No error appears
 anywhere, so the symptom is a cap card that stops advancing.
