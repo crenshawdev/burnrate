@@ -2018,6 +2018,50 @@ class TestThinkingShare(TreeCase):
         self.assertNotIn("think", block.lower())
 
 
+@unittest.skipIf(not NODE, "needs a JS engine")
+class TestStampCards(TreeCase):
+    """D-16: agent, plugin and MCP each get a bar card built like By model,
+    from the stamps as written, with unstamped rows left out."""
+
+    def calls(self, got):
+        return {c["elId"]: [(i["label"], i["v"]) for i in c["items"]]
+                for c in got["hbars"]}
+
+    def test_cards_carry_the_stamped_names_and_their_billed_equiv(self):
+        self.tree(
+            [typed_command("c1", "plan"),
+             msg_line("m1", inp=100, attributionAgent="acme-auditor",
+                      attributionPlugin="acme", attributionMcpServer="srv",
+                      attributionMcpTool="lookup"),
+             msg_line("m2", inp=20, attributionAgent="acme-auditor"),
+             msg_line("m3", inp=7, attributionPlugin="other",
+                      attributionMcpServer="srv2", attributionMcpTool="fetch"),
+             msg_line("m4", inp=1000)])
+        calls = self.calls(rendered(report(self.out)))
+        self.assertEqual(calls["#byAgent"], [("acme-auditor", 120)])
+        self.assertEqual(calls["#byPlugin"], [("acme", 100), ("other", 7)])
+        self.assertEqual(calls["#byMcp"],
+                         [("srv / lookup", 100), ("srv2 / fetch", 7)])
+        # the stamps never move By command (same numbers as the phase base)
+        self.assertEqual(calls["#byCmd"], [("plan", 1127)])
+
+    def test_the_existing_fixture_gives_the_cards_nothing(self):
+        _, out = run(["--root", P["primary"]])
+        calls = self.calls(rendered(report(out)))
+        for el in ("#byAgent", "#byPlugin", "#byMcp"):
+            self.assertEqual(calls[el], [])
+        self.assertTrue(calls["#byCmd"])
+
+    def test_every_new_card_says_it_counts_stamped_messages_only(self):
+        _, out = run()
+        html = report(out)
+        for title, el in (("By agent", "byAgent"), ("By plugin", "byPlugin"),
+                          ("By MCP tool", "byMcp")):
+            self.assertRegex(
+                html, rf'<h2>{title}</h2>\s*<div class="note">Stamped messages '
+                      rf'only</div><div class="hb" id="{el}">')
+
+
 FIVE_HOUR_WORDING = re.compile(
     r"5h|5-hour|five[_ -]hour|resets5|BLOCK_", re.IGNORECASE)
 

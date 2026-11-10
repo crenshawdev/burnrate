@@ -1309,6 +1309,12 @@ footer{color:var(--muted);font-size:11.5px;margin:18px 0 8px}
     <div class="card" style="margin:0"><h2>By model</h2><div class="hb" id="byModel"></div></div>
     <div class="card" style="margin:0"><h2>By effort</h2><div class="hb" id="byEffort"></div></div>
     <div class="card" style="margin:0"><h2>Main vs subagents</h2><div class="hb" id="byKind"></div></div>
+    <div class="card" style="margin:0"><h2>By agent</h2>
+      <div class="note">Stamped messages only</div><div class="hb" id="byAgent"></div></div>
+    <div class="card" style="margin:0"><h2>By plugin</h2>
+      <div class="note">Stamped messages only</div><div class="hb" id="byPlugin"></div></div>
+    <div class="card" style="margin:0"><h2>By MCP tool</h2>
+      <div class="note">Stamped messages only</div><div class="hb" id="byMcp"></div></div>
   </div>
 
   <div class="card" id="rlCard" style="display:none">
@@ -1751,12 +1757,15 @@ function render(){
     '%', 100 - span);
 
   // breakdowns: a = [billed-equiv, fresh in, cache write, cache read]
-  const agg = (key, labelFn) => {
+  // key is a column index, or a function of the row; src defaults to every row
+  const agg = (key, labelFn, src = rows) => {
+    const kf = typeof key === 'function' ? key : r => r[key];
     const m = new Map();
-    for (const r of rows){
-      const a = m.get(r[key]) || [0, 0, 0, 0];
+    for (const r of src){
+      const k = kf(r);
+      const a = m.get(k) || [0, 0, 0, 0];
       a[0] += r[D.be]; a[1] += r[D.inp]; a[2] += r[D.cc]; a[3] += r[D.cr];
-      m.set(r[key], a);
+      m.set(k, a);
     }
     return [...m.entries()].map(([k,a]) => ({label: labelFn(k), v: a[0], a}))
       .sort((a,b) => b.v - a.v);
@@ -1778,6 +1787,12 @@ function render(){
   hbars('#byEffort', withHit(agg(D.effort, e => e === '-' ? '(unspecified)' : e).sort((a,b) =>
     EORD.indexOf(a.label) - EORD.indexOf(b.label))));
   hbars('#byKind', withHit(agg(D.kind, k => k === 'm' ? 'main session' : 'subagents')));
+  // the stamps as written; an unstamped bar would hold nearly all the burn
+  hbars('#byAgent', withHit(agg(D.agent, a => a, rows.filter(r => r[D.agent]))));
+  hbars('#byPlugin', withHit(agg(D.plugin, a => a, rows.filter(r => r[D.plugin]))));
+  hbars('#byMcp', withHit(agg(r => JSON.stringify([r[D.mcpS], r[D.mcpT]]),
+    k => JSON.parse(k).filter(Boolean).join(' / '),
+    rows.filter(r => r[D.mcpS] || r[D.mcpT]))));
 
   // rate-limit card
   const rl = DATA.rl.filter(s => { const d = epochDay(s[0]); return inRange(d); });
