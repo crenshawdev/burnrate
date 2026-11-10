@@ -44,6 +44,11 @@ transcripts written before those fields existed still parse.
   window opened, and this session's cache hit rate. It is on by default, and
   the `showStatusLine` switch in `/config` turns it off. The hit rate counts
   only turns since the plugin was on.
+- History from Terminus. When `terminus` 2.0.0 or later is on the `PATH`,
+  burnrate reads its archive through read-only commands. The live copy of a
+  file wins, and only sessions whose watermarks changed are exported.
+  `--no-archive` turns it off. The first run with Terminus starts a new cache
+  file and is slow.
 
 ### Removed
 
