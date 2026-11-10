@@ -486,10 +486,6 @@ def resolve_sources(args, env=None):
         if layouts:
             sources.extend((k, arch) for k in layouts)
             label = "hindsight archive"
-    # alongside whatever archive was chosen above, never instead of it
-    terminus = None if no_archive else open_terminus(env)
-    if terminus:
-        sources.append(("terminus", TERMINUS_SOURCE))
     if zstd is None and any(k == "arch" for k, _ in sources):
         if any(k == "arch" and p != root for k, p in sources):
             print("warning: zstandard not installed -- archive skipped",
@@ -509,10 +505,18 @@ def resolve_sources(args, env=None):
         # cache file -- each run overwriting the last one's sessions.
         sources.insert(0, ("live", root))
     # by PATH, not by source count: a mixed root contributes two sources and
-    # no archive at all, and a dropped arch source contributes neither
+    # no archive at all, and a dropped arch source contributes neither. The
+    # label names only what survived the drop above.
     used = any(p != root for _k, p in sources)
     if not used:
         label = None
+    # alongside whatever archive was chosen above, never instead of it, and
+    # named without a path: a report must not embed the user's directory tree
+    terminus = None if no_archive else open_terminus(env)
+    if terminus:
+        sources = sources + [("terminus", TERMINUS_SOURCE)]
+        label = f"{label} + Terminus" if label else "Terminus"
+        used = True
     return {"root": root, "config_dir": config_dir,
             "rl_log": os.path.join(config_dir, "usage-logger",
                                    "usage-log.jsonl"),

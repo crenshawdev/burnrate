@@ -3615,7 +3615,7 @@ class TestTerminusSource(unittest.TestCase):
         src, _ = resolve_in(self.env_for(stub), archive=P["backup"])
         self.assertIn(("live", P["backup"]), src["sources"])
         self.assertIn(TERMINUS_ENTRY, src["sources"])
-        self.assertEqual(src["archive_label"], "archive: backup")
+        self.assertEqual(src["archive_label"], "archive: backup + Terminus")
 
     def test_three_runs_leave_two_cache_files(self):
         c = tempfile.mkdtemp(dir=TMP)
@@ -3922,6 +3922,48 @@ class TestTerminusExport(unittest.TestCase):
     def test_a_non_zero_export_ends_the_run(self):
         stub = tm_store(fail="export")
         self.fails(stub, "no frame header")
+
+
+class TestTerminusReport(unittest.TestCase):
+    """D-04: the report names Terminus beside any other archive it read, and
+    never where the binary or its data sits."""
+
+    def env_for(self, stub, **over):
+        return dict({"HOME": P["home"], "XDG_CONFIG_HOME": EMPTY_CONF,
+                     "PATH": stub.dir}, **over)
+
+    def test_terminus_is_named_beside_an_archive_by_name_only(self):
+        stub = tm_store()
+        proc, out = run(["--archive", P["backup"]], env=stub.env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = payload(out)
+        self.assertIn("archive: backup", data["archive_label"])
+        self.assertIn("Terminus", data["archive_label"])
+        self.assertTrue(data["archive_used"])
+
+    def test_terminus_alone_reads_terminus_and_leaks_no_path(self):
+        stub = tm_store()
+        proc, out = run(env=stub.env(), flags=("--json", "--no-open"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = payload(out)
+        self.assertEqual(data["archive_label"], "Terminus")
+        self.assertTrue(data["archive_used"])
+        for name in ("dashboard_data.json", "dashboard.html"):
+            with open(os.path.join(out, name), encoding="utf-8") as fh:
+                self.assertNotIn(stub.dir, fh.read(), name)
+
+    def test_an_archive_the_zstandard_drop_removed_is_not_named(self):
+        stub = tm_store()
+        with zstd_as(None):
+            src, err = resolve_in(self.env_for(stub), archive=FAKE_ARCH)
+        self.assertIn("zstandard not installed -- archive skipped", err)
+        self.assertEqual(src["archive_label"], "Terminus")
+        self.assertTrue(src["archive_used"])
+        with zstd_as(None):
+            src, err = resolve_in(
+                self.env_for(stub, XDG_CONFIG_HOME=P["config_home"]))
+        self.assertIn("zstandard not installed -- archive skipped", err)
+        self.assertEqual(src["archive_label"], "Terminus")
 
 
 if __name__ == "__main__":
