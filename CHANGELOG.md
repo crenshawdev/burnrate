@@ -46,8 +46,9 @@ transcripts written before those fields existed still parse.
   only turns since the plugin was on.
 - History from Terminus. When `terminus` 2.0.0 or later is on the `PATH`,
   burnrate reads its archive through read-only commands. The live copy of a
-  file wins, and only sessions whose watermarks changed are exported.
-  `--no-archive` turns it off. The first run with Terminus starts a new cache
+  file wins, an evicted Terminus file keeps the usage the cache already holds
+  for it, and a session is exported again when its Terminus watermarks or its
+  live or archive files changed. `--no-archive` turns it off. The first run with Terminus starts a new cache
   file and is slow.
 
 ### Removed

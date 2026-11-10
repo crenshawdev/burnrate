@@ -92,11 +92,13 @@ Inside that tree it parses `<project-dir>/<session>.jsonl`, including subagent
 transcripts, and optionally any archive you point `--archive` at.
 
 If a `terminus` 2.0.0 or later is on your `PATH`, burnrate reads that archive
-too. It runs two read-only commands, `terminus sessions --project '*' --json`
-and `terminus export --stdout`, and never runs `ingest` or any other command
-that writes. For each transcript file the live copy wins, and Terminus supplies
-only the files the live tree no longer has. Only sessions whose watermarks
-changed since the last run are exported.
+too. It runs three read-only commands, `terminus --version`,
+`terminus sessions --project '*' --json` and `terminus export --stdout`, and
+never runs `ingest` or any other command that writes. For each transcript file
+the live copy wins, and Terminus supplies only the files the live tree no longer
+has. A file Terminus has evicted is never exported, and it keeps the usage the
+cache already holds for it. A session is exported again when the watermarks of
+its Terminus files changed or when its live or archive files did.
 
 ## What it computes
 
@@ -349,13 +351,19 @@ warning, such as `warning: terminus failed (sessions exited 1) -- continuing
 without it`, and the run continues on your live transcripts and any other
 archive. The first run with Terminus is slow: it exports every session the live
 tree lacks and starts its own cache file. Later runs export only sessions whose
-watermarks changed.
+Terminus watermarks, live files or archive files changed.
+
+**Usage from an evicted Terminus file is gone.** That usage lives only in the
+cache file, and the cache file is keyed by the whole source set. When the source
+set changes, such as installing `zstandard` or a hindsight archive turning up,
+burnrate starts a fresh cache file and the evicted usage is not in it.
 
 **Stale numbers after a session you know happened.** The cache keys on files
 that changed. Force a full reparse with `/burnrate rebuild`, or delete the cache
 directory listed under [Cache](#cache). A rebuild re-exports every Terminus
-session. It also drops a session Terminus has evicted, because that session's
-usage existed only in the cache.
+file the live tree lacks. It also drops the usage of each file Terminus has
+evicted, because that usage existed only in the cache. The rest of the session
+stays.
 
 **No browser opened.** The run still reports the path it wrote. Open that file
 yourself; the report is self-contained and works offline.

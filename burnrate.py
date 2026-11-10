@@ -11,7 +11,8 @@ demand" stays fast.
 
 When a `terminus` 2.0.0 or later is on the PATH it is read too, through its
 read-only commands only. The live copy of a file wins; Terminus supplies the
-files the live tree no longer has.
+files the live tree no longer has. A file it has evicted keeps the usage the
+cache holds for it, and a rebuild drops only that usage, not the whole session.
 
 What it measures (per assistant message, deduped globally by .message.id):
     input / cache-write (5m and 1h split) / cache-read / output tokens
