@@ -67,9 +67,9 @@ PROBE_EFFORT = {
     "probe_tokyo_rollover": "probe-roll",
 }
 
-# Rate-limit logger samples: (ts, five_hour, seven_day), written literally as
-# the shipped wrapper writes them -- one JSON object per line whose percentages
-# are SCALARS. Spread over TWO days so the fixture exercises both the viewer's
+# Rate-limit logger samples: (ts, seven_day), written literally as the
+# shipped wrapper writes them -- one JSON object per line whose percentage is
+# a SCALAR. Spread over TWO days so the fixture exercises both the viewer's
 # rl.length > 1 card gate and lineChart's refusal below two points.
 #
 # Every sample sits in a midday-UTC band on purpose. The viewer buckets rl
@@ -79,10 +79,10 @@ PROBE_EFFORT = {
 # days in the two bucketings, collapsing the day set to one on some machines and
 # not others. 12:00Z-15:00Z is outside that hazard for every real offset.
 RL_SAMPLES = [
-    ("2026-03-01T12:00:00Z", 10, 30),
-    ("2026-03-01T13:00:00Z", 15.5, 31),
-    ("2026-03-02T12:00:00Z", 20, 32.25),
-    ("2026-03-02T13:00:00Z", 25, 33),
+    ("2026-03-01T12:00:00Z", 30),
+    ("2026-03-01T13:00:00Z", 31),
+    ("2026-03-02T12:00:00Z", 32.25),
+    ("2026-03-02T13:00:00Z", 33),
 ]
 
 # Carries all three script-data breakout vectors in one string: "</script>"
@@ -243,16 +243,14 @@ def build(root):
     write_lines(os.path.join(web_dir, "probes-sess.jsonl"), rows)
 
     # rate-limit logger samples, beside the primary tree, in exactly the record
-    # extras/usage_logger.sh writes: SCALAR percentages, not nested objects.
+    # extras/usage_logger.sh writes: a SCALAR percentage, not a nested object.
     rl = os.path.join(home, ".claude", "usage-logger", "usage-log.jsonl")
     os.makedirs(os.path.dirname(rl), exist_ok=True)
     with open(rl, "w", encoding="utf-8") as fh:
-        for i, (when, five, seven) in enumerate(RL_SAMPLES):
+        for i, (when, seven) in enumerate(RL_SAMPLES):
             fh.write(json.dumps({
                 "ts": when,
-                "five_hour": five,
                 "seven_day": seven,
-                "resets5": 1772380800 + i,
                 "resets7": 1772985600 + i,
                 "session_id": f"rl-sess-{i}",
                 "model": "Sonnet 4.6"}) + "\n")
@@ -298,10 +296,10 @@ def build(root):
         "backup": {"label": "proj", "be": round(bk_be)},
         "archive": {"label": "thing", "be": round(arch_be)},
         "rl_samples": len(RL_SAMPLES),
-        # what read_rl_log must produce from the file above: [epoch, five,
-        # seven], ascending. Written from the literals rather than through the
+        # what read_rl_log must produce from the file above: [epoch,
+        # seven_day], ascending. Written from the literals rather than through the
         # reader, so a reader that drops or reshapes a field fails here.
-        "rl_rows": sorted([int(epoch(w)), f, s] for w, f, s in RL_SAMPLES),
+        "rl_rows": sorted([int(epoch(w)), s] for w, s in RL_SAMPLES),
         "zstd": zstd is not None,
         "probe_efforts": PROBE_EFFORT,
         "probe_days": PROBE_DAYS,

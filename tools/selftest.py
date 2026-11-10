@@ -230,18 +230,19 @@ class TestRootResolution(unittest.TestCase):
         self.assertFalse(payload(out2)["rl_installed"])
 
     def test_rl_rows_carry_the_shape_the_logger_writes(self):
-        """A row count says nothing about the row. The logger writes SCALAR
-        percentages; against nested {"used_percentage": n} objects the payload
+        """A row count says nothing about the row. The logger writes a SCALAR
+        percentage; against nested {"used_percentage": n} objects the payload
         still carries four rows, and the chart's `v > 0` test then fails on
         every one of them and renders 'Not enough data in range'."""
         _, out = run()
         rl = payload(out)["rl"]
         self.assertEqual(rl, EXP["rl_rows"])
-        for ts, five, seven in rl:
+        for row in rl:
+            self.assertEqual(len(row), 2, row)
+            ts, seven = row
             self.assertIsInstance(ts, int)
-            for v in (five, seven):
-                self.assertIsInstance(v, (int, float))
-                self.assertNotIsInstance(v, bool)
+            self.assertIsInstance(seven, (int, float))
+            self.assertNotIsInstance(seven, bool)
 
     def test_missing_root_exits_two_with_its_own_message(self):
         # match the MESSAGE: argparse's own usage error is also exit 2, so an
@@ -1567,7 +1568,7 @@ console.log(JSON.stringify({
         self.assertEqual(call["elId"], "#rlChart")
         self.assertEqual(len(call["days"]), 2, call["days"])
         self.assertEqual([s["name"] for s in call["series"]],
-                         ["5-hour window", "7-day window"])
+                         ["7-day window"])
         for s in call["series"]:
             self.assertEqual(len(s["values"]), 2, s)
             for v in s["values"]:
@@ -1610,6 +1611,10 @@ class TestNoFiveHourWindow(unittest.TestCase):
         data = payload(out)
         self.assertTrue(data["daily"], "no daily rows: the pin is vacuous")
         self.assertNotIn("blocks", data)
+
+    def test_the_report_page_describes_no_five_hour_window(self):
+        self.assertIn("rlCard", br.PAGE, "no cap card in PAGE: pin is vacuous")
+        self.assertIsNone(FIVE_HOUR_WORDING.search(br.PAGE))
 
     def test_the_cli_output_describes_no_five_hour_window(self):
         proc, _ = run(flags=("--json", "--no-open"))
@@ -1961,7 +1966,8 @@ class TestPluginPackaging(unittest.TestCase):
 class TestRateLimitLogReader(unittest.TestCase):
     """LOG-01: the reader parses a file another program appends to many times a
     second, so its ordering has to survive the shapes that file really takes --
-    a second holding several samples, and a window the payload omitted."""
+    a second holding several samples, and lines written before the logger
+    stopped recording a second window."""
 
     def log(self, *lines):
         d = tempfile.mkdtemp(dir=TMP)
@@ -1970,40 +1976,43 @@ class TestRateLimitLogReader(unittest.TestCase):
             fh.write("".join(ln + "\n" for ln in lines))
         return path
 
-    def test_an_absent_window_in_a_shared_second_does_not_raise(self):
-        """Sorting whole rows compares None against a float as soon as two
-        samples share a timestamp and one window is missing -- the wrapper's
-        timestamps are second-resolution and each window is independently
-        absent, so this is a normal file. The TypeError escapes past the
-        per-line guard and the whole run produces no report."""
+    def test_an_old_format_line_reads_as_a_two_element_row(self):
+        """Logs written before the change carry two more keys per line. They
+        are ignored by name: no migration, no rewrite."""
         path = self.log(
-            '{"ts":"2026-07-31T15:31:11Z","five_hour":null,"seven_day":30}',
-            '{"ts":"2026-07-31T15:31:11Z","five_hour":23.5,"seven_day":30}')
+            '{"ts":"2026-07-31T15:31:11Z","five_hour":23.5,"seven_day":30,'
+            '"resets5":1,"resets7":2}')
+        self.assertEqual(br.read_rl_log(path),
+                         [[int(br.parse_ts("2026-07-31T15:31:11Z")), 30]])
+
+    def test_a_null_seven_day_line_is_dropped_without_raising(self):
+        path = self.log(
+            '{"ts":"2026-07-31T15:31:11Z","five_hour":23.5,"seven_day":null}',
+            '{"ts":"2026-07-31T15:31:11Z","five_hour":23.5,"seven_day":30}',
+            '{"ts":"2026-07-31T15:31:12Z","five_hour":23.5}')
         rows = br.read_rl_log(path)
-        self.assertEqual([r[1] for r in rows], [None, 23.5], rows)
+        self.assertEqual([r[1] for r in rows], [30], rows)
 
     def test_samples_in_one_second_keep_the_order_they_were_written(self):
         """File order is write order, so the last row of a second is the newest
         sample. Sorting on the values instead makes the viewer's lastOf() report
-        the LARGEST sample of that second -- visibly wrong right after a 5-hour
-        window resets, which is exactly when several samples land together."""
+        the LARGEST sample of that second, not the latest."""
         path = self.log(
-            '{"ts":"2026-07-31T15:31:11Z","five_hour":88.0,"seven_day":40}',
-            '{"ts":"2026-07-31T15:31:11Z","five_hour":91.0,"seven_day":40}',
-            '{"ts":"2026-07-31T15:31:11Z","five_hour":3.0,"seven_day":41}')
+            '{"ts":"2026-07-31T15:31:11Z","seven_day":88.0}',
+            '{"ts":"2026-07-31T15:31:11Z","seven_day":91.0}',
+            '{"ts":"2026-07-31T15:31:11Z","seven_day":3.0}')
         rows = br.read_rl_log(path)
         self.assertEqual([r[1] for r in rows], [88.0, 91.0, 3.0], rows)
 
     def test_rows_from_different_seconds_still_sort_ascending(self):
         path = self.log(
-            '{"ts":"2026-07-31T15:31:20Z","five_hour":2}',
-            '{"ts":"2026-07-31T15:31:11Z","five_hour":1}')
+            '{"ts":"2026-07-31T15:31:20Z","seven_day":2}',
+            '{"ts":"2026-07-31T15:31:11Z","seven_day":1}')
         self.assertEqual([r[1] for r in br.read_rl_log(path)], [1, 2])
 
     def test_a_run_over_such_a_log_still_writes_its_report(self):
-        # the user-visible half: the raise is outside read_rl_log's per-line
-        # try, so a single duplicated second cost the entire dashboard and the
-        # only recovery was hand-editing the log
+        # the user-visible half: a null seven_day line must cost neither the
+        # report nor a sample in the count
         d = tempfile.mkdtemp(dir=TMP)
         root = os.path.join(d, ".claude", "projects")
         shutil.copytree(P["primary"], root)
@@ -2013,12 +2022,11 @@ class TestRateLimitLogReader(unittest.TestCase):
             body = fh.read()
         with open(log, "w", encoding="utf-8") as fh:
             fh.write(body)
-            fh.write('{"ts":"2026-03-01T12:00:00Z","five_hour":null,'
-                     '"seven_day":30}\n')
+            fh.write('{"ts":"2026-03-01T12:00:00Z","seven_day":null}\n')
         proc, out = run(["--root", root])
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue(os.path.exists(os.path.join(out, "dashboard.html")))
-        self.assertEqual(len(payload(out)["rl"]), EXP["rl_samples"] + 1)
+        self.assertEqual(len(payload(out)["rl"]), EXP["rl_samples"])
 
 
 def rl_payload(five=23.5, seven=41.2, sid="sess-1", model="Sonnet 4.6"):
@@ -2156,13 +2164,11 @@ class TestUsageLoggerWrapper(unittest.TestCase):
         self.feed(d, rl_payload(24.5, 42.5))
         rows = br.read_rl_log(os.path.join(d, "usage-log.jsonl"))
         self.assertEqual(len(rows), 2, rows)
-        for ts, five, seven in rows:
+        for ts, seven in rows:
             self.assertIsInstance(ts, int)
-            self.assertIsInstance(five, float)
             self.assertIsInstance(seven, float)
         self.assertLessEqual(rows[0][0], rows[1][0])
-        self.assertEqual([r[1] for r in rows], [23.5, 24.5])
-        self.assertEqual([r[2] for r in rows], [41.2, 42.5])
+        self.assertEqual([r[1] for r in rows], [41.2, 42.5])
 
 
 FULL_SETTINGS = {

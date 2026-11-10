@@ -861,20 +861,16 @@ def read_rl_log(rl_log):
                         d = json.loads(line)
                         ts = parse_ts(d.get("ts") or "")
                         if ts:
-                            rows.append([int(ts), d.get("five_hour"),
-                                         d.get("seven_day")])
+                            if d.get("seven_day") is not None:
+                                rows.append([int(ts), d["seven_day"]])
                     except Exception:
                         continue
         except OSError:
             continue
-    # Sort on the timestamp ALONE, never on the whole row. Either window can be
-    # absent (the payload carries them independently), so a default sort
-    # compares None against a float the moment two samples share a second and
-    # raises TypeError out of here, past every per-line guard, and the run
-    # produces no report at all. Sorting on ts is also what keeps ties in file
-    # order -- Python's sort is stable, and file order is write order, so the
-    # viewer's lastOf() reports the LAST sample of a second rather than the
-    # largest one, which is what a 5h window reset looks like.
+    # Sort on the timestamp ALONE, never on the whole row: Python's sort is
+    # stable and file order is write order, so same-second samples keep their
+    # write order and the viewer's lastOf() reports the LAST sample of a
+    # second, not the largest one.
     rows.sort(key=lambda r: r[0])
     return rows
 
@@ -1245,7 +1241,7 @@ footer{color:var(--muted);font-size:11.5px;margin:18px 0 8px}
   </div>
 
   <div class="card" id="rlCard" style="display:none">
-    <h2>Rate-limit windows</h2>
+    <h2>7-day rate-limit window</h2>
     <div class="note">Logged used-percentage from the statusline payload</div>
     <div class="legend" id="rlLegend"></div>
     <div id="rlChart"></div>
@@ -1707,16 +1703,11 @@ function render(){
   if (rl.length > 1){
     $('#rlCard').style.display = '';
     const rdays = [...new Set(rl.map(s => epochDay(s[0])))].sort();
-    const lastOf = (day, idx) => {
-      const v = rl.filter(s => epochDay(s[0]) === day && s[idx] != null).pop();
-      return v ? v[idx] : null;
-    };
+    const lastOf = day => rl.filter(s => epochDay(s[0]) === day).pop()[1];
     lineChart('#rlChart', rdays, [
-      {name:'5-hour window', color:'--s1', values: rdays.map(d => lastOf(d,1))},
-      {name:'7-day window',  color:'--s2', values: rdays.map(d => lastOf(d,2))}], '%');
+      {name:'7-day window', color:'--s2', values: rdays.map(lastOf)}], '%');
     $('#rlLegend').innerHTML =
-      `<span class="it"><span class="ln" style="background:var(--s1)"></span>5-hour window</span>
-       <span class="it"><span class="ln" style="background:var(--s2)"></span>7-day window</span>`;
+      `<span class="it"><span class="ln" style="background:var(--s2)"></span>7-day window</span>`;
   } else $('#rlCard').style.display = 'none';
 
   // sessions table
@@ -1771,8 +1762,8 @@ $('#gen').textContent = `Generated ${DATA.generated} · ` +
   `data ${MINDAY} → ${MAXDAY}`;
 $('#foot').textContent = 'Billed-equivalent weights every token to a common unit; it is not a bill. ' +
   (DATA.rl_installed ? '' :
-   'Rate-limit logger not installed: cap percentages (5h/7d windows) are not ' +
-   'being recorded; they need the opt-in extras/usage_logger.sh.');
+   'Rate-limit logger not installed: the 7-day cap percentage is not ' +
+   'being recorded; it needs the opt-in extras/usage_logger.sh.');
 buildFilters();
 render();
 </script>
