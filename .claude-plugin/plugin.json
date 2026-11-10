@@ -14,5 +14,13 @@
     "tokens",
     "rate-limits",
     "claude-code"
-  ]
+  ],
+  "userConfig": {
+    "showStatusLine": {
+      "type": "boolean",
+      "title": "Show the burnrate status line",
+      "description": "Shows the week burndown and this session's cache hit rate in one status line under the prompt. Turn it off to remove the line.",
+      "default": true
+    }
+  }
 }

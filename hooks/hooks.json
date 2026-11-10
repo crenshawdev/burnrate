@@ -1,0 +1,6 @@
+{
+  "description": "Draws one status line under the prompt with the week's burndown and this session's cache hit rate.",
+  "modules": [
+    "./statusline.ts"
+  ]
+}
