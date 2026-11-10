@@ -21,11 +21,12 @@ What it reconstructs:
     - per-session summaries: peak context, compactions, interrupts, agents
     - the rate-limit logger's samples (extras/usage_logger.sh), when installed
 
-Attribution: a slash command the user typed, or a skill the model invoked,
-opens a segment that stays open until the user's next typed prompt or the next
-command; a subagent attaches to the segment open at its first timestamp.
-Built-ins like /clear and /model change a setting rather than do work, so they
-open none.
+Attribution: a message Claude Code stamped with the skill it ran is filed under
+that skill. A message without a stamp falls back to the segment rule: a slash
+command the user typed, or a skill the model invoked, opens a segment that stays
+open until the user's next typed prompt or the next command, and a subagent
+message attaches to the segment open at its agent's first timestamp. Built-ins
+like /clear and /model change a setting rather than do work, so they open none.
 
 Stdlib + zstandard (archive only). The parse cache is one gzipped file per
 source set under the platform's cache directory: $XDG_CACHE_HOME/burnrate
@@ -953,7 +954,7 @@ def aggregate(sessions, tz_offset, rl_log):
         be = out = bg = 0.0
         for r in rows:
             ts, unit = r[1], r[4]
-            cmd = seg_at(segs, agent_first.get(unit, ts) if unit else ts)
+            cmd = r[15] or seg_at(segs, agent_first.get(unit, ts) if unit else ts)
             all_rows.append((ts, proj, cmd, r[2], r[3], "a" if unit else "m", r))
             be += be_of(r)
             out += r[9]

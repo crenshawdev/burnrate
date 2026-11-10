@@ -761,6 +761,56 @@ class TestMessageFields(TreeCase):
         self.assertEqual(sum(r[6] for r in got["daily"]), EXP["total_be"])
 
 
+def iso_at(ts):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+class TestStampedAttribution(TreeCase):
+    """A message stamped with the skill it ran is filed under that skill; one
+    without a stamp keeps the segment guess, and absence never means
+    conversation."""
+
+    def by_command(self, got):
+        out = {}
+        for r in got["daily"]:
+            out[r[2]] = out.get(r[2], 0) + r[6]
+        return out
+
+    def test_the_existing_fixture_files_by_command_as_before(self):
+        proc, out = run(["--root", P["primary"]])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.by_command(payload(out)), EXP["cmd_be"])
+
+    def test_stamped_rows_go_under_their_skill_and_the_rest_under_the_segment(self):
+        got = self.tree([
+            msg_line("m0", inp=1, attributionSkill="acme:early"),
+            typed_command("c1", "plan"),
+            msg_line("m1", inp=100),
+            msg_line("m2", inp=20, attributionSkill="acme:review"),
+            msg_line("m3", inp=3)])
+        self.assertEqual(self.by_command(got),
+                         {"acme:early": 1, "plan": 103, "acme:review": 20})
+
+    def test_the_other_stamps_never_replace_the_command(self):
+        got = self.tree([
+            typed_command("c1", "plan"),
+            msg_line("m1", inp=100, attributionAgent="acme-auditor",
+                     attributionPlugin="acme", attributionMcpServer="srv",
+                     attributionMcpTool="lookup")])
+        self.assertEqual(self.by_command(got), {"plan": 100})
+
+    def test_a_partly_stamped_subagent_splits_across_two_commands(self):
+        late = self.T0 + 120
+        got = self.tree(
+            [typed_command("c1", "plan"), msg_line("m1", inp=1000)],
+            subs={(0, "agent-1"): [
+                msg_line("a1", inp=40, attributionSkill="acme:audit",
+                         timestamp=iso_at(late)),
+                msg_line("a2", inp=7, timestamp=iso_at(late + 60))]})
+        self.assertEqual(self.by_command(got),
+                         {"plan": 1007, "acme:audit": 40})
+
+
 class TestZstandardAbsent(unittest.TestCase):
     """The optional dependency is missing on most machines, so every branch
     that drops an arch source has to hold there -- which is precisely where the
